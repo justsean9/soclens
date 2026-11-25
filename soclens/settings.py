@@ -475,6 +475,14 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         description="Optional API key for OpenAI-compatible local LLM endpoints.",
     ),
     SettingSpec(
+        key="llm_visible_providers",
+        category="workspace",
+        label="Visible AI Analyst Providers",
+        env_vars=("SOCLENS_LLM_VISIBLE_PROVIDERS",),
+        default="",
+        description="Comma-separated AI providers to show in the AI Analyst tab (blank = all; e.g. copilot_directline).",
+    ),
+    SettingSpec(
         key="ms_copilot_auth_mode",
         category="workspace",
         label="MS Copilot Auth Mode",

@@ -148,6 +148,7 @@ class LocalLLMConfig:
     ms_security_workspace: str = "default"
     ms_security_poll_interval: float = 2.0
     agent_presets: tuple[CopilotAgentPreset, ...] = ()
+    visible_providers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1261,6 +1262,29 @@ def _parse_optional_positive_int(raw_value: int | str | None, *, name: str) -> i
     return parsed
 
 
+def parse_visible_llm_providers(raw: str | Sequence[str] | None) -> tuple[str, ...]:
+    """Parse ``llm_visible_providers`` into an ordered tuple of normalized provider keys."""
+    if raw is None:
+        return ()
+    tokens: list[str]
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned or cleaned.lower() == "all":
+            return ()
+        tokens = [part.strip() for part in cleaned.split(",") if part.strip()]
+    else:
+        tokens = [str(part).strip() for part in raw if str(part).strip()]
+    resolved: list[str] = []
+    for tok in tokens:
+        try:
+            norm = _normalize_llm_provider(tok)
+        except ConfigurationError:
+            continue
+        if norm not in resolved:
+            resolved.append(norm)
+    return tuple(resolved)
+
+
 def get_local_llm_config(
     provider: str | None = None,
     base_url: str | None = None,
@@ -1287,9 +1311,12 @@ def get_local_llm_config(
     Supports ``ollama``, ``openai``, ``m365_copilot``, ``copilot_directline``,
     and ``security_copilot``.
     """
-    resolved_provider = _normalize_llm_provider(
-        provider if provider is not None else os.environ.get("RF_LLM_PROVIDER")
-    )
+    resolved_visible = parse_visible_llm_providers(get_effective_setting("llm_visible_providers"))
+    raw_provider = provider if provider is not None else os.environ.get("RF_LLM_PROVIDER")
+    if not _clean_optional_str(raw_provider) and resolved_visible:
+        resolved_provider = resolved_visible[0]
+    else:
+        resolved_provider = _normalize_llm_provider(raw_provider)
 
     resolved_graph_url = (
         _clean_optional_str(ms_graph_base_url)
@@ -1442,6 +1469,7 @@ def get_local_llm_config(
         ms_security_workspace=resolved_sec_ws,
         ms_security_poll_interval=resolved_poll,
         agent_presets=resolved_presets,
+        visible_providers=resolved_visible,
     )
 
 

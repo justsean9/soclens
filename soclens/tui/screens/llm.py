@@ -236,12 +236,36 @@ class LocalLLMPane(BaseSocPane):
             selected = _MANUAL_MODEL_VALUE
         return options, selected
 
+    @staticmethod
+    def _visible_provider_options(
+        visible_providers: tuple[str, ...] | None = None,
+        *,
+        ensure_provider: str | None = None,
+    ) -> list[tuple[str, str]]:
+        allowed = (
+            visible_providers
+            if visible_providers is not None
+            else get_local_llm_config().visible_providers
+        )
+        if not allowed:
+            return list(_PROVIDER_OPTIONS)
+        opts = [(label, key) for label, key in _PROVIDER_OPTIONS if key in allowed]
+        if ensure_provider and not any(key == ensure_provider for _, key in opts):
+            for label, key in _PROVIDER_OPTIONS:
+                if key == ensure_provider:
+                    opts.append((label, key))
+                    break
+        return opts or list(_PROVIDER_OPTIONS)
+
     def compose(self) -> ComposeResult:
         cfg = get_local_llm_config()
         self._active_session.provider = cfg.provider
         self._active_session.base_url = cfg.base_url
         self._active_session.model = cfg.model
 
+        provider_options = self._visible_provider_options(
+            cfg.visible_providers, ensure_provider=cfg.provider
+        )
         model_options, initial_model_select = self._model_options_for_provider(
             cfg.provider, cfg.model
         )
@@ -272,7 +296,7 @@ class LocalLLMPane(BaseSocPane):
 
         with Horizontal(classes="action-row toolbar-row"):
             yield Select(
-                list(_PROVIDER_OPTIONS),
+                provider_options,
                 allow_blank=False,
                 value=cfg.provider,
                 id="llm-provider-select",
@@ -378,6 +402,9 @@ class LocalLLMPane(BaseSocPane):
         log = self.query_one("#llm-transcript", RichLog)
 
         with prov_sel.prevent(Select.Changed):
+            prov_sel.set_options(
+                self._visible_provider_options(ensure_provider=sess.provider)
+            )
             prov_sel.value = sess.provider
         with url_inp.prevent(Input.Changed):
             url_inp.value = sess.base_url
@@ -485,6 +512,24 @@ class LocalLLMPane(BaseSocPane):
     def on_settings_updated(self) -> None:
         cfg = get_local_llm_config()
         try:
+            prov_sel = self.query_one("#llm-provider-select", Select)
+            allowed = cfg.visible_providers
+            if allowed and self._active_session.provider not in allowed:
+                new_prov = allowed[0]
+                self._active_session.provider = new_prov
+                self._active_session.base_url = _default_url_for_provider(new_prov)
+                self._active_session.remote_conversation_id = None
+                self._active_session.remote_conversation_token = None
+                self._active_session.remote_watermark = None
+                self._load_session_into_ui(self._active_session)
+                self._refresh_session_select()
+            else:
+                opts = self._visible_provider_options(
+                    allowed, ensure_provider=self._active_session.provider
+                )
+                with prov_sel.prevent(Select.Changed):
+                    prov_sel.set_options(opts)
+                    prov_sel.value = self._active_session.provider
             model_input = self.query_one("#llm-model-input", Input)
             if not model_input.value.strip() and cfg.model:
                 with model_input.prevent(Input.Changed):

@@ -191,6 +191,7 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "soclens_auto_approve": ("cat-workspace", "set-auto-approve"),
     "soclens_ascii_art_enabled": ("cat-workspace", "set-ascii-art-enabled"),
     "rf_llm_api_key": ("cat-workspace", "set-rf-llm-api-key"),
+    "llm_visible_providers": ("cat-workspace", "set-llm-visible-providers"),
     "ms_copilot_auth_mode": ("cat-workspace", "set-ms-copilot-auth-mode"),
     "ms_copilot_bearer_token": ("cat-workspace", "set-ms-copilot-bearer-token"),
     "ms_copilot_graph_base_url": ("cat-workspace", "set-ms-copilot-graph-url"),
@@ -964,6 +965,31 @@ class SettingsPane(BaseSocPane):
                         yield Static(
                             "Microsoft Enterprise Copilot & Security Copilot (Token-First)",
                             classes="section-label",
+                        )
+                        yield self._make_label("llm_visible_providers")
+                        yield Select(
+                            [
+                                ("Show All AI Providers (Default)", ""),
+                                ("Copilot Studio (Direct Line) Only", "copilot_directline"),
+                                (
+                                    "Copilot Studio Only (Direct Line & Direct-to-Engine)",
+                                    "copilot_directline,copilot_studio",
+                                ),
+                                (
+                                    "Copilot Direct Line + Security Copilot",
+                                    "copilot_directline,security_copilot",
+                                ),
+                                (
+                                    "Microsoft Copilot Suite Only (All MS Copilot)",
+                                    "copilot_directline,copilot_studio,m365_copilot,security_copilot",
+                                ),
+                                ("Local LLMs Only (Ollama & OpenAI-Compatible)", "ollama,openai"),
+                            ],
+                            allow_blank=False,
+                            value="",
+                            id="set-llm-visible-providers",
+                            classes="setting-field",
+                            compact=True,
                         )
                         yield self._make_label("ms_copilot_auth_mode")
                         yield Select(
@@ -2051,7 +2077,34 @@ class SettingsPane(BaseSocPane):
             with ascii_cb.prevent(Checkbox.Changed):
                 ascii_cb.value = (ascii_val or "").strip().lower() in _SSL_VERIFY_TRUE
 
-            # Microsoft Copilot auth mode & web grounding
+            # Microsoft Copilot visible providers, auth mode & web grounding
+            vis_prov = (
+                self._form_value_for_display("llm_visible_providers", saved_map) or ""
+            ).strip()
+            vis_sel = self.query_one("#set-llm-visible-providers", Select)
+            vis_preset_opts = [
+                ("Show All AI Providers (Default)", ""),
+                ("Copilot Studio (Direct Line) Only", "copilot_directline"),
+                (
+                    "Copilot Studio Only (Direct Line & Direct-to-Engine)",
+                    "copilot_directline,copilot_studio",
+                ),
+                (
+                    "Copilot Direct Line + Security Copilot",
+                    "copilot_directline,security_copilot",
+                ),
+                (
+                    "Microsoft Copilot Suite Only (All MS Copilot)",
+                    "copilot_directline,copilot_studio,m365_copilot,security_copilot",
+                ),
+                ("Local LLMs Only (Ollama & OpenAI-Compatible)", "ollama,openai"),
+            ]
+            if vis_prov and not any(v == vis_prov for _, v in vis_preset_opts):
+                vis_preset_opts.append((f"Custom ({vis_prov})", vis_prov))
+            with vis_sel.prevent(Select.Changed):
+                vis_sel.set_options(vis_preset_opts)
+                vis_sel.value = vis_prov
+
             ms_auth = (
                 self._form_value_for_display("ms_copilot_auth_mode", saved_map) or "token"
             ).strip().lower()
@@ -2498,7 +2551,15 @@ class SettingsPane(BaseSocPane):
             env_ascii = get_env_override_for_setting("soclens_ascii_art_enabled")
             values["soclens_ascii_art_enabled"] = "false" if env_ascii is not None else None
 
-        # Microsoft Copilot auth mode & web grounding
+        # Microsoft Copilot visible providers, auth mode & web grounding
+        vis_prov_val = str(self.query_one("#set-llm-visible-providers", Select).value or "").strip()
+        env_vis_prov = get_env_override_for_setting("llm_visible_providers")
+        values["llm_visible_providers"] = (
+            vis_prov_val
+            if (vis_prov_val or "llm_visible_providers" in existing_saved or env_vis_prov is not None)
+            else None
+        )
+
         ms_auth_val = str(self.query_one("#set-ms-copilot-auth-mode", Select).value or "token").strip().lower()
         env_ms_auth = get_env_override_for_setting("ms_copilot_auth_mode")
         values["ms_copilot_auth_mode"] = (

@@ -234,3 +234,33 @@ def test_tui_llm_multi_chat_windows_and_copilot_providers(tmp_path: Path) -> Non
                 )
 
     asyncio.run(_run())
+
+
+def test_tui_llm_visible_providers_directline_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOCLENS_LLM_VISIBLE_PROVIDERS", "copilot_directline")
+    monkeypatch.delenv("RF_LLM_PROVIDER", raising=False)
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(LocalLLMPane)
+            prov_sel = pane.query_one("#llm-provider-select", Select)
+            assert prov_sel.value == "copilot_directline"
+            option_values = [val for _label, val in prov_sel._options if val != Select.NULL]
+            assert option_values == ["copilot_directline"]
+
+            # Creating a new chat also defaults to copilot_directline
+            pane.query_one("#llm-new-chat-btn", Button).press()
+            await pilot.pause()
+            assert pane.query_one("#llm-provider-select", Select).value == "copilot_directline"
+
+    asyncio.run(_run())
