@@ -112,6 +112,13 @@ _SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("splunk_password", "set-splunk-password", "set-splunk-password-vault"),
     ("s1_api_token", "set-s1-api-token", "set-s1-api-token-vault"),
     ("rf_llm_api_key", "set-rf-llm-api-key", "set-rf-llm-api-key-vault"),
+    ("ms_copilot_bearer_token", "set-ms-copilot-bearer-token", "set-ms-copilot-bearer-token-vault"),
+    ("ms_copilot_token_endpoint", "set-ms-copilot-token-endpoint", "set-ms-copilot-token-endpoint-vault"),
+    (
+        "ms_copilot_directline_secret",
+        "set-ms-copilot-directline-secret",
+        "set-ms-copilot-directline-secret-vault",
+    ),
 )
 
 _SECRET_MANAGED_INPUT_KEYS: frozenset[str] = frozenset(
@@ -184,6 +191,16 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "soclens_auto_approve": ("cat-workspace", "set-auto-approve"),
     "soclens_ascii_art_enabled": ("cat-workspace", "set-ascii-art-enabled"),
     "rf_llm_api_key": ("cat-workspace", "set-rf-llm-api-key"),
+    "ms_copilot_auth_mode": ("cat-workspace", "set-ms-copilot-auth-mode"),
+    "ms_copilot_bearer_token": ("cat-workspace", "set-ms-copilot-bearer-token"),
+    "ms_copilot_graph_base_url": ("cat-workspace", "set-ms-copilot-graph-url"),
+    "ms_copilot_web_grounding": ("cat-workspace", "set-ms-copilot-web-grounding"),
+    "ms_copilot_directline_url": ("cat-workspace", "set-ms-copilot-directline-url"),
+    "ms_copilot_token_endpoint": ("cat-workspace", "set-ms-copilot-token-endpoint"),
+    "ms_copilot_directline_secret": ("cat-workspace", "set-ms-copilot-directline-secret"),
+    "ms_security_copilot_workspace": ("cat-workspace", "set-ms-security-copilot-workspace"),
+    "ms_security_copilot_poll_interval": ("cat-workspace", "set-ms-security-copilot-poll-interval"),
+    "ms_copilot_agents_json": ("cat-workspace", "set-ms-copilot-agents-json"),
     "secret_provider": ("cat-secrets", "set-secret-provider"),
     "secret_store_verify_ssl": ("cat-secrets", "set-secret-store-verify-ssl"),
     "secret_store_timeout": ("cat-secrets", "set-pam-timeout"),
@@ -241,6 +258,9 @@ _SECRET_INPUT_IDS: tuple[str, ...] = (
     "set-splunk-password",
     "set-s1-api-token",
     "set-rf-llm-api-key",
+    "set-ms-copilot-bearer-token",
+    "set-ms-copilot-token-endpoint",
+    "set-ms-copilot-directline-secret",
     "set-tss-password",
     "set-tss-client-secret",
     "set-tss-access-token",
@@ -293,6 +313,46 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
     ("rf_ignored_hashes_file", "set-ignored-hashes-file", "Optional ignored_hashes.txt path"),
     ("rf_ignored_hashes", "set-ignored-hashes", "Comma-separated SHA-256 hashes"),
     ("rf_llm_api_key", "set-rf-llm-api-key", "Optional API key for OpenAI-compatible local LLM"),
+    (
+        "ms_copilot_bearer_token",
+        "set-ms-copilot-bearer-token",
+        "MS Graph Bearer token (Graph Explorer / az CLI / PowerShell)",
+    ),
+    (
+        "ms_copilot_graph_base_url",
+        "set-ms-copilot-graph-url",
+        "Default: https://graph.microsoft.com/beta",
+    ),
+    (
+        "ms_copilot_directline_url",
+        "set-ms-copilot-directline-url",
+        "Default: https://directline.botframework.com/v3/directline",
+    ),
+    (
+        "ms_copilot_token_endpoint",
+        "set-ms-copilot-token-endpoint",
+        "Copilot Studio Mobile/Web Channel Token Endpoint URL",
+    ),
+    (
+        "ms_copilot_directline_secret",
+        "set-ms-copilot-directline-secret",
+        "Optional Copilot Studio Direct Line channel secret",
+    ),
+    (
+        "ms_security_copilot_workspace",
+        "set-ms-security-copilot-workspace",
+        "Default: default",
+    ),
+    (
+        "ms_security_copilot_poll_interval",
+        "set-ms-security-copilot-poll-interval",
+        "Default: 2.0",
+    ),
+    (
+        "ms_copilot_agents_json",
+        "set-ms-copilot-agents-json",
+        'Optional JSON array: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}]',
+    ),
     ("secret_store_timeout", "set-pam-timeout", "Default: 15.0"),
     ("tss_base_url", "set-tss-base-url", "e.g. https://secrets.corp.local/SecretServer"),
     ("tss_platform_url", "set-tss-platform-url", "Optional Delinea Platform identity URL"),
@@ -901,6 +961,99 @@ class SettingsPane(BaseSocPane):
                             compact=True,
                         )
                         yield self._make_vault_select("set-rf-llm-api-key-vault")
+                        yield Static(
+                            "Microsoft Enterprise Copilot & Security Copilot (Token-First)",
+                            classes="section-label",
+                        )
+                        yield self._make_label("ms_copilot_auth_mode")
+                        yield Select(
+                            [
+                                ("Direct Bearer Token (Graph Explorer / PAM / PowerShell)", "token"),
+                                ("Azure CLI Auto-Refresh (az account get-access-token)", "az_cli"),
+                            ],
+                            allow_blank=False,
+                            value="token",
+                            id="set-ms-copilot-auth-mode",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_bearer_token")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="MS Graph Bearer token (Graph Explorer / az CLI / PowerShell)",
+                            id="set-ms-copilot-bearer-token",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-ms-copilot-bearer-token-vault")
+                        yield self._make_label("ms_copilot_graph_base_url")
+                        yield Input(
+                            value="",
+                            placeholder="Default: https://graph.microsoft.com/beta",
+                            id="set-ms-copilot-graph-url",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_web_grounding")
+                        yield Checkbox(
+                            "Enable M365 Copilot Web Search Grounding",
+                            value=True,
+                            id="set-ms-copilot-web-grounding",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_token_endpoint")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Copilot Studio Mobile/Web Channel Token Endpoint URL",
+                            id="set-ms-copilot-token-endpoint",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-ms-copilot-token-endpoint-vault")
+                        yield self._make_label("ms_copilot_directline_secret")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional Copilot Studio Direct Line channel secret",
+                            id="set-ms-copilot-directline-secret",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-ms-copilot-directline-secret-vault")
+                        yield self._make_label("ms_copilot_directline_url")
+                        yield Input(
+                            value="",
+                            placeholder="Default: https://directline.botframework.com/v3/directline",
+                            id="set-ms-copilot-directline-url",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_security_copilot_workspace")
+                        yield Input(
+                            value="",
+                            placeholder="Default: default",
+                            id="set-ms-security-copilot-workspace",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_security_copilot_poll_interval")
+                        yield Input(
+                            value="",
+                            placeholder="Default: 2.0",
+                            id="set-ms-security-copilot-poll-interval",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_agents_json")
+                        yield Input(
+                            value="",
+                            placeholder='Optional JSON array: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}]',
+                            id="set-ms-copilot-agents-json",
+                            classes="setting-field",
+                            compact=True,
+                        )
 
                     with VerticalScroll(id="cat-profiles", classes="settings-cat-scroll"):
                         yield Static("Named Profiles & Per-User Storage", classes="section-label")
@@ -1898,6 +2051,23 @@ class SettingsPane(BaseSocPane):
             with ascii_cb.prevent(Checkbox.Changed):
                 ascii_cb.value = (ascii_val or "").strip().lower() in _SSL_VERIFY_TRUE
 
+            # Microsoft Copilot auth mode & web grounding
+            ms_auth = (
+                self._form_value_for_display("ms_copilot_auth_mode", saved_map) or "token"
+            ).strip().lower()
+            ms_auth_sel = self.query_one("#set-ms-copilot-auth-mode", Select)
+            with ms_auth_sel.prevent(Select.Changed):
+                ms_auth_sel.value = ms_auth if ms_auth in ("token", "az_cli") else "token"
+
+            ms_wg_val = self._form_value_for_display("ms_copilot_web_grounding", saved_map)
+            ms_wg_cb = self.query_one("#set-ms-copilot-web-grounding", Checkbox)
+            with ms_wg_cb.prevent(Checkbox.Changed):
+                ms_wg_cb.value = (
+                    True
+                    if ms_wg_val is None
+                    else ms_wg_val.strip().lower() not in _SSL_VERIFY_FALSE
+                )
+
             # OSINT enabled (defaults to True when unset)
             osint_en_val = self._form_value_for_display("osint_enabled", saved_map)
             osint_cb = self.query_one("#set-osint-enabled", Checkbox)
@@ -2327,6 +2497,25 @@ class SettingsPane(BaseSocPane):
         else:
             env_ascii = get_env_override_for_setting("soclens_ascii_art_enabled")
             values["soclens_ascii_art_enabled"] = "false" if env_ascii is not None else None
+
+        # Microsoft Copilot auth mode & web grounding
+        ms_auth_val = str(self.query_one("#set-ms-copilot-auth-mode", Select).value or "token").strip().lower()
+        env_ms_auth = get_env_override_for_setting("ms_copilot_auth_mode")
+        values["ms_copilot_auth_mode"] = (
+            ms_auth_val
+            if (ms_auth_val != "token" or "ms_copilot_auth_mode" in existing_saved or env_ms_auth is not None)
+            else None
+        )
+        ms_wg_checked = bool(self.query_one("#set-ms-copilot-web-grounding", Checkbox).value)
+        if not ms_wg_checked:
+            values["ms_copilot_web_grounding"] = "false"
+        else:
+            env_ms_wg = get_env_override_for_setting("ms_copilot_web_grounding")
+            values["ms_copilot_web_grounding"] = (
+                "true"
+                if (env_ms_wg is not None or "ms_copilot_web_grounding" in existing_saved)
+                else None
+            )
 
         # OSINT enabled (defaults to True; only persist "false" or override env)
         osint_checked = bool(self.query_one("#set-osint-enabled", Checkbox).value)

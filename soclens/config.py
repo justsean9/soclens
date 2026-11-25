@@ -22,6 +22,7 @@ from requests.utils import should_bypass_proxies
 
 from soclens.settings import (
     AKEYLESS_AUTH_MODES,
+    MS_COPILOT_AUTH_MODES,
     SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS_BY_KEY,
     SUPPORTED_SECRET_PROVIDERS,
@@ -99,12 +100,34 @@ class SentinelOneConfig:
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:1234/v1"
-SUPPORTED_LLM_PROVIDERS: frozenset[str] = frozenset({"ollama", "openai"})
+DEFAULT_M365_COPILOT_GRAPH_URL = "https://graph.microsoft.com/beta"
+DEFAULT_COPILOT_DIRECTLINE_URL = "https://directline.botframework.com/v3/directline"
+COPILOT_LLM_PROVIDERS: frozenset[str] = frozenset(
+    {"m365_copilot", "copilot_directline", "security_copilot"}
+)
+SUPPORTED_LLM_PROVIDERS: frozenset[str] = frozenset(
+    {"ollama", "openai", "m365_copilot", "copilot_directline", "security_copilot"}
+)
+
+
+@dataclass(frozen=True)
+class CopilotAgentPreset:
+    """Named Microsoft Copilot or LLM agent preset for multi-agent workflows."""
+
+    name: str
+    provider: str = "m365_copilot"
+    model: str | None = None
+    base_url: str | None = None
+    token_endpoint: str | None = field(default=None, repr=False)
+    directline_secret: str | None = field(default=None, repr=False)
+    bearer_token: str | None = field(default=None, repr=False)
+    workspace: str | None = None
+    web_grounding: bool | None = None
 
 
 @dataclass(frozen=True)
 class LocalLLMConfig:
-    """Resolved local LLM configuration for Ollama or OpenAI-compatible endpoints."""
+    """Resolved AI analyst configuration for local LLMs and Microsoft Copilot agents."""
 
     provider: str = "ollama"
     base_url: str = DEFAULT_OLLAMA_BASE_URL
@@ -114,6 +137,17 @@ class LocalLLMConfig:
     verify_ssl: bool | str = True
     temperature: float = 0.2
     max_tokens: int | None = None
+    # Microsoft Copilot & Security Copilot settings
+    ms_auth_mode: str = "token"
+    ms_bearer_token: str | None = field(default=None, repr=False)
+    ms_graph_base_url: str = DEFAULT_M365_COPILOT_GRAPH_URL
+    ms_web_grounding: bool = True
+    ms_directline_url: str = DEFAULT_COPILOT_DIRECTLINE_URL
+    ms_token_endpoint: str | None = field(default=None, repr=False)
+    ms_directline_secret: str | None = field(default=None, repr=False)
+    ms_security_workspace: str = "default"
+    ms_security_poll_interval: float = 2.0
+    agent_presets: tuple[CopilotAgentPreset, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1048,14 +1082,120 @@ def get_sentinelone_config(
 
 def _normalize_llm_provider(raw_provider: str | None) -> str:
     cleaned = (_clean_optional_str(raw_provider) or "ollama").lower()
-    if cleaned in ("openai-compatible", "openai_compatible"):
-        cleaned = "openai"
+    aliases = {
+        "openai-compatible": "openai",
+        "openai_compatible": "openai",
+        "copilot": "m365_copilot",
+        "m365": "m365_copilot",
+        "m365-copilot": "m365_copilot",
+        "enterprise_copilot": "m365_copilot",
+        "directline": "copilot_directline",
+        "copilot-directline": "copilot_directline",
+        "copilot_studio": "copilot_directline",
+        "copilot-studio": "copilot_directline",
+        "security-copilot": "security_copilot",
+        "sec_copilot": "security_copilot",
+        "secops": "security_copilot",
+    }
+    cleaned = aliases.get(cleaned, cleaned)
     if cleaned not in SUPPORTED_LLM_PROVIDERS:
         raise ConfigurationError(
-            f"Unsupported local LLM provider '{raw_provider}'. "
+            f"Unsupported LLM provider '{raw_provider}'. "
             f"Expected one of: {', '.join(sorted(SUPPORTED_LLM_PROVIDERS))}."
         )
     return cleaned
+
+
+def parse_copilot_agent_presets(raw: str | Sequence[Mapping[str, Any]] | None) -> tuple[CopilotAgentPreset, ...]:
+    """Parse ``ms_copilot_agents_json`` into validated ``CopilotAgentPreset`` entries."""
+    if raw is None:
+        return ()
+    data: Any
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            return ()
+        try:
+            data = json.loads(cleaned)
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"Invalid JSON in ms_copilot_agents_json: {exc}"
+            ) from exc
+    else:
+        data = raw
+
+    items: list[Mapping[str, Any]] = []
+    if isinstance(data, dict):
+        # Allow {"Agent Name": "https://token-endpoint..." or {config dict}}
+        for name, val in data.items():
+            clean_name = str(name).strip()
+            if not clean_name:
+                continue
+            if isinstance(val, str):
+                items.append(
+                    {
+                        "name": clean_name,
+                        "provider": "copilot_directline",
+                        "token_endpoint": val.strip(),
+                    }
+                )
+            elif isinstance(val, Mapping):
+                entry = dict(val)
+                entry.setdefault("name", clean_name)
+                items.append(entry)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, Mapping):
+                items.append(item)
+    else:
+        raise ConfigurationError(
+            "ms_copilot_agents_json must be a JSON array of agent objects or a JSON object map."
+        )
+
+    presets: list[CopilotAgentPreset] = []
+    seen: set[str] = set()
+    for item in items:
+        name = _clean_optional_str(str(item.get("name") or ""))
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        prov = _normalize_llm_provider(
+            _clean_optional_str(str(item.get("provider") or "")) or "m365_copilot"
+        )
+        raw_wg = item.get("web_grounding")
+        web_grounding: bool | None = None
+        if isinstance(raw_wg, bool):
+            web_grounding = raw_wg
+        elif isinstance(raw_wg, str) and raw_wg.strip():
+            web_grounding = raw_wg.strip().lower() in ("1", "true", "yes", "on")
+        presets.append(
+            CopilotAgentPreset(
+                name=name,
+                provider=prov,
+                model=_clean_optional_str(
+                    str(item["model"]) if item.get("model") is not None else None
+                ),
+                base_url=_clean_optional_str(
+                    str(item["base_url"]) if item.get("base_url") is not None else None
+                ),
+                token_endpoint=_clean_optional_str(
+                    str(item["token_endpoint"]) if item.get("token_endpoint") is not None else None
+                ),
+                directline_secret=_clean_optional_str(
+                    str(item["directline_secret"])
+                    if item.get("directline_secret") is not None
+                    else None
+                ),
+                bearer_token=_clean_optional_str(
+                    str(item["bearer_token"]) if item.get("bearer_token") is not None else None
+                ),
+                workspace=_clean_optional_str(
+                    str(item["workspace"]) if item.get("workspace") is not None else None
+                ),
+                web_grounding=web_grounding,
+            )
+        )
+    return tuple(presets)
 
 
 def _parse_positive_float(raw_value: float | str | None, *, default: float, name: str) -> float:
@@ -1129,27 +1269,56 @@ def get_local_llm_config(
     verify_ssl: bool | str | Path | None = None,
     temperature: float | str | None = None,
     max_tokens: int | str | None = None,
+    *,
+    ms_auth_mode: str | None = None,
+    ms_bearer_token: str | None = None,
+    ms_graph_base_url: str | None = None,
+    ms_web_grounding: bool | str | None = None,
+    ms_directline_url: str | None = None,
+    ms_token_endpoint: str | None = None,
+    ms_directline_secret: str | None = None,
+    ms_security_workspace: str | None = None,
+    ms_security_poll_interval: float | str | None = None,
+    agent_presets: str | Sequence[Mapping[str, Any]] | tuple[CopilotAgentPreset, ...] | None = None,
 ) -> LocalLLMConfig:
-    """Load local LLM configuration from explicit arguments or environment variables.
+    """Load AI analyst configuration from explicit arguments, environment variables, or settings.
 
-    Reads ``RF_LLM_PROVIDER`` (default ``ollama``), ``RF_LLM_BASE_URL``,
-    ``RF_LLM_MODEL``, ``RF_LLM_API_KEY``, ``RF_LLM_TIMEOUT`` (default ``120.0``),
-    ``RF_LLM_VERIFY_SSL``, ``RF_LLM_TEMPERATURE`` (default ``0.2``), and
-    ``RF_LLM_MAX_TOKENS``.
+    Supports ``ollama``, ``openai``, ``m365_copilot``, ``copilot_directline``,
+    and ``security_copilot``.
     """
     resolved_provider = _normalize_llm_provider(
         provider if provider is not None else os.environ.get("RF_LLM_PROVIDER")
     )
-    default_url = (
-        DEFAULT_OPENAI_BASE_URL if resolved_provider == "openai" else DEFAULT_OLLAMA_BASE_URL
+
+    resolved_graph_url = (
+        _clean_optional_str(ms_graph_base_url)
+        or get_effective_setting("ms_copilot_graph_base_url")
+        or DEFAULT_M365_COPILOT_GRAPH_URL
+    ).rstrip("/")
+    resolved_dl_url = (
+        _clean_optional_str(ms_directline_url)
+        or get_effective_setting("ms_copilot_directline_url")
+        or DEFAULT_COPILOT_DIRECTLINE_URL
+    ).rstrip("/")
+
+    if resolved_provider == "openai":
+        default_url = DEFAULT_OPENAI_BASE_URL
+    elif resolved_provider in ("m365_copilot", "security_copilot"):
+        default_url = resolved_graph_url
+    elif resolved_provider == "copilot_directline":
+        default_url = resolved_dl_url
+    else:
+        default_url = DEFAULT_OLLAMA_BASE_URL
+
+    env_base_url = (
+        _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
+        if resolved_provider in ("ollama", "openai")
+        else None
     )
-    raw_url = (
-        _clean_optional_str(base_url)
-        or _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
-        or default_url
-    )
+    raw_url = _clean_optional_str(base_url) or env_base_url or default_url
     if not raw_url.lower().startswith(("http://", "https://")):
-        raw_url = f"http://{raw_url}"
+        scheme = "https://" if resolved_provider in COPILOT_LLM_PROVIDERS else "http://"
+        raw_url = f"{scheme}{raw_url}"
     normalized_url = raw_url.rstrip("/")
 
     resolved_model = _clean_optional_str(
@@ -1180,6 +1349,77 @@ def get_local_llm_config(
     )
     resolved_max_tokens = _parse_optional_positive_int(raw_max_tokens, name="RF_LLM_MAX_TOKENS")
 
+    raw_auth_mode = (
+        _clean_optional_str(ms_auth_mode)
+        if ms_auth_mode is not None
+        else get_effective_setting("ms_copilot_auth_mode")
+    )
+    resolved_auth_mode = (raw_auth_mode or "token").strip().lower()
+    if resolved_auth_mode not in MS_COPILOT_AUTH_MODES:
+        raise ConfigurationError(
+            f"Unsupported ms_copilot_auth_mode '{resolved_auth_mode}'. "
+            f"Expected one of: {', '.join(MS_COPILOT_AUTH_MODES)}."
+        )
+
+    resolved_ms_token = (
+        _clean_optional_str(ms_bearer_token)
+        if ms_bearer_token is not None
+        else get_effective_setting("ms_copilot_bearer_token")
+    )
+    resolved_token_endpoint = (
+        _clean_optional_str(ms_token_endpoint)
+        if ms_token_endpoint is not None
+        else get_effective_setting("ms_copilot_token_endpoint")
+    )
+    resolved_dl_secret = (
+        _clean_optional_str(ms_directline_secret)
+        if ms_directline_secret is not None
+        else get_effective_setting("ms_copilot_directline_secret")
+    )
+    resolved_sec_ws = (
+        _clean_optional_str(ms_security_workspace)
+        if ms_security_workspace is not None
+        else get_effective_setting("ms_security_copilot_workspace")
+    ) or "default"
+
+    raw_poll = (
+        ms_security_poll_interval
+        if ms_security_poll_interval is not None
+        else get_effective_setting("ms_security_copilot_poll_interval")
+    )
+    resolved_poll = _parse_positive_float(
+        raw_poll, default=2.0, name="SOCLENS_MS_SECURITY_COPILOT_POLL_INTERVAL"
+    )
+
+    if isinstance(ms_web_grounding, bool):
+        resolved_web_grounding = ms_web_grounding
+    else:
+        raw_wg = (
+            ms_web_grounding
+            if ms_web_grounding is not None
+            else get_effective_setting("ms_copilot_web_grounding")
+        )
+        resolved_web_grounding = (
+            True
+            if raw_wg is None or not str(raw_wg).strip()
+            else str(raw_wg).strip().lower() in ("1", "true", "yes", "on")
+        )
+
+    resolved_presets: tuple[CopilotAgentPreset, ...]
+    if isinstance(agent_presets, tuple) and all(
+        isinstance(p, CopilotAgentPreset) for p in agent_presets
+    ):
+        resolved_presets = agent_presets
+    elif agent_presets is not None:
+        resolved_presets = parse_copilot_agent_presets(agent_presets)  # type: ignore[arg-type]
+    else:
+        try:
+            resolved_presets = parse_copilot_agent_presets(
+                get_effective_setting("ms_copilot_agents_json")
+            )
+        except ConfigurationError:
+            resolved_presets = ()
+
     return LocalLLMConfig(
         provider=resolved_provider,
         base_url=normalized_url,
@@ -1189,6 +1429,16 @@ def get_local_llm_config(
         verify_ssl=resolved_verify,
         temperature=resolved_temp,
         max_tokens=resolved_max_tokens,
+        ms_auth_mode=resolved_auth_mode,
+        ms_bearer_token=resolved_ms_token,
+        ms_graph_base_url=resolved_graph_url,
+        ms_web_grounding=resolved_web_grounding,
+        ms_directline_url=resolved_dl_url,
+        ms_token_endpoint=resolved_token_endpoint,
+        ms_directline_secret=resolved_dl_secret,
+        ms_security_workspace=resolved_sec_ws,
+        ms_security_poll_interval=resolved_poll,
+        agent_presets=resolved_presets,
     )
 
 

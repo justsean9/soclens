@@ -3153,40 +3153,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_s1_act.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
-    # 7. Local LLM subcommand
+    # 7. AI Analyst / Local LLM & Microsoft Copilot subcommand
     llm_parser = subparsers.add_parser(
         "llm",
-        help="Interact with a local LLM (Ollama or OpenAI-compatible server)",
+        help="Interact with Local LLMs (Ollama/OpenAI) or Microsoft Copilot & Security Copilot agents",
     )
     llm_subparsers = llm_parser.add_subparsers(dest="llm_subcommand", metavar="SUBCOMMAND")
 
     def _add_llm_conn_args(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--provider",
-            choices=["ollama", "openai"],
+            choices=[
+                "ollama",
+                "openai",
+                "m365_copilot",
+                "copilot_directline",
+                "security_copilot",
+            ],
             default=None,
-            help="Local LLM provider (default: RF_LLM_PROVIDER or ollama)",
+            help="AI provider (default: RF_LLM_PROVIDER or ollama)",
         )
         p.add_argument(
             "--base-url",
             default=None,
-            help="Local LLM base URL (default: RF_LLM_BASE_URL or provider default)",
+            help="Provider base URL or Copilot Studio Token Endpoint",
         )
-        p.add_argument("--api-key", default=None, help="Optional API key for OpenAI-compatible servers")
+        p.add_argument(
+            "--api-key",
+            default=None,
+            help="Optional API key, MS Graph Bearer token, or Direct Line secret",
+        )
+        p.add_argument(
+            "--agent",
+            default=None,
+            help="Named Copilot/LLM agent preset from ms_copilot_agents_json",
+        )
         p.add_argument("--timeout", type=float, default=None, help="HTTP timeout in seconds")
         p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
-    llm_status = llm_subparsers.add_parser("status", help="Check local LLM connectivity and available models")
+    llm_status = llm_subparsers.add_parser("status", help="Check LLM or Microsoft Copilot connectivity")
     _add_llm_conn_args(llm_status)
 
-    llm_models = llm_subparsers.add_parser("models", help="List available models on the local LLM server")
+    llm_models = llm_subparsers.add_parser("models", help="List available models or Copilot agents")
     _add_llm_conn_args(llm_models)
 
-    llm_chat = llm_subparsers.add_parser("chat", help="Send a prompt or file to the local LLM")
+    llm_agents = llm_subparsers.add_parser(
+        "agents", help="List configured named Microsoft Copilot / LLM agent presets"
+    )
+    llm_agents.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    llm_chat = llm_subparsers.add_parser("chat", help="Send a prompt or file to the LLM or Copilot agent")
     _add_llm_conn_args(llm_chat)
     llm_chat.add_argument("--prompt", default=None, help="User prompt text")
     llm_chat.add_argument("--system", default=None, help="Optional system prompt override")
-    llm_chat.add_argument("--model", default=None, help="Model name (default: RF_LLM_MODEL)")
+    llm_chat.add_argument("--model", default=None, help="Model or agent name (default: RF_LLM_MODEL)")
+    llm_chat.add_argument(
+        "--conversation-id",
+        default=None,
+        help="Optional existing Copilot / Security Copilot conversation or session ID to continue",
+    )
     llm_chat.add_argument(
         "--template",
         choices=list(SOC_PROMPT_TEMPLATES.keys()),
@@ -5310,6 +5335,8 @@ def _build_llm_client(args: argparse.Namespace) -> LocalLLMClient:
         base_url=getattr(args, "base_url", None),
         model=getattr(args, "model", None),
         api_key=getattr(args, "api_key", None),
+        agent_name=getattr(args, "agent", None),
+        conversation_id=getattr(args, "conversation_id", None),
         timeout=getattr(args, "timeout", None),
         verify_ssl=verify_ssl,
         temperature=getattr(args, "temperature", None),
@@ -5320,8 +5347,39 @@ def _build_llm_client(args: argparse.Namespace) -> LocalLLMClient:
 def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
     subcmd = getattr(args, "llm_subcommand", None)
     if not subcmd:
-        print("[-] Missing llm subcommand. Use: status, models, chat, explain-sigma", file=sys.stderr)
+        print(
+            "[-] Missing llm subcommand. Use: status, models, agents, chat, explain-sigma",
+            file=sys.stderr,
+        )
         return 1
+
+    if subcmd == "agents":
+        from soclens.config import get_local_llm_config
+
+        cfg = get_local_llm_config()
+        payload_agents = [
+            {
+                "name": p.name,
+                "provider": p.provider,
+                "model": p.model,
+                "workspace": p.workspace,
+                "has_token_endpoint": bool(p.token_endpoint),
+                "has_directline_secret": bool(p.directline_secret),
+            }
+            for p in cfg.agent_presets
+        ]
+        if use_json:
+            _emit_json({"agents": payload_agents})
+        elif not payload_agents:
+            print(
+                "No named Copilot/LLM agents configured. Set 'ms_copilot_agents_json' in "
+                "Settings or SOCLENS_MS_COPILOT_AGENTS (see docs/MICROSOFT_COPILOT_GUIDE.md)."
+            )
+        else:
+            for item in payload_agents:
+                extra = f" (workspace={item['workspace']})" if item["workspace"] else ""
+                print(f"- {item['name']} [{item['provider']}]{extra}")
+        return 0
 
     with _build_llm_client(args) as llm:
         if subcmd == "status":
@@ -5404,14 +5462,15 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                 )
 
             if use_json:
-                _emit_json(
-                    {
-                        "provider": result["provider"],
-                        "model": result["model"],
-                        "done": result["done"],
-                        "content": result["content"],
-                    }
-                )
+                out_payload: dict[str, Any] = {
+                    "provider": result["provider"],
+                    "model": result["model"],
+                    "done": result["done"],
+                    "content": result["content"],
+                }
+                if result.get("conversation_id"):
+                    out_payload["conversation_id"] = result["conversation_id"]
+                _emit_json(out_payload)
             else:
                 print(result["content"])
             return 0

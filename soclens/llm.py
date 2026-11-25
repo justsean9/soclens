@@ -13,12 +13,19 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from soclens.config import (
+    COPILOT_LLM_PROVIDERS,
     ConfigurationError,
     ConfiguredSession,
+    CopilotAgentPreset,
     LocalLLMConfig,
     PivotPayload,
     get_local_llm_config,
     suppress_insecure_ssl_warnings,
+)
+from soclens.copilot import (
+    CopilotDirectLineTransport,
+    M365CopilotTransport,
+    SecurityCopilotTransport,
 )
 
 __all__ = [
@@ -292,7 +299,7 @@ def _extract_error_detail(response: requests.Response) -> str:
 
 
 class LocalLLMClient:
-    """HTTP client for local Ollama and OpenAI-compatible LLM servers."""
+    """HTTP client for local LLMs (Ollama/OpenAI-compatible) and Microsoft Copilot agents."""
 
     def __init__(
         self,
@@ -306,6 +313,17 @@ class LocalLLMClient:
         verify_ssl: bool | str | Path | None = None,
         temperature: float | str | None = None,
         max_tokens: int | str | None = None,
+        ms_auth_mode: str | None = None,
+        ms_bearer_token: str | None = None,
+        ms_graph_base_url: str | None = None,
+        ms_web_grounding: bool | str | None = None,
+        ms_directline_url: str | None = None,
+        ms_token_endpoint: str | None = None,
+        ms_directline_secret: str | None = None,
+        ms_security_workspace: str | None = None,
+        ms_security_poll_interval: float | str | None = None,
+        agent_name: str | None = None,
+        conversation_id: str | None = None,
         max_retries: int = 2,
         backoff_base: float = 0.5,
         stop_event: threading.Event | None = None,
@@ -324,6 +342,15 @@ class LocalLLMClient:
                         verify_ssl,
                         temperature,
                         max_tokens,
+                        ms_auth_mode,
+                        ms_bearer_token,
+                        ms_graph_base_url,
+                        ms_web_grounding,
+                        ms_directline_url,
+                        ms_token_endpoint,
+                        ms_directline_secret,
+                        ms_security_workspace,
+                        ms_security_poll_interval,
                     )
                 )
                 if has_overrides:
@@ -336,6 +363,46 @@ class LocalLLMClient:
                         verify_ssl=verify_ssl if verify_ssl is not None else config.verify_ssl,
                         temperature=temperature if temperature is not None else config.temperature,
                         max_tokens=max_tokens if max_tokens is not None else config.max_tokens,
+                        ms_auth_mode=ms_auth_mode if ms_auth_mode is not None else config.ms_auth_mode,
+                        ms_bearer_token=(
+                            ms_bearer_token if ms_bearer_token is not None else config.ms_bearer_token
+                        ),
+                        ms_graph_base_url=(
+                            ms_graph_base_url
+                            if ms_graph_base_url is not None
+                            else config.ms_graph_base_url
+                        ),
+                        ms_web_grounding=(
+                            ms_web_grounding
+                            if ms_web_grounding is not None
+                            else config.ms_web_grounding
+                        ),
+                        ms_directline_url=(
+                            ms_directline_url
+                            if ms_directline_url is not None
+                            else config.ms_directline_url
+                        ),
+                        ms_token_endpoint=(
+                            ms_token_endpoint
+                            if ms_token_endpoint is not None
+                            else config.ms_token_endpoint
+                        ),
+                        ms_directline_secret=(
+                            ms_directline_secret
+                            if ms_directline_secret is not None
+                            else config.ms_directline_secret
+                        ),
+                        ms_security_workspace=(
+                            ms_security_workspace
+                            if ms_security_workspace is not None
+                            else config.ms_security_workspace
+                        ),
+                        ms_security_poll_interval=(
+                            ms_security_poll_interval
+                            if ms_security_poll_interval is not None
+                            else config.ms_security_poll_interval
+                        ),
+                        agent_presets=config.agent_presets,
                     )
                 else:
                     self.config = config
@@ -349,14 +416,35 @@ class LocalLLMClient:
                     verify_ssl=verify_ssl,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    ms_auth_mode=ms_auth_mode,
+                    ms_bearer_token=ms_bearer_token,
+                    ms_graph_base_url=ms_graph_base_url,
+                    ms_web_grounding=ms_web_grounding,
+                    ms_directline_url=ms_directline_url,
+                    ms_token_endpoint=ms_token_endpoint,
+                    ms_directline_secret=ms_directline_secret,
+                    ms_security_workspace=ms_security_workspace,
+                    ms_security_poll_interval=ms_security_poll_interval,
                 )
         except ConfigurationError as exc:
             raise LocalLLMConfigError(str(exc)) from exc
+
+        # Apply named agent preset if agent_name or model matches a configured preset
+        target_agent = (agent_name or "").strip() or (self.config.model or "").strip()
+        matched_preset = self._find_agent_preset(target_agent) if target_agent else None
+        if matched_preset is not None and (
+            agent_name is not None or self.config.provider in COPILOT_LLM_PROVIDERS
+        ):
+            self.config = self._apply_agent_preset(self.config, matched_preset)
 
         self.max_retries = max(0, int(max_retries))
         self.backoff_base = max(0.0, float(backoff_base))
         self._stop_event = stop_event if stop_event is not None else threading.Event()
         self._owns_session = session is None
+        self._initial_conversation_id = (conversation_id or "").strip() or None
+        self._copilot_transport: (
+            M365CopilotTransport | CopilotDirectLineTransport | SecurityCopilotTransport | None
+        ) = None
 
         if session is not None:
             self.session = session
@@ -369,6 +457,85 @@ class LocalLLMClient:
         self.session.verify = self.config.verify_ssl
         if self.config.verify_ssl is False:
             suppress_insecure_ssl_warnings()
+
+    def _find_agent_preset(self, name: str) -> CopilotAgentPreset | None:
+        needle = name.strip().lower()
+        if not needle:
+            return None
+        for preset in self.config.agent_presets:
+            if preset.name.strip().lower() == needle:
+                return preset
+        return None
+
+    @staticmethod
+    def _apply_agent_preset(cfg: LocalLLMConfig, preset: CopilotAgentPreset) -> LocalLLMConfig:
+        return get_local_llm_config(
+            provider=preset.provider,
+            base_url=preset.base_url or cfg.base_url,
+            model=preset.model or preset.name,
+            api_key=cfg.api_key,
+            timeout=cfg.timeout,
+            verify_ssl=cfg.verify_ssl,
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            ms_auth_mode=cfg.ms_auth_mode,
+            ms_bearer_token=preset.bearer_token or cfg.ms_bearer_token,
+            ms_graph_base_url=cfg.ms_graph_base_url,
+            ms_web_grounding=(
+                preset.web_grounding if preset.web_grounding is not None else cfg.ms_web_grounding
+            ),
+            ms_directline_url=cfg.ms_directline_url,
+            ms_token_endpoint=preset.token_endpoint or cfg.ms_token_endpoint,
+            ms_directline_secret=preset.directline_secret or cfg.ms_directline_secret,
+            ms_security_workspace=preset.workspace or cfg.ms_security_workspace,
+            ms_security_poll_interval=cfg.ms_security_poll_interval,
+            agent_presets=cfg.agent_presets,
+        )
+
+    @property
+    def is_copilot_provider(self) -> bool:
+        return self.config.provider in COPILOT_LLM_PROVIDERS
+
+    @property
+    def conversation_id(self) -> str | None:
+        if self._copilot_transport is not None:
+            return self._copilot_transport.conversation_id
+        return self._initial_conversation_id
+
+    def reset_conversation(self) -> None:
+        """Reset server-side Copilot / Security Copilot conversation state."""
+        self._initial_conversation_id = None
+        if self._copilot_transport is not None:
+            self._copilot_transport.reset_conversation()
+
+    def _get_copilot_transport(
+        self,
+    ) -> M365CopilotTransport | CopilotDirectLineTransport | SecurityCopilotTransport:
+        if self._copilot_transport is not None:
+            return self._copilot_transport
+        common_kwargs: dict[str, Any] = {
+            "stop_event": self._stop_event,
+            "max_retries": self.max_retries,
+            "backoff_base": self.backoff_base,
+            "error_factory": LocalLLMError,
+            "connection_error_factory": LocalLLMConnectionError,
+        }
+        if self.config.provider == "m365_copilot":
+            transport: M365CopilotTransport | CopilotDirectLineTransport | SecurityCopilotTransport = (
+                M365CopilotTransport(self.config, self.session, **common_kwargs)
+            )
+        elif self.config.provider == "copilot_directline":
+            transport = CopilotDirectLineTransport(self.config, self.session, **common_kwargs)
+        elif self.config.provider == "security_copilot":
+            transport = SecurityCopilotTransport(self.config, self.session, **common_kwargs)
+        else:
+            raise LocalLLMConfigError(
+                f"Provider '{self.config.provider}' is not a Microsoft Copilot provider."
+            )
+        if self._initial_conversation_id:
+            transport.conversation_id = self._initial_conversation_id
+        self._copilot_transport = transport
+        return transport
 
     def __enter__(self) -> LocalLLMClient:
         return self
@@ -526,8 +693,30 @@ class LocalLLMClient:
             endpoint=url,
         )
 
+    def _default_copilot_model_label(self) -> str:
+        if self.config.model:
+            return self.config.model
+        if self.config.provider == "m365_copilot":
+            return "M365 Copilot Chat"
+        if self.config.provider == "copilot_directline":
+            return "Copilot Studio Agent"
+        if self.config.provider == "security_copilot":
+            return f"Security Copilot ({self.config.ms_security_workspace})"
+        return self.config.provider
+
     def list_models(self) -> list[str]:
-        """Return available model names/IDs from the configured local LLM server."""
+        """Return available model names/IDs or configured Copilot agent presets."""
+        if self.is_copilot_provider:
+            names: list[str] = [
+                preset.name
+                for preset in self.config.agent_presets
+                if preset.provider == self.config.provider
+            ]
+            default_label = self._default_copilot_model_label()
+            if default_label not in names:
+                names.insert(0, default_label)
+            return names
+
         url = self._endpoint_url("models")
         response = self._request("GET", url)
         try:
@@ -570,7 +759,17 @@ class LocalLLMClient:
         return models
 
     def check_connection(self) -> dict[str, Any]:
-        """Probe the local LLM server and return a structured health summary."""
+        """Probe the configured LLM or Microsoft Copilot endpoint and return a health summary."""
+        if self.is_copilot_provider:
+            transport = self._get_copilot_transport()
+            result = transport.check_connection()
+            if result.get("ok"):
+                presets = self.list_models()
+                existing = list(result.get("models") or [])
+                merged = list(dict.fromkeys([*presets, *existing]))
+                result["models"] = merged
+            return result
+
         try:
             models = self.list_models()
             return {
@@ -598,15 +797,47 @@ class LocalLLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         stream_callback: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a chat completion request (streaming or non-streaming)."""
+        if not messages:
+            raise LocalLLMConfigError("At least one chat message is required.")
+
+        if self.is_copilot_provider:
+            selected_label = (
+                (model if model is not None else self.config.model or "").strip()
+                or self._default_copilot_model_label()
+            )
+            # Extract latest user prompt
+            latest_user = ""
+            for msg in reversed(messages):
+                if str(msg.get("role") or "user").strip().lower() == "user":
+                    latest_user = str(msg.get("content") or "").strip()
+                    if latest_user:
+                        break
+            if not latest_user:
+                latest_user = str(messages[-1].get("content") or "").strip()
+
+            clean_system = (system_prompt or "").strip()
+            freeform_sys = SOC_PROMPT_TEMPLATES["freeform"]["system_prompt"].strip()
+            if clean_system and clean_system != freeform_sys:
+                turn_text = f"[Analyst Instructions]\n{clean_system}\n\n{latest_user}"
+            else:
+                turn_text = latest_user
+
+            transport = self._get_copilot_transport()
+            return transport.send_turn(
+                turn_text,
+                conversation_id=conversation_id,
+                stream_callback=stream_callback,
+                model_label=selected_label,
+            )
+
         selected_model = (model if model is not None else self.config.model or "").strip()
         if not selected_model:
             raise LocalLLMConfigError(
                 "No local LLM model specified. Set RF_LLM_MODEL or pass model explicitly."
             )
-        if not messages:
-            raise LocalLLMConfigError("At least one chat message is required.")
 
         full_messages: list[dict[str, str]] = []
         clean_system = (system_prompt or "").strip()

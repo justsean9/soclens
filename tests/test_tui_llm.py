@@ -149,3 +149,88 @@ def test_tui_sigma_pivot_to_local_llm(tmp_path: Path) -> None:
                 assert "Suspicious Encoded PowerShell" in str(badge.render())
 
     asyncio.run(_run())
+
+
+def test_tui_llm_multi_chat_windows_and_copilot_providers(tmp_path: Path) -> None:
+    mock_llm = MagicMock(spec=LocalLLMClient)
+    mock_llm.__enter__.return_value = mock_llm
+    mock_llm.__exit__.return_value = None
+    mock_llm.chat.side_effect = [
+        {
+            "content": "M365 Copilot reply for Chat 1.",
+            "model": "M365 Copilot Chat",
+            "provider": "m365_copilot",
+            "conversation_id": "conv-m365-tab1",
+            "done": True,
+            "raw": {},
+        },
+        {
+            "content": "Security Copilot reply for Chat 2.",
+            "model": "Security Copilot",
+            "provider": "security_copilot",
+            "conversation_id": "sc-sess-tab2",
+            "done": True,
+            "raw": {},
+        },
+    ]
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        with patch("soclens.tui.screens.llm.LocalLLMClient", return_value=mock_llm):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                pane = app.query_one(LocalLLMPane)
+
+                # Switch Chat 1 to Enterprise M365 Copilot Chat and send a message
+                pane.query_one("#llm-provider-select", Select).value = "m365_copilot"
+                await pilot.pause()
+                pane.query_one("#llm-prompt", Input).value = "Hello M365"
+                pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert "M365 Copilot reply for Chat 1." in _richlog_text(
+                    pane.query_one("#llm-transcript", RichLog)
+                )
+
+                # Open a second independent chat window for Security Copilot
+                pane.query_one("#llm-new-chat-btn", Button).press()
+                await pilot.pause()
+                assert len(pane._sessions) == 2
+                assert _richlog_text(pane.query_one("#llm-transcript", RichLog)) == ""
+
+                pane.query_one("#llm-provider-select", Select).value = "security_copilot"
+                await pilot.pause()
+                pane.query_one("#llm-prompt", Input).value = "Hello SecCopilot"
+                pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert "Security Copilot reply for Chat 2." in _richlog_text(
+                    pane.query_one("#llm-transcript", RichLog)
+                )
+
+                # Switch back to Chat 1 and verify its transcript and conversation_id are intact
+                pane.query_one("#llm-session-select", Select).value = "chat-1"
+                await pilot.pause()
+                assert pane.query_one("#llm-provider-select", Select).value == "m365_copilot"
+                assert pane._sessions["chat-1"].remote_conversation_id == "conv-m365-tab1"
+                assert "M365 Copilot reply for Chat 1." in _richlog_text(
+                    pane.query_one("#llm-transcript", RichLog)
+                )
+
+                # Close Chat 1 and confirm Chat 2 remains active
+                pane.query_one("#llm-close-chat-btn", Button).press()
+                await pilot.pause()
+                assert len(pane._sessions) == 1
+                assert "Security Copilot reply for Chat 2." in _richlog_text(
+                    pane.query_one("#llm-transcript", RichLog)
+                )
+
+    asyncio.run(_run())

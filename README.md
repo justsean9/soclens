@@ -8,7 +8,7 @@
 
 Cross-platform SOC investigation workbench providing a unified CLI (`soclens`) and interactive Textual Terminal User Interface (`soclens tui`) integrating Recorded Future (Watchlists, Brand Monitoring, Entity Match, Connect v2, SOAR v3, Detection Rules, Playbook Alerts, Alerts v3, Cases, Sandbox v0), **16 built-in free passive OSINT feeds** (WHOIS/RDAP, DoH DNS, GeoIP, BGP/ASN, Shodan InternetDB, crt.sh, URLScan, SANS DShield, Wayback Machine, AlienVault OTX, GreyNoise, CIRCL NSRL, MITRE CVE + FIRST EPSS + CISA KEV, plus optional free-key VirusTotal, AbuseIPDB, and abuse.ch) into a single pane of glass alongside Splunk Search & Splunk Enterprise Security triage/enrichment, SentinelOne EDR, Sigma-to-Splunk conversion, Local LLM analysis, per-user settings profiles, and air-gapped offline deployment bundling.
 
-See [docs/RF_API_REVIEW.md](docs/RF_API_REVIEW.md) for the Recorded Future API reference and [CHANGELOG.md](CHANGELOG.md) for release notes.
+See [docs/RF_API_REVIEW.md](docs/RF_API_REVIEW.md) for the Recorded Future API reference, [docs/MICROSOFT_COPILOT_GUIDE.md](docs/MICROSOFT_COPILOT_GUIDE.md) for the Microsoft Enterprise Copilot / Copilot Studio / Security Copilot setup & offline install KB, and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ---
 
@@ -44,8 +44,8 @@ Insikt Group & local Sigma rule browsing with live pySigma `savedsearches.conf` 
 
 ![Sigma Rules & Splunk Export](docs/screenshots/sigma-rules.svg)
 
-### Local LLM SOC Copilot (`F7`)
-Ollama & OpenAI-compatible triage assistant with attached investigation context and SPL generation:
+### AI Analyst: Local LLM & Microsoft Copilot Multi-Agent (`F7`)
+Ollama, OpenAI-compatible, Enterprise M365 Copilot Chat, Copilot Studio (Direct Line / Token Endpoint), and Microsoft Security Copilot triage assistant with multiple concurrent chat windows, attached investigation context, and SPL generation (see [docs/MICROSOFT_COPILOT_GUIDE.md](docs/MICROSOFT_COPILOT_GUIDE.md)):
 
 ![Local LLM SOC Copilot](docs/screenshots/local-llm.svg)
 

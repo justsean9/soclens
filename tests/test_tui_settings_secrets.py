@@ -225,7 +225,7 @@ def test_tui_settings_cat_secrets_masked_inputs_bw_optional_and_show_secrets(
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
             pane = app.query_one(SettingsPane)
-            assert len(_SECRET_INPUT_IDS) == 18
+            assert len(_SECRET_INPUT_IDS) == 21
             for widget_id in _SECRET_INPUT_IDS:
                 assert pane.query_one(f"#{widget_id}", Input).password is True
 
@@ -266,7 +266,7 @@ def test_tui_settings_dynamic_input_to_vault_dropdown_swap_including_llm_key(
     tmp_path: Path,
     isolated_settings_env: Path,
 ) -> None:
-    assert len(_SECRET_MANAGED_VAULT_FIELDS) == 10
+    assert len(_SECRET_MANAGED_VAULT_FIELDS) == 13
     assert tuple(k for k, _, _ in _SECRET_MANAGED_VAULT_FIELDS) == SECRET_MANAGED_SETTING_KEYS
 
     app = create_app(

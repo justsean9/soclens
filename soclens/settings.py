@@ -88,6 +88,7 @@ SUPPORTED_SECRET_PROVIDERS: tuple[str, ...] = (
 TSS_AUTH_MODES: tuple[str, ...] = ("password", "platform", "token")
 VAULT_AUTH_MODES: tuple[str, ...] = ("token", "approle")
 AKEYLESS_AUTH_MODES: tuple[str, ...] = ("access_key", "token")
+MS_COPILOT_AUTH_MODES: tuple[str, ...] = ("token", "az_cli")
 SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
     "rf_api_token",
     "rf_sandbox_token",
@@ -99,6 +100,9 @@ SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
     "splunk_password",
     "s1_api_token",
     "rf_llm_api_key",
+    "ms_copilot_bearer_token",
+    "ms_copilot_token_endpoint",
+    "ms_copilot_directline_secret",
 )
 
 
@@ -469,6 +473,90 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         env_vars=("RF_LLM_API_KEY",),
         secret=True,
         description="Optional API key for OpenAI-compatible local LLM endpoints.",
+    ),
+    SettingSpec(
+        key="ms_copilot_auth_mode",
+        category="workspace",
+        label="MS Copilot Auth Mode",
+        env_vars=("SOCLENS_MS_COPILOT_AUTH_MODE",),
+        default="token",
+        choices=MS_COPILOT_AUTH_MODES,
+        description="Token source for M365 Copilot & Security Copilot: token (Bearer token) or az_cli (auto via az account get-access-token).",
+    ),
+    SettingSpec(
+        key="ms_copilot_bearer_token",
+        category="workspace",
+        label="MS Copilot / Graph Bearer Token",
+        env_vars=("SOCLENS_MS_COPILOT_TOKEN", "MS_COPILOT_BEARER_TOKEN"),
+        secret=True,
+        description="Microsoft Graph Bearer token for Enterprise M365 Copilot Chat & Security Copilot (from Graph Explorer, az CLI, or PowerShell).",
+    ),
+    SettingSpec(
+        key="ms_copilot_graph_base_url",
+        category="workspace",
+        label="MS Graph Base URL",
+        env_vars=("SOCLENS_MS_COPILOT_GRAPH_URL",),
+        value_type="url",
+        default="https://graph.microsoft.com/beta",
+        description="Microsoft Graph beta endpoint (use https://graph.microsoft.us/beta for GCC-High/DoD).",
+    ),
+    SettingSpec(
+        key="ms_copilot_web_grounding",
+        category="workspace",
+        label="M365 Copilot Web Grounding",
+        env_vars=("SOCLENS_MS_COPILOT_WEB_GROUNDING",),
+        value_type="bool",
+        default="true",
+        description="Enable web search grounding on M365 Copilot Chat turns (true/false).",
+    ),
+    SettingSpec(
+        key="ms_copilot_directline_url",
+        category="workspace",
+        label="Copilot Studio Direct Line URL",
+        env_vars=("SOCLENS_MS_COPILOT_DIRECTLINE_URL",),
+        value_type="url",
+        default="https://directline.botframework.com/v3/directline",
+        description="Bot Framework Direct Line v3 base URL for Copilot Studio agents.",
+    ),
+    SettingSpec(
+        key="ms_copilot_token_endpoint",
+        category="workspace",
+        label="Copilot Studio Token Endpoint",
+        env_vars=("SOCLENS_MS_COPILOT_TOKEN_ENDPOINT",),
+        secret=True,
+        description="Copilot Studio Mobile/Web Channel Token Endpoint URL (no Entra App Registration required).",
+    ),
+    SettingSpec(
+        key="ms_copilot_directline_secret",
+        category="workspace",
+        label="Copilot Studio Direct Line Secret",
+        env_vars=("SOCLENS_MS_COPILOT_DIRECTLINE_SECRET",),
+        secret=True,
+        description="Optional Copilot Studio Direct Line channel secret (alternative to Token Endpoint).",
+    ),
+    SettingSpec(
+        key="ms_security_copilot_workspace",
+        category="workspace",
+        label="Security Copilot Workspace ID",
+        env_vars=("SOCLENS_MS_SECURITY_COPILOT_WORKSPACE",),
+        default="default",
+        description="Microsoft Security Copilot workspace identifier (usually 'default').",
+    ),
+    SettingSpec(
+        key="ms_security_copilot_poll_interval",
+        category="workspace",
+        label="Security Copilot Poll Interval (s)",
+        env_vars=("SOCLENS_MS_SECURITY_COPILOT_POLL_INTERVAL",),
+        value_type="float",
+        default="2.0",
+        description="Polling interval in seconds while waiting for Security Copilot evaluations.",
+    ),
+    SettingSpec(
+        key="ms_copilot_agents_json",
+        category="workspace",
+        label="MS Copilot Named Agents (JSON)",
+        env_vars=("SOCLENS_MS_COPILOT_AGENTS",),
+        description='Optional JSON array of named Copilot/LLM agents: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}].',
     ),
     # Secret Manager (PAM / Vault)
     SettingSpec(

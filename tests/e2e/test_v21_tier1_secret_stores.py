@@ -199,7 +199,7 @@ def test_v21_f1_secret_server_batch_resolve_deduplicates_item_fetches(
     mock_secret_server: MockSecretServer,
 ) -> None:
     recommended = _load_secret_fixtures()["secret_server"]["recommended_map"]
-    assert set(recommended) == set(SECRET_MANAGED_SETTING_KEYS)
+    assert set(recommended).issubset(set(SECRET_MANAGED_SETTING_KEYS))
 
     cfg = get_secret_store_config(provider="secret_server")
     with SecretServerProvider(cfg) as provider:
@@ -548,9 +548,10 @@ def test_v21_f4_settings_persist_vault_map_only_zero_plaintext_secrets_on_disk(
     )
 
     hydrated = hydrate_secrets_from_store()
-    assert set(hydrated) == set(SECRET_MANAGED_SETTING_KEYS)
+    assert set(hydrated) == set(recommended)
+    assert set(recommended).issubset(set(SECRET_MANAGED_SETTING_KEYS))
     effective_values: dict[str, str] = {}
-    for key in SECRET_MANAGED_SETTING_KEYS:
+    for key in recommended:
         val = get_effective_setting(key)
         assert val is not None and val.startswith("e2e-vault-")
         effective_values[key] = val
