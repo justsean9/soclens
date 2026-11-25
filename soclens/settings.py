@@ -12,7 +12,7 @@ import stat
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,7 @@ _LAST_ERRORS: dict[Path, str] = {}
 
 _SESSION_LOCK = threading.RLock()
 _SESSION_OVERRIDES: dict[str, str | None] = {}
+_VAULT_HYDRATED_KEYS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,30 @@ class SettingSpec:
     default: str | None = None
     mask_url_credentials: bool = False
     description: str = ""
+    choices: tuple[str, ...] = ()
+
+
+SUPPORTED_SECRET_PROVIDERS: tuple[str, ...] = (
+    "none",
+    "secret_server",
+    "hashicorp_vault",
+    "onepassword_connect",
+    "bitwarden",
+)
+TSS_AUTH_MODES: tuple[str, ...] = ("password", "platform", "token")
+VAULT_AUTH_MODES: tuple[str, ...] = ("token", "approle")
+SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
+    "rf_api_token",
+    "rf_sandbox_token",
+    "rf_asi_api_key",
+    "rf_pfi_token",
+    "rf_riskrecon_token",
+    "splunk_token",
+    "splunk_username",
+    "splunk_password",
+    "s1_api_token",
+    "rf_llm_api_key",
+)
 
 
 SETTING_CATEGORIES: tuple[tuple[str, str], ...] = (
@@ -62,6 +87,7 @@ SETTING_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("sentinelone", "SentinelOne EDR"),
     ("network", "Network, SSL & Proxy"),
     ("workspace", "Workspace & Tool Defaults"),
+    ("secret_manager", "Secret Manager (PAM / Vault)"),
 )
 
 SETTING_SPECS: tuple[SettingSpec, ...] = (
@@ -201,6 +227,36 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         default="false",
         description="true, false, or path to a custom CA bundle PEM file.",
     ),
+    SettingSpec(
+        key="splunk_es_tenant_field",
+        category="splunk",
+        label="Splunk ES Tenant Field",
+        env_vars=("SPLUNK_ES_TENANT_FIELD",),
+        default="tenant_id",
+        description="Primary field name for tenant extraction on ES notables (inherits soclens_tenant_field).",
+    ),
+    SettingSpec(
+        key="splunk_es_tenant_aliases",
+        category="splunk",
+        label="Splunk ES Tenant Aliases",
+        env_vars=("SPLUNK_ES_TENANT_ALIASES",),
+        default="org_id,client_code,customer_id",
+        description="Fallback tenant field aliases (CSV or JSON list) checked case-insensitively.",
+    ),
+    SettingSpec(
+        key="splunk_es_custom_fields",
+        category="splunk",
+        label="Splunk ES Custom Fields",
+        env_vars=("SPLUNK_ES_CUSTOM_FIELDS",),
+        description="Optional CSV or JSON list of pinned custom ES notable fields.",
+    ),
+    SettingSpec(
+        key="splunk_es_saved_views",
+        category="splunk",
+        label="Splunk ES Saved Views",
+        env_vars=("SPLUNK_ES_SAVED_VIEWS",),
+        description="Single-line JSON array or object storing custom Splunk ES queue views.",
+    ),
     # SentinelOne EDR
     SettingSpec(
         key="s1_console_url",
@@ -248,6 +304,20 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         value_type="float",
         default="30.0",
         description="Request timeout in seconds for SentinelOne API calls.",
+    ),
+    SettingSpec(
+        key="s1_tier_rules",
+        category="sentinelone",
+        label="SentinelOne Site Tier Rules",
+        env_vars=("S1_TIER_RULES",),
+        description="Optional single-line JSON mapping/list of tier regex rules (default MDR-*, MSSP-*).",
+    ),
+    SettingSpec(
+        key="s1_site_tenant_map",
+        category="sentinelone",
+        label="SentinelOne Site-Tenant Map",
+        env_vars=("S1_SITE_TENANT_MAP",),
+        description="Optional single-line JSON mapping of site name/code/ID to tenant_id.",
     ),
     # Network, SSL & Proxy
     SettingSpec(
@@ -360,6 +430,256 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         value_type="bool",
         default="false",
         description="Permit non-interactive CLI mutations without --yes (true/false).",
+    ),
+    SettingSpec(
+        key="rf_llm_api_key",
+        category="workspace",
+        label="Local LLM API Key",
+        env_vars=("RF_LLM_API_KEY",),
+        secret=True,
+        description="Optional API key for OpenAI-compatible local LLM endpoints.",
+    ),
+    # Secret Manager (PAM / Vault)
+    SettingSpec(
+        key="secret_provider",
+        category="secret_manager",
+        label="Secret Manager Provider",
+        env_vars=("SOCLENS_SECRET_PROVIDER",),
+        default="none",
+        choices=SUPPORTED_SECRET_PROVIDERS,
+        description="Active PAM / Secret Manager backend (none, secret_server, hashicorp_vault, onepassword_connect, bitwarden).",
+    ),
+    SettingSpec(
+        key="secret_store_verify_ssl",
+        category="secret_manager",
+        label="Secret Store SSL Verification",
+        env_vars=("SOCLENS_SECRET_STORE_VERIFY_SSL", "SOCLENS_SECRET_VERIFY_SSL"),
+        value_type="ssl_verify",
+        description="true, false, CA bundle path, or leave blank to inherit RF SSL setting.",
+    ),
+    SettingSpec(
+        key="secret_store_timeout",
+        category="secret_manager",
+        label="Secret Store Timeout (sec)",
+        env_vars=("SOCLENS_SECRET_STORE_TIMEOUT", "SOCLENS_SECRET_TIMEOUT"),
+        value_type="float",
+        default="15.0",
+        description="HTTP timeout in seconds for secret manager API calls.",
+    ),
+    SettingSpec(
+        key="vault_secret_map",
+        category="secret_manager",
+        label="Vault Secret Map (JSON)",
+        env_vars=("SOCLENS_VAULT_SECRET_MAP",),
+        description="Single-line JSON mapping of SOCLens setting keys to canonical vault references.",
+    ),
+    SettingSpec(
+        key="tss_base_url",
+        category="secret_manager",
+        label="Secret Server Base URL",
+        env_vars=("TSS_BASE_URL", "SOCLENS_TSS_BASE_URL"),
+        value_type="url",
+        description="Thycotic / Delinea Secret Server base URL.",
+    ),
+    SettingSpec(
+        key="tss_auth_mode",
+        category="secret_manager",
+        label="Secret Server Auth Mode",
+        env_vars=("TSS_AUTH_MODE", "SOCLENS_TSS_AUTH_MODE"),
+        default="password",
+        choices=TSS_AUTH_MODES,
+        description="Secret Server authentication mode: password, platform, or token.",
+    ),
+    SettingSpec(
+        key="tss_username",
+        category="secret_manager",
+        label="Secret Server Username",
+        env_vars=("TSS_USERNAME", "SOCLENS_TSS_USERNAME"),
+        description="Secret Server username for OAuth2 password grant.",
+    ),
+    SettingSpec(
+        key="tss_password",
+        category="secret_manager",
+        label="Secret Server Password",
+        env_vars=("TSS_PASSWORD", "SOCLENS_TSS_PASSWORD"),
+        secret=True,
+        description="Secret Server bootstrap password.",
+    ),
+    SettingSpec(
+        key="tss_domain",
+        category="secret_manager",
+        label="Secret Server Domain",
+        env_vars=("TSS_DOMAIN", "SOCLENS_TSS_DOMAIN"),
+        description="Optional Active Directory domain for Secret Server authentication.",
+    ),
+    SettingSpec(
+        key="tss_client_id",
+        category="secret_manager",
+        label="Secret Server Platform Client ID",
+        env_vars=("TSS_CLIENT_ID", "SOCLENS_TSS_CLIENT_ID"),
+        description="Delinea Platform OAuth2 client ID.",
+    ),
+    SettingSpec(
+        key="tss_client_secret",
+        category="secret_manager",
+        label="Secret Server Platform Client Secret",
+        env_vars=("TSS_CLIENT_SECRET", "SOCLENS_TSS_CLIENT_SECRET"),
+        secret=True,
+        description="Delinea Platform OAuth2 client secret.",
+    ),
+    SettingSpec(
+        key="tss_access_token",
+        category="secret_manager",
+        label="Secret Server Access Token",
+        env_vars=("TSS_ACCESS_TOKEN", "SOCLENS_TSS_ACCESS_TOKEN"),
+        secret=True,
+        description="Pre-issued Secret Server Bearer token.",
+    ),
+    SettingSpec(
+        key="tss_platform_url",
+        category="secret_manager",
+        label="Secret Server Platform URL",
+        env_vars=("TSS_PLATFORM_URL", "SOCLENS_TSS_PLATFORM_URL"),
+        value_type="url",
+        description="Delinea Platform identity URL.",
+    ),
+    SettingSpec(
+        key="tss_folder_id",
+        category="secret_manager",
+        label="Secret Server Folder ID",
+        env_vars=("TSS_FOLDER_ID", "SOCLENS_TSS_FOLDER_ID"),
+        description="Optional Secret Server folder ID filter.",
+    ),
+    SettingSpec(
+        key="vault_addr",
+        category="secret_manager",
+        label="HashiCorp Vault Address",
+        env_vars=("VAULT_ADDR", "SOCLENS_VAULT_ADDR"),
+        value_type="url",
+        description="HashiCorp Vault or OpenBao server URL.",
+    ),
+    SettingSpec(
+        key="vault_auth_mode",
+        category="secret_manager",
+        label="Vault Auth Mode",
+        env_vars=("VAULT_AUTH_MODE", "SOCLENS_VAULT_AUTH_MODE"),
+        default="token",
+        choices=VAULT_AUTH_MODES,
+        description="HashiCorp Vault authentication mode: token or approle.",
+    ),
+    SettingSpec(
+        key="vault_token",
+        category="secret_manager",
+        label="Vault Token",
+        env_vars=("VAULT_TOKEN", "SOCLENS_VAULT_TOKEN"),
+        secret=True,
+        description="HashiCorp Vault authentication token.",
+    ),
+    SettingSpec(
+        key="vault_role_id",
+        category="secret_manager",
+        label="Vault AppRole Role ID",
+        env_vars=("VAULT_ROLE_ID", "SOCLENS_VAULT_ROLE_ID"),
+        description="HashiCorp Vault AppRole role_id.",
+    ),
+    SettingSpec(
+        key="vault_secret_id",
+        category="secret_manager",
+        label="Vault AppRole Secret ID",
+        env_vars=("VAULT_SECRET_ID", "SOCLENS_VAULT_SECRET_ID"),
+        secret=True,
+        description="HashiCorp Vault AppRole secret_id.",
+    ),
+    SettingSpec(
+        key="vault_auth_mount",
+        category="secret_manager",
+        label="Vault AppRole Auth Mount",
+        env_vars=("VAULT_AUTH_MOUNT", "SOCLENS_VAULT_AUTH_MOUNT"),
+        default="approle",
+        description="HashiCorp Vault AppRole auth mount path (default approle).",
+    ),
+    SettingSpec(
+        key="vault_kv_mount",
+        category="secret_manager",
+        label="Vault KV v2 Mount",
+        env_vars=("VAULT_KV_MOUNT", "VAULT_MOUNT", "SOCLENS_VAULT_KV_MOUNT"),
+        default="secret",
+        description="HashiCorp Vault KV v2 secrets engine mount path (default secret).",
+    ),
+    SettingSpec(
+        key="vault_namespace",
+        category="secret_manager",
+        label="Vault Namespace",
+        env_vars=("VAULT_NAMESPACE", "SOCLENS_VAULT_NAMESPACE"),
+        description="Optional HashiCorp Vault Enterprise namespace header.",
+    ),
+    SettingSpec(
+        key="vault_prefix",
+        category="secret_manager",
+        label="Vault Path Prefix",
+        env_vars=("VAULT_PREFIX", "VAULT_PATH_PREFIX", "SOCLENS_VAULT_PREFIX"),
+        description="Optional KV v2 subpath prefix for catalog discovery.",
+    ),
+    SettingSpec(
+        key="op_connect_url",
+        category="secret_manager",
+        label="1Password Connect URL",
+        env_vars=("OP_CONNECT_HOST", "OP_CONNECT_URL", "SOCLENS_OP_CONNECT_URL"),
+        value_type="url",
+        description="1Password Connect Server base URL.",
+    ),
+    SettingSpec(
+        key="op_connect_token",
+        category="secret_manager",
+        label="1Password Connect Token",
+        env_vars=("OP_CONNECT_TOKEN", "SOCLENS_OP_CONNECT_TOKEN"),
+        secret=True,
+        description="1Password Connect Server Bearer token.",
+    ),
+    SettingSpec(
+        key="op_vault_id",
+        category="secret_manager",
+        label="1Password Vault UUID",
+        env_vars=("OP_VAULT_ID", "SOCLENS_OP_VAULT_ID"),
+        description="Optional 1Password Vault UUID scope.",
+    ),
+    SettingSpec(
+        key="bw_serve_url",
+        category="secret_manager",
+        label="Bitwarden bw serve URL",
+        env_vars=("BW_SERVE_URL", "BW_API_URL", "SOCLENS_BW_SERVE_URL"),
+        value_type="url",
+        default="http://127.0.0.1:8087",
+        description="Local Bitwarden CLI 'bw serve' REST URL.",
+    ),
+    SettingSpec(
+        key="bw_master_password",
+        category="secret_manager",
+        label="Bitwarden Master Password",
+        env_vars=("BW_MASTER_PASSWORD", "SOCLENS_BW_MASTER_PASSWORD"),
+        secret=True,
+        description="Optional Bitwarden vault unlock password (blank by default; session/env preferred).",
+    ),
+    SettingSpec(
+        key="bw_folder_id",
+        category="secret_manager",
+        label="Bitwarden Folder ID",
+        env_vars=("BW_FOLDER_ID", "SOCLENS_BW_FOLDER_ID"),
+        description="Optional Bitwarden folder UUID filter.",
+    ),
+    SettingSpec(
+        key="bw_collection_id",
+        category="secret_manager",
+        label="Bitwarden Collection ID",
+        env_vars=("BW_COLLECTION_ID", "SOCLENS_BW_COLLECTION_ID"),
+        description="Optional Bitwarden collection UUID filter.",
+    ),
+    SettingSpec(
+        key="bw_organization_id",
+        category="secret_manager",
+        label="Bitwarden Organization ID",
+        env_vars=("BW_ORGANIZATION_ID", "SOCLENS_BW_ORGANIZATION_ID"),
+        description="Optional Bitwarden organization UUID filter.",
     ),
 )
 
@@ -673,7 +993,14 @@ def save_profile_settings(
             if cleaned is None:
                 existing.pop(canon, None)
             else:
-                existing[canon] = cleaned
+                with _SESSION_LOCK:
+                    skip_vault = (
+                        canon in SECRET_MANAGED_SETTING_KEYS
+                        and canon in _VAULT_HYDRATED_KEYS
+                        and cleaned == _SESSION_OVERRIDES.get(canon)
+                    )
+                if not skip_vault:
+                    existing[canon] = cleaned
 
         profiles[prof_name] = existing
         _write_store_atomic(target, store)
@@ -783,6 +1110,198 @@ def _validate_url(value: str, *, require_scheme: bool) -> str | None:
     return None
 
 
+def parse_vault_secret_map(
+    raw: str | Mapping[str, Any] | None,
+    *,
+    strict: bool = True,
+) -> dict[str, str]:
+    """Parse ``vault_secret_map`` JSON/mapping into ``{setting_key: canonical_ref}``."""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return {}
+        try:
+            loaded: Any = json.loads(stripped)
+        except ValueError as exc:
+            raise ValueError(f"vault_secret_map must be valid JSON: {exc}") from exc
+    elif isinstance(raw, Mapping):
+        loaded = raw
+    else:
+        raise ValueError("vault_secret_map must be a JSON object or mapping.")
+
+    if not isinstance(loaded, Mapping):
+        raise ValueError("vault_secret_map must be a JSON object.")
+
+    parsed: dict[str, str] = {}
+    for raw_k, raw_v in loaded.items():
+        if not isinstance(raw_k, str) or not raw_k.strip():
+            raise ValueError("vault_secret_map keys must be non-empty strings.")
+        canon = resolve_setting_key(raw_k) or raw_k.strip()
+        if canon not in SECRET_MANAGED_SETTING_KEYS:
+            raise ValueError(f"Unsupported secret-managed setting key: {raw_k!r}.")
+        if raw_v is None:
+            if strict:
+                raise ValueError(f"Vault reference for {canon!r} must be a non-empty string.")
+            continue
+        if not isinstance(raw_v, str):
+            raise ValueError(f"Vault reference for {canon!r} must be a string.")
+        if "\n" in raw_v or "\r" in raw_v:
+            raise ValueError(f"Vault reference for {canon!r} cannot contain newlines.")
+        cleaned = raw_v.strip()
+        if not cleaned:
+            if strict:
+                raise ValueError(f"Vault reference for {canon!r} cannot be empty.")
+            continue
+        parsed[canon] = cleaned
+    return parsed
+
+
+def serialize_vault_secret_map(mapping: Mapping[str, str | None]) -> str:
+    """Serialize ``{setting_key: canonical_ref}`` into compact single-line JSON."""
+    cleaned: dict[str, str] = {}
+    for raw_k, raw_v in mapping.items():
+        if not isinstance(raw_k, str) or not raw_k.strip():
+            raise ValueError("vault_secret_map keys must be non-empty strings.")
+        canon = resolve_setting_key(raw_k) or raw_k.strip()
+        if canon not in SECRET_MANAGED_SETTING_KEYS:
+            raise ValueError(f"Unsupported secret-managed setting key: {raw_k!r}.")
+        if raw_v is None:
+            continue
+        if not isinstance(raw_v, str):
+            raise ValueError(f"Vault reference for {canon!r} must be a string.")
+        if "\n" in raw_v or "\r" in raw_v:
+            raise ValueError(f"Vault reference for {canon!r} cannot contain newlines.")
+        val = raw_v.strip()
+        if val:
+            cleaned[canon] = val
+    if not cleaned:
+        return ""
+    return json.dumps(cleaned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def parse_s1_tier_rules(
+    raw: str | Sequence[Any] | Mapping[str, Any] | None,
+) -> list[tuple[str, re.Pattern[str]]]:
+    """Parse ``s1_tier_rules`` into ordered ``[(tier_name, compiled_regex), ...]``."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return []
+        try:
+            loaded: Any = json.loads(stripped)
+        except ValueError as exc:
+            raise ValueError(f"s1_tier_rules must be valid JSON: {exc}") from exc
+    else:
+        loaded = raw
+
+    pairs: list[tuple[str, str]] = []
+    if isinstance(loaded, Mapping):
+        for tier_k, pat_v in loaded.items():
+            if not isinstance(tier_k, str):
+                raise ValueError("s1_tier_rules tier names must be non-empty strings.")
+            if "\n" in tier_k or "\r" in tier_k:
+                raise ValueError(f"s1_tier_rules tier name {tier_k!r} cannot contain newlines.")
+            if not tier_k.strip():
+                raise ValueError("s1_tier_rules tier names must be non-empty strings.")
+            if not isinstance(pat_v, str):
+                raise ValueError(f"s1_tier_rules pattern for {tier_k!r} must be a non-empty string.")
+            if "\n" in pat_v or "\r" in pat_v:
+                raise ValueError(
+                    f"s1_tier_rules pattern for {tier_k.strip()!r} cannot contain newlines."
+                )
+            if not pat_v.strip():
+                raise ValueError(f"s1_tier_rules pattern for {tier_k!r} must be a non-empty string.")
+            pairs.append((tier_k.strip(), pat_v.strip()))
+    elif isinstance(loaded, Sequence) and not isinstance(loaded, (str, bytes, bytearray)):
+        for item in loaded:
+            if isinstance(item, Mapping):
+                tier_val = item.get("tier")
+                pat_val = item.get("pattern") if item.get("pattern") is not None else item.get("regex")
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)) and len(item) == 2:
+                tier_val, pat_val = item[0], item[1]
+            else:
+                raise ValueError(
+                    "s1_tier_rules list entries must be {'tier': ..., 'pattern': ...} or [tier, pattern]."
+                )
+            if not isinstance(tier_val, str):
+                raise ValueError("s1_tier_rules entry 'tier' must be a non-empty string.")
+            if "\n" in tier_val or "\r" in tier_val:
+                raise ValueError(f"s1_tier_rules entry 'tier' {tier_val!r} cannot contain newlines.")
+            if not tier_val.strip():
+                raise ValueError("s1_tier_rules entry 'tier' must be a non-empty string.")
+            if not isinstance(pat_val, str):
+                raise ValueError(
+                    f"s1_tier_rules entry pattern for {tier_val!r} must be a non-empty string."
+                )
+            if "\n" in pat_val or "\r" in pat_val:
+                raise ValueError(
+                    f"s1_tier_rules pattern for {tier_val.strip()!r} cannot contain newlines."
+                )
+            if not pat_val.strip():
+                raise ValueError(
+                    f"s1_tier_rules entry pattern for {tier_val!r} must be a non-empty string."
+                )
+            pairs.append((tier_val.strip(), pat_val.strip()))
+    else:
+        raise ValueError("s1_tier_rules must be a JSON object or array.")
+
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for tier_name, pattern_str in pairs:
+        if "\n" in tier_name or "\r" in tier_name:
+            raise ValueError(f"s1_tier_rules tier name {tier_name!r} cannot contain newlines.")
+        if "\n" in pattern_str or "\r" in pattern_str:
+            raise ValueError(f"s1_tier_rules pattern for {tier_name!r} cannot contain newlines.")
+        try:
+            regex = re.compile(pattern_str)
+        except re.error as exc:
+            raise ValueError(
+                f"s1_tier_rules invalid regex for {tier_name!r}: {exc}"
+            ) from exc
+        compiled.append((tier_name, regex))
+    return compiled
+
+
+def parse_s1_site_tenant_map(
+    raw: str | Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Parse ``s1_site_tenant_map`` JSON/mapping into ``{site_or_code: tenant_id}``."""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return {}
+        try:
+            loaded: Any = json.loads(stripped)
+        except ValueError as exc:
+            raise ValueError(f"s1_site_tenant_map must be valid JSON: {exc}") from exc
+    elif isinstance(raw, Mapping):
+        loaded = raw
+    else:
+        raise ValueError("s1_site_tenant_map must be a JSON object or mapping.")
+
+    if not isinstance(loaded, Mapping):
+        raise ValueError("s1_site_tenant_map must be a JSON object.")
+
+    result: dict[str, str] = {}
+    for raw_k, raw_v in loaded.items():
+        if isinstance(raw_k, (dict, list, bool)) or raw_k is None:
+            raise ValueError("s1_site_tenant_map keys must be non-empty strings.")
+        key_str = str(raw_k).strip()
+        if not key_str:
+            raise ValueError("s1_site_tenant_map keys must be non-empty strings.")
+        if not isinstance(raw_v, str) or not raw_v.strip():
+            raise ValueError(f"s1_site_tenant_map value for {key_str!r} must be a non-empty string.")
+        if "\n" in raw_v or "\r" in raw_v:
+            raise ValueError(f"s1_site_tenant_map value for {key_str!r} cannot contain newlines.")
+        result[key_str] = raw_v.strip()
+    return result
+
+
 def validate_settings_values(values: Mapping[str, str | None]) -> list[tuple[str, str]]:
     """Validate candidate setting values, returning ``[(key, error_message), ...]``."""
     errors: list[tuple[str, str]] = []
@@ -803,6 +1322,11 @@ def validate_settings_values(values: Mapping[str, str | None]) -> list[tuple[str
             continue
 
         if spec is None:
+            continue
+
+        if spec.choices and cleaned.lower() not in {c.lower() for c in spec.choices}:
+            valid_choices = ", ".join(spec.choices)
+            errors.append((canon, f"{label}: must be one of {valid_choices}."))
             continue
 
         if spec.value_type == "url":
@@ -829,6 +1353,46 @@ def validate_settings_values(values: Mapping[str, str | None]) -> list[tuple[str
                 errors.append(
                     (canon, f"{label}: must be auto, kitty, iterm2, sixel, or halfblock.")
                 )
+        elif canon == "vault_secret_map":
+            try:
+                parse_vault_secret_map(cleaned, strict=True)
+            except ValueError as exc:
+                errors.append((canon, f"{label}: {exc}"))
+        elif canon == "s1_tier_rules":
+            try:
+                parse_s1_tier_rules(cleaned)
+            except ValueError as exc:
+                errors.append((canon, f"{label}: {exc}"))
+        elif canon == "s1_site_tenant_map":
+            try:
+                parse_s1_site_tenant_map(cleaned)
+            except ValueError as exc:
+                errors.append((canon, f"{label}: {exc}"))
+        elif canon == "splunk_es_saved_views":
+            try:
+                loaded_views: Any = json.loads(cleaned)
+            except ValueError as exc:
+                errors.append((canon, f"{label}: must be valid JSON ({exc})."))
+                continue
+            if isinstance(loaded_views, list):
+                if not all(isinstance(item, dict) for item in loaded_views):
+                    errors.append((canon, f"{label}: JSON list entries must be objects."))
+            elif not isinstance(loaded_views, dict):
+                errors.append((canon, f"{label}: must be a JSON object or list of objects."))
+        elif canon == "splunk_es_tenant_field":
+            if any(ch.isspace() for ch in cleaned):
+                errors.append((canon, f"{label}: must be a single field name without whitespace."))
+        elif canon in {"splunk_es_tenant_aliases", "splunk_es_custom_fields"}:
+            if cleaned.startswith("["):
+                try:
+                    loaded_list: Any = json.loads(cleaned)
+                except ValueError as exc:
+                    errors.append((canon, f"{label}: invalid JSON list ({exc})."))
+                    continue
+                if not isinstance(loaded_list, list) or not all(
+                    isinstance(item, str) and item.strip() for item in loaded_list
+                ):
+                    errors.append((canon, f"{label}: JSON list must contain non-empty strings."))
 
     return errors
 
@@ -882,7 +1446,11 @@ def format_setting_display(
     return cleaned
 
 
-def set_session_overrides(overrides: Mapping[str, str | None]) -> None:
+def set_session_overrides(
+    overrides: Mapping[str, str | None],
+    *,
+    vault_hydrated: bool = False,
+) -> None:
     """Update process-local TUI session overrides without mutating ``os.environ``."""
     with _SESSION_LOCK:
         for key, val in overrides.items():
@@ -890,8 +1458,13 @@ def set_session_overrides(overrides: Mapping[str, str | None]) -> None:
             cleaned = _clean_str(val)
             if cleaned is None:
                 _SESSION_OVERRIDES.pop(canon, None)
+                _VAULT_HYDRATED_KEYS.discard(canon)
             else:
                 _SESSION_OVERRIDES[canon] = cleaned
+                if vault_hydrated:
+                    _VAULT_HYDRATED_KEYS.add(canon)
+                else:
+                    _VAULT_HYDRATED_KEYS.discard(canon)
 
 
 def clear_session_overrides(keys: tuple[str, ...] | list[str] | None = None) -> None:
@@ -899,10 +1472,19 @@ def clear_session_overrides(keys: tuple[str, ...] | list[str] | None = None) -> 
     with _SESSION_LOCK:
         if keys is None:
             _SESSION_OVERRIDES.clear()
+            _VAULT_HYDRATED_KEYS.clear()
         else:
             for key in keys:
                 canon = resolve_setting_key(key) or key.strip()
                 _SESSION_OVERRIDES.pop(canon, None)
+                _VAULT_HYDRATED_KEYS.discard(canon)
+
+
+def is_vault_hydrated_setting(key: str) -> bool:
+    """Return True if ``key`` currently holds a vault-hydrated session override."""
+    canon = resolve_setting_key(key) or key.strip()
+    with _SESSION_LOCK:
+        return canon in _VAULT_HYDRATED_KEYS and _SESSION_OVERRIDES.get(canon) is not None
 
 
 def get_session_override(key: str) -> tuple[bool, str | None]:
@@ -1050,12 +1632,16 @@ def describe_all_settings(
 __all__ = [
     "APP_CONFIG_DIR_NAME",
     "DEFAULT_PROFILE",
+    "SECRET_MANAGED_SETTING_KEYS",
     "SETTING_CATEGORIES",
     "SETTING_SPECS",
     "SETTING_SPECS_BY_KEY",
     "SETTINGS_FILENAME",
     "SETTINGS_SCHEMA_VERSION",
+    "SUPPORTED_SECRET_PROVIDERS",
     "SettingSpec",
+    "TSS_AUTH_MODES",
+    "VAULT_AUTH_MODES",
     "clear_profile_settings",
     "clear_session_overrides",
     "collect_env_importable_settings",
@@ -1072,11 +1658,16 @@ __all__ = [
     "get_settings_path",
     "get_settings_storage_info",
     "invalidate_settings_cache",
+    "is_vault_hydrated_setting",
     "list_profiles",
     "load_settings_store",
     "mask_secret",
+    "parse_s1_site_tenant_map",
+    "parse_s1_tier_rules",
+    "parse_vault_secret_map",
     "resolve_setting_key",
     "save_profile_settings",
+    "serialize_vault_secret_map",
     "set_active_profile",
     "set_session_overrides",
     "validate_profile_name",

@@ -465,3 +465,164 @@ def test_bundler_excludes_settings_files(tmp_path: Path) -> None:
     assert "settings.json" not in names
     assert ".soclens_settings.json" not in names
     assert ".soclens_tui_settings.json" not in names
+
+
+def test_wave0_categories_specs_and_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ("secret_manager", "Secret Manager (PAM / Vault)") in settings_mod.SETTING_CATEGORIES
+    assert settings_mod.SUPPORTED_SECRET_PROVIDERS == (
+        "none",
+        "secret_server",
+        "hashicorp_vault",
+        "onepassword_connect",
+        "bitwarden",
+    )
+    assert len(settings_mod.SECRET_MANAGED_SETTING_KEYS) == 10
+    assert "rf_llm_api_key" in settings_mod.SECRET_MANAGED_SETTING_KEYS
+    assert "splunk_username" in settings_mod.SECRET_MANAGED_SETTING_KEYS
+
+    bw_pw = settings_mod.SETTING_SPECS_BY_KEY["bw_master_password"]
+    assert bw_pw.secret is True
+    assert bw_pw.default is None
+    assert settings_mod.SETTING_SPECS_BY_KEY["bw_serve_url"].default == "http://127.0.0.1:8087"
+    assert settings_mod.SETTING_SPECS_BY_KEY["vault_kv_mount"].default == "secret"
+    assert settings_mod.SETTING_SPECS_BY_KEY["vault_auth_mount"].default == "approle"
+    assert settings_mod.SETTING_SPECS_BY_KEY["splunk_es_tenant_field"].default == "tenant_id"
+    assert settings_mod.SETTING_SPECS_BY_KEY["rf_llm_api_key"].secret is True
+
+    alias_cases = {
+        "RF_LLM_API_KEY": "rf_llm_api_key",
+        "OP_CONNECT_HOST": "op_connect_url",
+        "OP_CONNECT_URL": "op_connect_url",
+        "BW_API_URL": "bw_serve_url",
+        "BW_SERVE_URL": "bw_serve_url",
+        "VAULT_MOUNT": "vault_kv_mount",
+        "VAULT_PATH_PREFIX": "vault_prefix",
+        "SPLUNK_ES_TENANT_FIELD": "splunk_es_tenant_field",
+        "S1_TIER_RULES": "s1_tier_rules",
+        "S1_SITE_TENANT_MAP": "s1_site_tenant_map",
+        "SOCLENS_SECRET_VERIFY_SSL": "secret_store_verify_ssl",
+        "SOCLENS_SECRET_TIMEOUT": "secret_store_timeout",
+    }
+    for env_name, expected_key in alias_cases.items():
+        assert settings_mod.resolve_setting_key(env_name) == expected_key
+
+    monkeypatch.setenv("OP_CONNECT_HOST", "https://op.internal:8443")
+    hit = settings_mod.get_env_override_for_setting("op_connect_url")
+    assert hit == ("OP_CONNECT_HOST", "https://op.internal:8443")
+
+
+def test_wave0_vault_map_tier_rules_and_validation() -> None:
+    parsed = settings_mod.parse_vault_secret_map(
+        '{"RF_API_TOKEN":"secret_server:10:token","s1_api_token":"secret_server:20:key"}'
+    )
+    assert parsed == {
+        "rf_api_token": "secret_server:10:token",
+        "s1_api_token": "secret_server:20:key",
+    }
+    serialized = settings_mod.serialize_vault_secret_map(
+        {"s1_api_token": "secret_server:20:key", "rf_api_token": "secret_server:10:token", "splunk_token": None}
+    )
+    assert "\n" not in serialized
+    assert json.loads(serialized) == parsed
+    assert settings_mod.serialize_vault_secret_map({"rf_api_token": "   "}) == ""
+
+    with pytest.raises(ValueError):
+        settings_mod.parse_vault_secret_map('{"rf_base_url":"secret_server:1:url"}')
+    with pytest.raises(ValueError):
+        settings_mod.parse_vault_secret_map('{"rf_api_token":""}', strict=True)
+    assert settings_mod.parse_vault_secret_map('{"rf_api_token":""}', strict=False) == {}
+
+    rules_dict = settings_mod.parse_s1_tier_rules('{"MDR":"(?i)^mdr-([0-9]+)"}')
+    assert len(rules_dict) == 1 and rules_dict[0][0] == "MDR"
+    rules_list = settings_mod.parse_s1_tier_rules('[{"tier":"MSSP","pattern":"(?i)^mssp_([a-z0-9]+)"}]')
+    assert len(rules_list) == 1 and rules_list[0][0] == "MSSP"
+    with pytest.raises(ValueError):
+        settings_mod.parse_s1_tier_rules('{"MDR":"[unclosed"}')
+    for bad_tier_rule in (
+        {"MDR": "^mdr\n"},
+        {"MDR": "\n^mdr"},
+        {"MDR": "^mdr\r"},
+        {"MDR\nX": "^mdr"},
+        {"MDR\n": "^mdr"},
+        [{"tier": "MDR\r", "pattern": "^mdr"}],
+        [{"tier": "MDR", "pattern": "\r^mdr"}],
+        [["MDR\n", "^mdr"]],
+        [["MDR", "^mdr\n"]],
+        '{"MDR":"^mdr\\n"}',
+        '{"MDR\\nX":"^mdr"}',
+    ):
+        with pytest.raises(ValueError):
+            settings_mod.parse_s1_tier_rules(bad_tier_rule)
+
+    site_map = settings_mod.parse_s1_site_tenant_map('{"MDR-1234":"acme","9999":"beta"}')
+    assert site_map == {"MDR-1234": "acme", "9999": "beta"}
+
+    bad_errors = settings_mod.validate_settings_values(
+        {
+            "secret_provider": "unknown_pam",
+            "tss_auth_mode": "kerberos",
+            "vault_auth_mode": "oidc",
+            "vault_secret_map": "{bad json",
+            "s1_tier_rules": '{"MDR":"(unclosed"}',
+            "s1_site_tenant_map": '["not-a-dict"]',
+            "splunk_es_saved_views": '"not-list-or-dict"',
+            "splunk_es_tenant_field": "has space",
+            "splunk_es_custom_fields": '["ok", 123]',
+        }
+    )
+    bad_keys = {k for k, _ in bad_errors}
+    assert bad_keys == {
+        "secret_provider",
+        "tss_auth_mode",
+        "vault_auth_mode",
+        "vault_secret_map",
+        "s1_tier_rules",
+        "s1_site_tenant_map",
+        "splunk_es_saved_views",
+        "splunk_es_tenant_field",
+        "splunk_es_custom_fields",
+    }
+
+    assert (
+        settings_mod.validate_settings_values(
+            {
+                "secret_provider": "hashicorp_vault",
+                "tss_auth_mode": "platform",
+                "vault_auth_mode": "approle",
+                "vault_secret_map": serialized,
+                "s1_tier_rules": '{"MDR":"(?i)^mdr-([0-9]+)"}',
+                "s1_site_tenant_map": '{"MDR-1234":"acme"}',
+                "splunk_es_saved_views": '[{"name":"Open Triage"}]',
+                "splunk_es_tenant_field": "tenant_id",
+                "splunk_es_custom_fields": '["tenant_id","customer_tier"]',
+            }
+        )
+        == []
+    )
+
+
+def test_vault_hydrated_session_overrides_never_persisted_to_disk(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "vault_guard" / "settings.json"
+    settings_mod.save_profile_settings({"secret_provider": "hashicorp_vault"}, settings_path=cfg_path)
+
+    settings_mod.set_session_overrides({"rf_api_token": "pulled-secret-xyz"}, vault_hydrated=True)
+    assert settings_mod.is_vault_hydrated_setting("rf_api_token") is True
+
+    # Attempting to save the hydrated value back alongside other settings must skip persisting the pulled secret
+    settings_mod.save_profile_settings(
+        {
+            "rf_api_token": "pulled-secret-xyz",
+            "splunk_host": "https://splunk.local:8089",
+        },
+        settings_path=cfg_path,
+    )
+    saved = settings_mod.get_profile_settings(settings_path=cfg_path)
+    assert "rf_api_token" not in saved
+    assert saved["splunk_host"] == "https://splunk.local:8089"
+    assert "pulled-secret-xyz" not in cfg_path.read_text(encoding="utf-8")
+
+    # Manual non-hydrated save still persists normally
+    settings_mod.clear_session_overrides()
+    assert settings_mod.is_vault_hydrated_setting("rf_api_token") is False
+    settings_mod.save_profile_settings({"rf_api_token": "manual-token-abc"}, settings_path=cfg_path)
+    assert settings_mod.get_saved_setting("rf_api_token", settings_path=cfg_path) == "manual-token-abc"

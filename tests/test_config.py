@@ -12,14 +12,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import soclens.settings as settings_mod
 from soclens.config import (
     UI_VIEW_ADMIN,
     UI_VIEW_USER,
     ConfigurationError,
+    S1TierConfig,
+    SecretStoreConfig,
     SplunkConfig,
+    SplunkESTenantConfig,
+    classify_site_tier,
     configure_logging,
     ensure_utf8_console,
+    extract_tenant_from_site_name,
     format_ssl_verify_status,
+    get_local_llm_config,
     get_proxy_summary,
     get_rf_asi_key,
     get_rf_pfi_token,
@@ -27,10 +34,14 @@ from soclens.config import (
     get_rf_sandbox_token,
     get_rf_token,
     get_rf_verify_ssl,
+    get_s1_tier_config,
+    get_secret_store_config,
     get_splunk_config,
+    get_splunk_es_tenant_settings,
     get_ui_view_mode,
     get_workspace_dir,
     has_rf_ssl_env_override,
+    hydrate_secrets_from_store,
     parse_ssl_verify,
     record_api_error,
 )
@@ -362,3 +373,162 @@ def test_get_ui_view_mode_resolution_and_validation() -> None:
 
     with pytest.raises(ConfigurationError):
         get_ui_view_mode("superuser")
+
+
+def test_secret_store_config_masking_and_validation(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "sec" / "settings.json"
+    with patch.dict(os.environ, {}, clear=True):
+        settings_mod.save_profile_settings(
+            {
+                "secret_provider": "secret_server",
+                "rf_verify_ssl": "false",
+                "tss_base_url": "https://tss.corp.local/",
+                "tss_password": "tss-pw-secret",
+                "tss_client_secret": "tss-client-secret",
+                "tss_access_token": "tss-tok-secret",
+                "vault_token": "hvs.vault-secret",
+                "vault_secret_id": "vault-app-secret",
+                "op_connect_token": "op-conn-secret",
+                "bw_master_password": "bw-master-secret",
+                "vault_secret_map": '{"rf_api_token":"secret_server:42:token"}',
+            },
+            settings_path=cfg_path,
+        )
+        # Re-point isolated path for get_effective_setting
+        with patch.object(settings_mod, "_DEFAULT_SETTINGS_PATH_OVERRIDE", cfg_path):
+            cfg = get_secret_store_config()
+            assert isinstance(cfg, SecretStoreConfig)
+            assert cfg.enabled is True
+            assert cfg.is_enabled is True
+            assert cfg.verify_ssl is False
+            assert cfg.tss_base_url == "https://tss.corp.local"
+            assert cfg.tss_api_version == "v1"
+            assert cfg.tss_auto_comment is None
+            assert cfg.secret_map == {"rf_api_token": "secret_server:42:token"}
+
+            rendered = repr(cfg)
+            for secret_val in (
+                "tss-pw-secret",
+                "tss-client-secret",
+                "tss-tok-secret",
+                "hvs.vault-secret",
+                "vault-app-secret",
+                "op-conn-secret",
+                "bw-master-secret",
+            ):
+                assert secret_val not in rendered
+
+        with pytest.raises(ConfigurationError):
+            get_secret_store_config(provider="bad_provider")
+        with pytest.raises(ConfigurationError):
+            get_secret_store_config(tss_auth_mode="invalid")
+        with pytest.raises(ConfigurationError):
+            get_secret_store_config(vault_auth_mode="invalid")
+        with pytest.raises(ConfigurationError):
+            get_secret_store_config(timeout="-1")
+
+
+def test_hydrate_secrets_from_store_precedence_and_no_disk_leak(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "hydrate" / "settings.json"
+    settings_mod.save_profile_settings(
+        {
+            "secret_provider": "hashicorp_vault",
+            "vault_addr": "https://vault.corp.local:8200",
+            "vault_secret_map": json.dumps(
+                {
+                    "rf_api_token": "hashicorp_vault:soc/rf:token",
+                    "s1_api_token": "hashicorp_vault:soc/s1:token",
+                    "rf_llm_api_key": "hashicorp_vault:soc/llm:key",
+                },
+                separators=(",", ":"),
+            ),
+        },
+        settings_path=cfg_path,
+    )
+
+    mock_provider = MagicMock()
+    mock_provider.__enter__.return_value = mock_provider
+    mock_provider.__exit__.return_value = None
+    mock_provider.resolve_mapped_settings.return_value = {
+        "s1_api_token": "s1-vault-secret-9999",
+        "rf_llm_api_key": "llm-vault-secret-8888",
+    }
+
+    with (
+        patch.dict(os.environ, {"RF_API_TOKEN": "env-rf-wins"}, clear=True),
+        patch.object(settings_mod, "_DEFAULT_SETTINGS_PATH_OVERRIDE", cfg_path),
+        patch("soclens.secret_stores.build_secret_store_provider", return_value=mock_provider),
+    ):
+        masked = hydrate_secrets_from_store()
+        # RF_API_TOKEN was set in env so it was skipped when overwrite_existing=False
+        mock_provider.resolve_mapped_settings.assert_called_once_with(
+            {
+                "s1_api_token": "hashicorp_vault:soc/s1:token",
+                "rf_llm_api_key": "hashicorp_vault:soc/llm:key",
+            }
+        )
+        assert set(masked) == {"s1_api_token", "rf_llm_api_key"}
+        assert "s1-vault-secret-9999" not in masked["s1_api_token"]
+        assert "llm-vault-secret-8888" not in masked["rf_llm_api_key"]
+
+        # Effective settings resolve to hydrated memory values + env precedence
+        assert get_rf_token() == "env-rf-wins"
+        assert get_local_llm_config().api_key == "llm-vault-secret-8888"
+
+        # Persisting profile later must never leak hydrated values onto disk
+        settings_mod.save_profile_settings(
+            {"s1_api_token": "s1-vault-secret-9999", "s1_account_id": "acct-42"},
+            settings_path=cfg_path,
+        )
+        disk_text = cfg_path.read_text(encoding="utf-8")
+        assert "s1-vault-secret-9999" not in disk_text
+        assert "llm-vault-secret-8888" not in disk_text
+
+        # Calling with force=False skips already hydrated keys
+        mock_provider.resolve_mapped_settings.reset_mock()
+        assert hydrate_secrets_from_store(force=False) == {}
+        mock_provider.resolve_mapped_settings.assert_not_called()
+
+        # Calling with force=True & overwrite_existing=True refreshes all keys including env
+        mock_provider.resolve_mapped_settings.return_value = {
+            "rf_api_token": "rf-vault-override",
+            "s1_api_token": "s1-vault-refreshed",
+            "rf_llm_api_key": "llm-vault-refreshed",
+        }
+        refreshed = hydrate_secrets_from_store(force=True, overwrite_existing=True)
+        assert set(refreshed) == {"rf_api_token", "s1_api_token", "rf_llm_api_key"}
+        assert get_rf_token() == "rf-vault-override"
+
+        # Pre-set stop_event short-circuits immediately
+        stop_ev = threading.Event()
+        stop_ev.set()
+        assert hydrate_secrets_from_store(force=True, stop_event=stop_ev) == {}
+
+
+def test_splunk_es_tenant_settings_and_s1_tier_classification() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        es_cfg = get_splunk_es_tenant_settings()
+        assert isinstance(es_cfg, SplunkESTenantConfig)
+        assert es_cfg.tenant_field == "tenant_id"
+        assert es_cfg.tenant_aliases == ("org_id", "client_code", "customer_id")
+        assert es_cfg.extract_tenant({"TENANT_ID": "t-100"}) == "t-100"
+        assert es_cfg.extract_tenant({"fields": {"Client_Code": ["c-200"]}}) == "c-200"
+        assert es_cfg.extract_tenant({"rule_name": "no tenant"}) is None
+
+    with patch.dict(os.environ, {"SOCLENS_TENANT_FIELD": "org_code"}, clear=True):
+        inherited = get_splunk_es_tenant_settings()
+        assert inherited.tenant_field == "org_code"
+        assert inherited.extract_tenant({"ORG_CODE": "acme"}) == "acme"
+
+    with patch.dict(
+        os.environ,
+        {"S1_SITE_TENANT_MAP": '{"1234":"tenant-acme","VIP Site":"tenant-vip"}'},
+        clear=True,
+    ):
+        s1_cfg = get_s1_tier_config()
+        assert isinstance(s1_cfg, S1TierConfig)
+        assert s1_cfg.classify_site("MDR-1234") == ("MDR", "1234", "tenant-acme")
+        assert s1_cfg.classify_site("mssp_8298") == ("MSSP", "8298", "8298")
+        assert s1_cfg.classify_site("Default site") == ("Other", None, None)
+        assert classify_site_tier("VIP Site") == ("Other", "tenant-vip")
+        assert extract_tenant_from_site_name("mssp_8298") == "8298"

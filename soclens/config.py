@@ -6,8 +6,10 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,10 +21,20 @@ import urllib3
 from requests.utils import should_bypass_proxies
 
 from soclens.settings import (
+    SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS_BY_KEY,
+    SUPPORTED_SECRET_PROVIDERS,
+    TSS_AUTH_MODES,
+    VAULT_AUTH_MODES,
     get_effective_setting,
+    get_env_override_for_setting,
     get_saved_setting,
     get_session_override,
+    mask_secret,
+    parse_s1_site_tenant_map,
+    parse_s1_tier_rules,
+    parse_vault_secret_map,
+    set_session_overrides,
 )
 
 _ERROR_LOG_LOCK = threading.Lock()
@@ -101,6 +113,241 @@ class LocalLLMConfig:
     verify_ssl: bool | str = True
     temperature: float = 0.2
     max_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class SecretStoreConfig:
+    """Resolved secret manager / PAM configuration (secret fields excluded from repr)."""
+
+    provider: str = "none"
+    verify_ssl: bool | str = True
+    timeout: float = 15.0
+    secret_map: dict[str, str] = field(default_factory=dict)
+
+    # Thycotic / Delinea Secret Server
+    tss_base_url: str = ""
+    tss_auth_mode: str = "password"
+    tss_username: str | None = None
+    tss_password: str | None = field(default=None, repr=False)
+    tss_domain: str | None = None
+    tss_client_id: str | None = None
+    tss_client_secret: str | None = field(default=None, repr=False)
+    tss_access_token: str | None = field(default=None, repr=False)
+    tss_platform_url: str = ""
+    tss_folder_id: str | None = None
+    tss_api_version: str = "v1"
+    tss_auto_comment: str | None = None
+
+    # HashiCorp Vault (KV v2)
+    vault_addr: str = ""
+    vault_auth_mode: str = "token"
+    vault_token: str | None = field(default=None, repr=False)
+    vault_role_id: str | None = None
+    vault_secret_id: str | None = field(default=None, repr=False)
+    vault_auth_mount: str = "approle"
+    vault_kv_mount: str = "secret"
+    vault_namespace: str | None = None
+    vault_prefix: str | None = None
+
+    # 1Password Connect Server
+    op_connect_url: str = ""
+    op_connect_token: str | None = field(default=None, repr=False)
+    op_vault_id: str | None = None
+
+    # Bitwarden (bw serve)
+    bw_serve_url: str = "http://127.0.0.1:8087"
+    bw_master_password: str | None = field(default=None, repr=False)
+    bw_folder_id: str | None = None
+    bw_collection_id: str | None = None
+    bw_organization_id: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """Return True when an active secret store provider is selected."""
+        return self.provider.strip().lower() not in ("", "none")
+
+    @property
+    def is_enabled(self) -> bool:
+        """Return True when an active secret store provider is selected."""
+        return self.enabled
+
+    @property
+    def vault_mount(self) -> str:
+        """Compatibility alias for ``vault_kv_mount``."""
+        return self.vault_kv_mount
+
+    @property
+    def vault_path_prefix(self) -> str:
+        """Compatibility alias for ``vault_prefix``."""
+        return self.vault_prefix or ""
+
+    @property
+    def bw_api_url(self) -> str:
+        """Compatibility alias for ``bw_serve_url``."""
+        return self.bw_serve_url
+
+
+@dataclass(frozen=True)
+class PivotPayload:
+    """Typed cross-workbench pivot message passed across TUI panes."""
+
+    source_tab: str = ""
+    target_tab: str = ""
+    tenant_id: str | None = None
+    site_id: str | None = None
+    site_name: str | None = None
+    tier: str | None = None
+    entity: str | None = None
+    entity_type: str | None = None
+    src_ip: str | None = None
+    dest_ip: str | None = None
+    sha1: str | None = None
+    sha256: str | None = None
+    hostname: str | None = None
+    username: str | None = None
+    orig_sid: str | None = None
+    earliest: str | None = None
+    latest: str | None = None
+    spl_query: str | None = None
+    auto_run: bool = False
+    es_finding: dict[str, Any] | None = None
+    s1_threat: dict[str, Any] | None = None
+    rf_enrichment: dict[str, Any] | None = None
+    summary: str | None = None
+
+    def primary_ioc(self) -> tuple[str, str] | None:
+        """Return the highest-priority ``(entity_type, value)`` tuple for RF/Research pivots."""
+        if self.entity and self.entity.strip():
+            return (self.entity_type or "auto", self.entity.strip())
+        for kind, val in (
+            ("hash", self.sha256),
+            ("hash", self.sha1),
+            ("ip", self.src_ip),
+            ("ip", self.dest_ip),
+            ("host", self.hostname),
+            ("user", self.username),
+        ):
+            if val and val.strip():
+                return (kind, val.strip())
+        return None
+
+
+def _extract_scalar_tenant(val: Any) -> str | None:
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (list, tuple)):
+        for item in val:
+            extracted = _extract_scalar_tenant(item)
+            if extracted is not None:
+                return extracted
+        return None
+    if isinstance(val, (dict, set)):
+        return None
+    cleaned = str(val).strip()
+    return cleaned if cleaned else None
+
+
+@dataclass(frozen=True)
+class SplunkESTenantConfig:
+    """Resolved Splunk ES tenant extraction and custom-field configuration."""
+
+    tenant_field: str = "tenant_id"
+    tenant_aliases: tuple[str, ...] = ("org_id", "client_code", "customer_id")
+    custom_fields: tuple[str, ...] = ()
+
+    @property
+    def all_tenant_keys(self) -> tuple[str, ...]:
+        """Ordered candidate field names starting with ``tenant_field``."""
+        seen: set[str] = {self.tenant_field.casefold()}
+        keys: list[str] = [self.tenant_field]
+        for alias in self.tenant_aliases:
+            low = alias.casefold()
+            if low not in seen:
+                seen.add(low)
+                keys.append(alias)
+        return tuple(keys)
+
+    def extract_tenant(self, record: Mapping[str, Any]) -> str | None:
+        """Extract tenant identifier case-insensitively across primary field and aliases."""
+        containers: list[Mapping[str, Any]] = [record]
+        for nested_key in ("fields", "event"):
+            nested = record.get(nested_key)
+            if isinstance(nested, Mapping):
+                containers.append(nested)
+
+        for candidate_key in self.all_tenant_keys:
+            target = candidate_key.casefold()
+            for container in containers:
+                if candidate_key in container:
+                    val = _extract_scalar_tenant(container[candidate_key])
+                    if val is not None:
+                        return val
+                for rec_k, rec_v in container.items():
+                    if isinstance(rec_k, str) and rec_k.casefold() == target:
+                        val = _extract_scalar_tenant(rec_v)
+                        if val is not None:
+                            return val
+        return None
+
+
+DEFAULT_S1_TIER_RULES: tuple[tuple[str, str], ...] = (
+    ("MDR", r"(?i)^mdr[-_]?([a-z0-9]+)"),
+    ("MSSP", r"(?i)^mssp[-_]?([a-z0-9]+)"),
+)
+_COMPILED_DEFAULT_S1_TIER_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (tier, re.compile(pattern)) for tier, pattern in DEFAULT_S1_TIER_RULES
+)
+
+
+@dataclass(frozen=True)
+class S1TierConfig:
+    """Resolved SentinelOne site tier classification and site-to-tenant mapping."""
+
+    rules: tuple[tuple[str, re.Pattern[str]], ...] = _COMPILED_DEFAULT_S1_TIER_RULES
+    site_tenant_map: dict[str, str] = field(default_factory=dict)
+    default_tier: str = "Other"
+
+    def classify_site(
+        self,
+        site_name: str,
+        site_id: str | None = None,
+    ) -> tuple[str, str | None, str | None]:
+        """Classify ``site_name`` into ``(tier, site_code, tenant_id)``."""
+        cleaned_name = site_name.strip()
+        tier = self.default_tier
+        site_code: str | None = None
+
+        for rule_tier, pattern in self.rules:
+            match = pattern.search(cleaned_name)
+            if match is not None:
+                tier = rule_tier
+                if match.lastindex and match.lastindex >= 1:
+                    raw_code = match.group(1)
+                    if isinstance(raw_code, str) and raw_code.strip():
+                        site_code = raw_code.strip()
+                break
+
+        lowered_map = {k.casefold(): v for k, v in self.site_tenant_map.items()}
+        mapped_tenant: str | None = None
+        candidates: list[str] = []
+        if cleaned_name:
+            candidates.append(cleaned_name)
+        if site_id and site_id.strip():
+            candidates.append(site_id.strip())
+        if site_code:
+            candidates.append(site_code)
+
+        for cand in candidates:
+            if cand in self.site_tenant_map:
+                mapped_tenant = self.site_tenant_map[cand]
+                break
+            low = cand.casefold()
+            if low in lowered_map:
+                mapped_tenant = lowered_map[low]
+                break
+
+        tenant_id = mapped_tenant if mapped_tenant is not None else site_code
+        return tier, site_code, tenant_id
 
 
 def _clean_optional_str(value: str | None) -> str | None:
@@ -633,9 +880,6 @@ def get_splunk_config(
     return config
 
 
-    return config
-
-
 def get_sentinelone_config(
     console_url: str | None = None,
     api_token: str | None = None,
@@ -822,8 +1066,10 @@ def get_local_llm_config(
     resolved_model = _clean_optional_str(
         model if model is not None else os.environ.get("RF_LLM_MODEL")
     )
-    resolved_api_key = _clean_optional_str(
-        api_key if api_key is not None else os.environ.get("RF_LLM_API_KEY")
+    resolved_api_key = (
+        _clean_optional_str(api_key)
+        if api_key is not None
+        else get_effective_setting("rf_llm_api_key")
     )
     raw_timeout: float | str | None = (
         timeout if timeout is not None else os.environ.get("RF_LLM_TIMEOUT")
@@ -855,6 +1101,345 @@ def get_local_llm_config(
         temperature=resolved_temp,
         max_tokens=resolved_max_tokens,
     )
+
+
+def _normalize_optional_url(value: str | None, *, default: str = "") -> str:
+    cleaned = _clean_optional_str(value)
+    if cleaned is None:
+        return default
+    return cleaned.rstrip("/")
+
+
+def get_secret_store_config(
+    *,
+    provider: str | None = None,
+    verify_ssl: bool | str | Path | None = None,
+    timeout: float | str | None = None,
+    secret_map: str | Mapping[str, str] | None = None,
+    tss_base_url: str | None = None,
+    tss_auth_mode: str | None = None,
+    tss_username: str | None = None,
+    tss_password: str | None = None,
+    tss_domain: str | None = None,
+    tss_client_id: str | None = None,
+    tss_client_secret: str | None = None,
+    tss_access_token: str | None = None,
+    tss_platform_url: str | None = None,
+    tss_folder_id: str | None = None,
+    tss_api_version: str | None = None,
+    tss_auto_comment: str | None = None,
+    vault_addr: str | None = None,
+    vault_auth_mode: str | None = None,
+    vault_token: str | None = None,
+    vault_role_id: str | None = None,
+    vault_secret_id: str | None = None,
+    vault_auth_mount: str | None = None,
+    vault_kv_mount: str | None = None,
+    vault_namespace: str | None = None,
+    vault_prefix: str | None = None,
+    op_connect_url: str | None = None,
+    op_connect_token: str | None = None,
+    op_vault_id: str | None = None,
+    bw_serve_url: str | None = None,
+    bw_master_password: str | None = None,
+    bw_folder_id: str | None = None,
+    bw_collection_id: str | None = None,
+    bw_organization_id: str | None = None,
+) -> SecretStoreConfig:
+    """Resolve Secret Manager / PAM configuration from args, session, env, or saved settings."""
+    raw_provider = (
+        _clean_optional_str(provider)
+        if provider is not None
+        else get_effective_setting("secret_provider", include_default=True)
+    )
+    resolved_provider = (raw_provider or "none").strip().lower()
+    if resolved_provider not in SUPPORTED_SECRET_PROVIDERS:
+        valid = ", ".join(SUPPORTED_SECRET_PROVIDERS)
+        raise ConfigurationError(
+            f"Unsupported secret store provider {raw_provider!r}. Expected one of: {valid}."
+        )
+
+    if verify_ssl is not None:
+        resolved_verify: bool | str = parse_ssl_verify(verify_ssl, default=True)
+    else:
+        configured_verify = get_effective_setting("secret_store_verify_ssl")
+        if configured_verify is not None:
+            resolved_verify = parse_ssl_verify(configured_verify, default=True)
+        else:
+            resolved_verify = get_rf_verify_ssl()
+
+    raw_timeout: float | str | None = (
+        timeout
+        if timeout is not None
+        else get_effective_setting("secret_store_timeout", include_default=True)
+    )
+    resolved_timeout = _parse_positive_float(
+        raw_timeout,
+        default=15.0,
+        name="SOCLENS_SECRET_STORE_TIMEOUT",
+    )
+
+    raw_secret_map: str | Mapping[str, str] | None = (
+        secret_map if secret_map is not None else get_effective_setting("vault_secret_map")
+    )
+    try:
+        resolved_secret_map = parse_vault_secret_map(raw_secret_map, strict=False)
+    except ValueError as exc:
+        raise ConfigurationError(f"Invalid vault_secret_map: {exc}") from exc
+
+    raw_tss_auth_mode = (
+        _clean_optional_str(tss_auth_mode)
+        if tss_auth_mode is not None
+        else get_effective_setting("tss_auth_mode", include_default=True)
+    )
+    resolved_tss_auth_mode = (raw_tss_auth_mode or "password").strip().lower()
+    if resolved_tss_auth_mode not in TSS_AUTH_MODES:
+        valid = ", ".join(TSS_AUTH_MODES)
+        raise ConfigurationError(
+            f"Invalid Secret Server auth mode {raw_tss_auth_mode!r}. Expected one of: {valid}."
+        )
+
+    raw_tss_api_ver = (
+        _clean_optional_str(tss_api_version)
+        if tss_api_version is not None
+        else _clean_optional_str(os.environ.get("TSS_API_VERSION"))
+    )
+    resolved_tss_api_ver = (raw_tss_api_ver or "v1").strip().lower()
+    if resolved_tss_api_ver not in {"v1", "v2"}:
+        raise ConfigurationError(
+            f"Invalid Secret Server API version {raw_tss_api_ver!r}. Expected 'v1' or 'v2'."
+        )
+
+    resolved_tss_auto_comment = (
+        _clean_optional_str(tss_auto_comment)
+        if tss_auto_comment is not None
+        else _clean_optional_str(os.environ.get("TSS_AUTO_COMMENT"))
+    )
+
+    raw_vault_auth_mode = (
+        _clean_optional_str(vault_auth_mode)
+        if vault_auth_mode is not None
+        else get_effective_setting("vault_auth_mode", include_default=True)
+    )
+    resolved_vault_auth_mode = (raw_vault_auth_mode or "token").strip().lower()
+    if resolved_vault_auth_mode not in VAULT_AUTH_MODES:
+        valid = ", ".join(VAULT_AUTH_MODES)
+        raise ConfigurationError(
+            f"Invalid Vault auth mode {raw_vault_auth_mode!r}. Expected one of: {valid}."
+        )
+
+    def _opt(explicit_val: str | None, key: str, *, include_default: bool = False) -> str | None:
+        if explicit_val is not None:
+            return _clean_optional_str(explicit_val)
+        return get_effective_setting(key, include_default=include_default)
+
+    return SecretStoreConfig(
+        provider=resolved_provider,
+        verify_ssl=resolved_verify,
+        timeout=resolved_timeout,
+        secret_map=resolved_secret_map,
+        tss_base_url=_normalize_optional_url(_opt(tss_base_url, "tss_base_url")),
+        tss_auth_mode=resolved_tss_auth_mode,
+        tss_username=_opt(tss_username, "tss_username"),
+        tss_password=_opt(tss_password, "tss_password"),
+        tss_domain=_opt(tss_domain, "tss_domain"),
+        tss_client_id=_opt(tss_client_id, "tss_client_id"),
+        tss_client_secret=_opt(tss_client_secret, "tss_client_secret"),
+        tss_access_token=_opt(tss_access_token, "tss_access_token"),
+        tss_platform_url=_normalize_optional_url(_opt(tss_platform_url, "tss_platform_url")),
+        tss_folder_id=_opt(tss_folder_id, "tss_folder_id"),
+        tss_api_version=resolved_tss_api_ver,
+        tss_auto_comment=resolved_tss_auto_comment,
+        vault_addr=_normalize_optional_url(_opt(vault_addr, "vault_addr")),
+        vault_auth_mode=resolved_vault_auth_mode,
+        vault_token=_opt(vault_token, "vault_token"),
+        vault_role_id=_opt(vault_role_id, "vault_role_id"),
+        vault_secret_id=_opt(vault_secret_id, "vault_secret_id"),
+        vault_auth_mount=(_opt(vault_auth_mount, "vault_auth_mount", include_default=True) or "approle").strip("/"),
+        vault_kv_mount=(_opt(vault_kv_mount, "vault_kv_mount", include_default=True) or "secret").strip("/"),
+        vault_namespace=_opt(vault_namespace, "vault_namespace"),
+        vault_prefix=_opt(vault_prefix, "vault_prefix"),
+        op_connect_url=_normalize_optional_url(_opt(op_connect_url, "op_connect_url")),
+        op_connect_token=_opt(op_connect_token, "op_connect_token"),
+        op_vault_id=_opt(op_vault_id, "op_vault_id"),
+        bw_serve_url=_normalize_optional_url(
+            _opt(bw_serve_url, "bw_serve_url", include_default=True),
+            default="http://127.0.0.1:8087",
+        ),
+        bw_master_password=_opt(bw_master_password, "bw_master_password"),
+        bw_folder_id=_opt(bw_folder_id, "bw_folder_id"),
+        bw_collection_id=_opt(bw_collection_id, "bw_collection_id"),
+        bw_organization_id=_opt(bw_organization_id, "bw_organization_id"),
+    )
+
+
+def hydrate_secrets_from_store(
+    *,
+    force: bool = False,
+    overwrite_existing: bool = False,
+    stop_event: threading.Event | None = None,
+) -> dict[str, str]:
+    """Pull mapped secrets into process-local session overrides without writing to disk.
+
+    Preserves environment variable precedence when ``overwrite_existing=False``.
+    Returns ``{setting_key: masked_secret_value}``.
+    """
+    cfg = get_secret_store_config()
+    if not cfg.is_enabled or not cfg.secret_map:
+        return {}
+    if stop_event is not None and stop_event.is_set():
+        return {}
+
+    target_map: dict[str, str] = {}
+    for setting_key, ref in cfg.secret_map.items():
+        if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+            continue
+        if not overwrite_existing and get_env_override_for_setting(setting_key) is not None:
+            continue
+        if not force:
+            has_sess, sess_val = get_session_override(setting_key)
+            if has_sess and sess_val is not None:
+                continue
+        target_map[setting_key] = ref
+
+    if not target_map:
+        return {}
+    if stop_event is not None and stop_event.is_set():
+        return {}
+
+    from soclens.secret_stores import build_secret_store_provider
+
+    with build_secret_store_provider(cfg, stop_event=stop_event) as provider:
+        resolved = provider.resolve_mapped_settings(target_map)
+
+    to_apply: dict[str, str] = {}
+    for setting_key, secret_val in resolved.items():
+        if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+            continue
+        cleaned = _clean_optional_str(secret_val)
+        if cleaned is None:
+            continue
+        if not overwrite_existing and get_env_override_for_setting(setting_key) is not None:
+            continue
+        to_apply[setting_key] = cleaned
+
+    if to_apply:
+        set_session_overrides(to_apply, vault_hydrated=True)
+
+    return {k: mask_secret(v) for k, v in to_apply.items()}
+
+
+def _parse_field_list(raw: str | Sequence[str] | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return ()
+        if stripped.startswith("["):
+            try:
+                loaded: Any = json.loads(stripped)
+            except ValueError:
+                loaded = None
+            if isinstance(loaded, list):
+                return tuple(str(item).strip() for item in loaded if str(item).strip())
+        return tuple(part.strip() for part in stripped.split(",") if part.strip())
+    return tuple(str(item).strip() for item in raw if str(item).strip())
+
+
+def get_splunk_es_tenant_settings(
+    *,
+    tenant_field: str | None = None,
+    tenant_aliases: str | Sequence[str] | None = None,
+    custom_fields: str | Sequence[str] | None = None,
+) -> SplunkESTenantConfig:
+    """Resolve Splunk ES tenant extraction and pinned custom-field settings."""
+    resolved_field = (
+        _clean_optional_str(tenant_field)
+        or get_effective_setting("splunk_es_tenant_field")
+        or get_effective_setting("soclens_tenant_field")
+        or "tenant_id"
+    )
+    resolved_aliases = (
+        _parse_field_list(tenant_aliases)
+        if tenant_aliases is not None
+        else _parse_field_list(
+            get_effective_setting("splunk_es_tenant_aliases", include_default=True)
+        )
+    )
+    if not resolved_aliases and tenant_aliases is None:
+        resolved_aliases = ("org_id", "client_code", "customer_id")
+
+    resolved_custom = (
+        _parse_field_list(custom_fields)
+        if custom_fields is not None
+        else _parse_field_list(get_effective_setting("splunk_es_custom_fields"))
+    )
+
+    return SplunkESTenantConfig(
+        tenant_field=resolved_field,
+        tenant_aliases=resolved_aliases,
+        custom_fields=resolved_custom,
+    )
+
+
+def get_s1_tier_config(
+    *,
+    tier_rules: str | Sequence[Any] | Mapping[str, Any] | None = None,
+    site_tenant_map: str | Mapping[str, Any] | None = None,
+) -> S1TierConfig:
+    """Resolve SentinelOne site tier rules and site-to-tenant override mapping."""
+    raw_rules: str | Sequence[Any] | Mapping[str, Any] | None = (
+        tier_rules if tier_rules is not None else get_effective_setting("s1_tier_rules")
+    )
+    try:
+        parsed_rules = parse_s1_tier_rules(raw_rules)
+    except ValueError as exc:
+        raise ConfigurationError(f"Invalid s1_tier_rules: {exc}") from exc
+
+    compiled_rules = tuple(parsed_rules) if parsed_rules else _COMPILED_DEFAULT_S1_TIER_RULES
+
+    raw_map: str | Mapping[str, Any] | None = (
+        site_tenant_map
+        if site_tenant_map is not None
+        else get_effective_setting("s1_site_tenant_map")
+    )
+    try:
+        parsed_map = parse_s1_site_tenant_map(raw_map)
+    except ValueError as exc:
+        raise ConfigurationError(f"Invalid s1_site_tenant_map: {exc}") from exc
+
+    return S1TierConfig(rules=compiled_rules, site_tenant_map=parsed_map)
+
+
+def classify_site_tier(
+    site_name: str,
+    *,
+    site_id: str | None = None,
+    tier_rules: str | Sequence[Any] | Mapping[str, Any] | None = None,
+    site_tenant_map: str | Mapping[str, Any] | None = None,
+) -> tuple[str, str | None]:
+    """Classify an S1 ``siteName`` into ``(tier, tenant_id)``."""
+    cfg = get_s1_tier_config(tier_rules=tier_rules, site_tenant_map=site_tenant_map)
+    tier, _site_code, tenant_id = cfg.classify_site(site_name, site_id=site_id)
+    return tier, tenant_id
+
+
+def extract_tenant_from_site_name(
+    site_name: str,
+    *,
+    site_id: str | None = None,
+    tier_rules: str | Sequence[Any] | Mapping[str, Any] | None = None,
+    site_tenant_map: str | Mapping[str, Any] | None = None,
+) -> str | None:
+    """Return the mapped or regex-extracted ``tenant_id`` for an S1 site name."""
+    _tier, tenant_id = classify_site_tier(
+        site_name,
+        site_id=site_id,
+        tier_rules=tier_rules,
+        site_tenant_map=site_tenant_map,
+    )
+    return tenant_id
 
 
 def ensure_utf8_console() -> None:
