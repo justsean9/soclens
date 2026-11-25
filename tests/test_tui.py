@@ -10,12 +10,14 @@ import json
 import struct
 import zlib
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from rich.color import ColorSystem
 from rich.console import Console
 from textual.containers import Container, Vertical
+from textual.pilot import Pilot
 from textual.widgets import (
     Button,
     Collapsible,
@@ -51,6 +53,7 @@ from soclens.tui.image_render import (
     render_image_halfblock,
     render_kitty_placeholder_grid,
 )
+from soclens.tui.pivot import PivotPayload, format_copilot_context
 from soclens.tui.rf_formatters import (
     extract_alerts_v3,
     extract_sandbox_samples,
@@ -3025,16 +3028,21 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
         workspace_dir=tmp_path,
     )
 
+    async def _wait_for_settled(target_app: SocLensApp, target_pilot: Pilot[Any]) -> None:
+        for _ in range(20):
+            await target_pilot.pause()
+            if not target_app.workers:
+                break
+            await target_app.workers.wait_for_complete()
+        await target_pilot.pause()
+
     async def _run() -> None:
         async with app.run_test(size=(140, 40)) as pilot:
-            await pilot.pause()
-            await app.workers.wait_for_complete()
-            await pilot.pause()
+            await _wait_for_settled(app, pilot)
 
             # Load entities for report:fOqHJL
             await pilot.click("#wl-lists-table", offset=(4, 2), times=2)
-            await app.workers.wait_for_complete()
-            await pilot.pause()
+            await _wait_for_settled(app, pilot)
 
             # 1. Right-click Company row -> modal displays name & ID, approve calls remove_entity(..., "iuiKOZ", is_id=True)
             await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
@@ -3048,8 +3056,7 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
             assert "Colonial Federal Savings Bank" in body_txt
             assert "iuiKOZ" in body_txt
             await pilot.click("#confirm-approve-btn")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
+            await _wait_for_settled(app, pilot)
             mock_client.remove_entity.assert_called_with("report:fOqHJL", "iuiKOZ", is_id=True)
 
             # 2. Double-click Company row -> populates #wl-ent-type & #wl-ent-value, clicking #wl-remove-btn uses ID
@@ -3062,8 +3069,7 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-approve-btn")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
+            await _wait_for_settled(app, pilot)
             mock_client.remove_entity.assert_called_with("report:fOqHJL", "iuiKOZ", is_id=True)
 
             # 3. Typing opaque ID or exact name while #wl-ent-type has stale default "InternetDomainName"
@@ -3075,8 +3081,7 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
                 await pilot.pause()
                 assert isinstance(app.screen, ConfirmActionModal)
                 await pilot.click("#confirm-approve-btn")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await _wait_for_settled(app, pilot)
                 mock_client.remove_entity.assert_called_with("report:fOqHJL", "iuiKOZ", is_id=True)
 
             # 4. Filter by annotation "1015" and right-click filtered row -> removes "iuiKOZ" with is_id=True
@@ -3092,8 +3097,7 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-approve-btn")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
+            await _wait_for_settled(app, pilot)
             mock_client.remove_entity.assert_called_with("report:fOqHJL", "iuiKOZ", is_id=True)
 
             # 5. Ambiguous duplicate names typed into form -> refused with status message, no remove_entity call
@@ -3109,4 +3113,33 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
             assert "Multiple loaded entities match" in status_txt
 
     asyncio.run(_run())
+
+
+def test_format_copilot_context_renders_spl_query_when_present() -> None:
+    title, body = format_copilot_context(
+        PivotPayload(
+            tenant_id="1234",
+            hostname="FIN-WKSTN-01",
+            summary="Suspicious beacon",
+            entity="198.51.100.42",
+            spl_query="  index=notable tenant_id=1234 | head 5  ",
+            es_finding={"rule_name": "Beacon Check"},
+        )
+    )
+    assert "1234" in title
+    assert "## Indicators & Entities" in body
+    assert "## Splunk Query\n```spl\nindex=notable tenant_id=1234 | head 5\n```" in body
+    assert body.index("## Indicators & Entities") < body.index("## Splunk Query")
+    assert body.index("## Splunk Query") < body.index("## Splunk ES Finding")
+
+    for blank_query in (None, "", "   \n\t  "):
+        _, body_no_spl = format_copilot_context(
+            PivotPayload(
+                tenant_id="1234",
+                hostname="FIN-WKSTN-01",
+                summary="Alert",
+                spl_query=blank_query,
+            )
+        )
+        assert "## Splunk Query" not in body_no_spl
 

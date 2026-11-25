@@ -101,6 +101,10 @@ class _WatchlistSelectTable(DoubleClickDataTable):
             await super()._on_click(event)
             return
 
+        if event.chain >= 2:
+            event.stop()
+            return
+
         if (
             self.show_cursor
             and self.cursor_type != "none"
@@ -174,6 +178,7 @@ class WatchlistsPane(BaseSocPane):
         self._row_key_to_entity: dict[str, dict[str, Any]] = {}
         self._current_list_id: str = ""
         self._current_list_name: str = ""
+        self._lists_request_seq: int = 0
         self._entities_request_seq: int = 0
         self._tables_ready: bool = False
         self._pending_activation: bool = False
@@ -182,7 +187,6 @@ class WatchlistsPane(BaseSocPane):
         self._entity_sort_desc: bool = False
         self._list_sort_by: str = "none"
         self._list_sort_desc: bool = False
-        self._syncing_sort_select: bool = False
         self._selected_entity: dict[str, str] | None = None
 
     def compose(self) -> ComposeResult:
@@ -398,7 +402,7 @@ class WatchlistsPane(BaseSocPane):
             )
             return
         type_filter = str(self.query_one("#wl-type-filter", Select).value)
-        self._load_watchlists_worker(None if type_filter == "all" else type_filter)
+        self._start_load_watchlists(None if type_filter == "all" else type_filter)
 
     def _update_filter_title(self) -> None:
         type_val = str(self.query_one("#wl-type-filter", Select).value)
@@ -452,11 +456,8 @@ class WatchlistsPane(BaseSocPane):
         )
         sort_select = self.query_one("#wl-entity-sort-select", Select)
         if str(sort_select.value) != self._entity_sort_by:
-            self._syncing_sort_select = True
-            try:
+            with sort_select.prevent(Select.Changed):
                 sort_select.value = self._entity_sort_by
-            finally:
-                self._syncing_sort_select = False
 
     def _set_entity_sort(
         self,
@@ -1231,7 +1232,7 @@ class WatchlistsPane(BaseSocPane):
 
     @on(Select.Changed, "#wl-entity-sort-select")
     def handle_entity_sort_select_changed(self, event: Select.Changed) -> None:
-        if self._syncing_sort_select or not self._tables_ready:
+        if not self._tables_ready:
             return
         new_sort = str(event.value)
         if new_sort == self._entity_sort_by:
@@ -1274,15 +1275,24 @@ class WatchlistsPane(BaseSocPane):
         if self._loaded_type_filter == "all" or new_type == self._loaded_type_filter:
             self._render_watchlists_table()
         else:
-            self._load_watchlists_worker(None if new_type == "all" else new_type)
+            self._start_load_watchlists(None if new_type == "all" else new_type)
 
     @on(Button.Pressed, "#wl-clear-filter-btn")
     def handle_clear_filters(self) -> None:
-        self.query_one("#wl-search-input", Input).value = ""
-        self.query_one("#wl-entity-search-input", Input).value = ""
-        self.query_one("#wl-type-filter", Select).value = "all"
+        wl_search = self.query_one("#wl-search-input", Input)
+        ent_search = self.query_one("#wl-entity-search-input", Input)
+        type_select = self.query_one("#wl-type-filter", Select)
+        with wl_search.prevent(Input.Changed):
+            wl_search.value = ""
+        with ent_search.prevent(Input.Changed):
+            ent_search.value = ""
+        with type_select.prevent(Select.Changed):
+            type_select.value = "all"
         self._update_filter_title()
-        self._render_watchlists_table()
+        if self._has_loaded_lists_once and self._loaded_type_filter != "all":
+            self._start_load_watchlists(None)
+        else:
+            self._render_watchlists_table()
         self._render_entities_table()
 
     @on(Button.Pressed, "#wl-back-btn")
@@ -1352,31 +1362,67 @@ class WatchlistsPane(BaseSocPane):
         if self._view_stage == "entities":
             self._set_view_stage("lists")
         type_filter = str(self.query_one("#wl-type-filter", Select).value)
-        self._load_watchlists_worker(None if type_filter == "all" else type_filter)
+        self._start_load_watchlists(None if type_filter == "all" else type_filter)
 
-    @work(thread=True, exit_on_error=False, exclusive=True, group="wl-lists")
-    def _load_watchlists_worker(self, list_type: str | None) -> None:
-        try:
-            if self.is_app_shutting_down():
+    def _start_load_watchlists(self, list_type: str | None) -> None:
+        self._lists_request_seq += 1
+        self._load_watchlists_worker(list_type, self._lists_request_seq)
+
+    def _refresh_watchlists_inline(
+        self,
+        list_type: str | None,
+        *,
+        request_seq: int | None = None,
+        update_status: bool = True,
+    ) -> None:
+        if request_seq is None:
+            def _prepare() -> int | None:
+                if self.is_app_shutting_down():
+                    return None
+                self._lists_request_seq += 1
+                return self._lists_request_seq
+
+            prepared = self.run_on_ui(_prepare)
+            if prepared is None:
                 return
+            seq = int(prepared)
+        else:
+            seq = request_seq
+
+        if seq != self._lists_request_seq or self.is_app_shutting_down():
+            return
+        if update_status:
             self.set_status("Loading watchlists from Recorded Future...")
-            with self.log_scope("watchlists"):
-                raw_lists = self.client.get_watchlists(list_types=list_type)
-            if self.is_app_shutting_down():
+        with self.log_scope("watchlists"):
+            raw_lists = self.client.get_watchlists(list_types=list_type)
+        if seq != self._lists_request_seq or self.is_app_shutting_down():
+            return
+        lists_data = list(raw_lists) if isinstance(raw_lists, list) else []
+
+        def _populate() -> None:
+            if seq != self._lists_request_seq or self.is_app_shutting_down():
                 return
-            lists_data = list(raw_lists) if isinstance(raw_lists, list) else []
+            self._all_watchlists = lists_data
+            self._loaded_type_filter = list_type or "all"
+            self._has_loaded_lists_once = True
+            self._update_filter_title()
+            self._render_watchlists_table()
 
-            def _populate() -> None:
-                self._all_watchlists = lists_data
-                self._loaded_type_filter = list_type or "all"
-                self._has_loaded_lists_once = True
-                self._update_filter_title()
-                self._render_watchlists_table()
-
-            self.run_on_ui(_populate)
+        self.run_on_ui(_populate)
+        if seq != self._lists_request_seq or self.is_app_shutting_down():
+            return
+        if update_status:
             msg = f"Loaded {len(lists_data)} watchlist(s)."
             self.set_status(msg)
             self.append_log(msg)
+
+    @work(thread=True, exit_on_error=False)
+    def _load_watchlists_worker(
+        self, list_type: str | None, request_seq: int | None = None
+    ) -> None:
+        try:
+            seq = self._lists_request_seq if request_seq is None else request_seq
+            self._refresh_watchlists_inline(list_type, request_seq=seq, update_status=True)
         except Exception as exc:
             self.report_error("Load Watchlists", exc)
 
@@ -1414,28 +1460,60 @@ class WatchlistsPane(BaseSocPane):
         )
         self._start_load_entities(list_id, list_name=matched)
 
-    @work(thread=True, exit_on_error=False, exclusive=True, group="wl-entities")
-    def _load_entities_worker(self, list_id: str, request_seq: int) -> None:
-        try:
-            if self.is_app_shutting_down():
+    def _refresh_entities_inline(
+        self,
+        list_id: str,
+        *,
+        request_seq: int | None = None,
+        update_status: bool = True,
+    ) -> None:
+        if request_seq is None:
+            def _prepare() -> int | None:
+                if self.is_app_shutting_down() or list_id != self._current_list_id:
+                    return None
+                self._entities_request_seq += 1
+                self._selected_entity = None
+                return self._entities_request_seq
+
+            prepared = self.run_on_ui(_prepare)
+            if prepared is None:
                 return
+            seq = int(prepared)
+        else:
+            seq = request_seq
+
+        if seq != self._entities_request_seq or self.is_app_shutting_down():
+            return
+        if update_status:
             self.set_status(f"Fetching entities for {list_id}...")
-            with self.log_scope("watchlists"):
-                raw_entries = self.client.get_watchlist_entities(list_id)
-            if self.is_app_shutting_down():
+        with self.log_scope("watchlists"):
+            raw_entries = self.client.get_watchlist_entities(list_id)
+        if seq != self._entities_request_seq or self.is_app_shutting_down():
+            return
+        entries = list(raw_entries) if isinstance(raw_entries, list) else []
+
+        def _populate() -> None:
+            if (
+                seq != self._entities_request_seq
+                or self.is_app_shutting_down()
+                or list_id != self._current_list_id
+            ):
                 return
-            entries = list(raw_entries) if isinstance(raw_entries, list) else []
+            self._current_entities = entries
+            self._render_entities_table()
 
-            def _populate() -> None:
-                if request_seq != self._entities_request_seq:
-                    return
-                self._current_entities = entries
-                self._render_entities_table()
-
-            self.run_on_ui(_populate)
+        self.run_on_ui(_populate)
+        if seq != self._entities_request_seq or self.is_app_shutting_down():
+            return
+        if update_status:
             msg = f"Loaded {len(entries)} entity/entities from {list_id}."
             self.set_status(msg)
             self.append_log(msg)
+
+    @work(thread=True, exit_on_error=False)
+    def _load_entities_worker(self, list_id: str, request_seq: int) -> None:
+        try:
+            self._refresh_entities_inline(list_id, request_seq=request_seq, update_status=True)
         except Exception as exc:
             self.report_error("Load Watchlist Entities", exc)
 
@@ -1457,8 +1535,12 @@ class WatchlistsPane(BaseSocPane):
     @work(thread=True, exit_on_error=False)
     def _create_list_worker(self, name: str, list_type: str) -> None:
         try:
+            if self.is_app_shutting_down():
+                return
             with self.log_scope("watchlists"):
                 created = self.client.create_list(name, list_type)
+            if self.is_app_shutting_down():
+                return
             lid = str(created.get("id") or "")
             if lid:
                 self.run_on_ui(
@@ -1467,7 +1549,8 @@ class WatchlistsPane(BaseSocPane):
             msg = f"Created list '{name}' (ID: {lid}, type={list_type})."
             self.set_status(msg)
             self.append_log(msg)
-            self._load_watchlists_worker(None)
+            if not self.is_app_shutting_down():
+                self._refresh_watchlists_inline(None, update_status=False)
         except Exception as exc:
             self.report_error("Create List", exc)
 
@@ -1489,15 +1572,17 @@ class WatchlistsPane(BaseSocPane):
     @work(thread=True, exit_on_error=False)
     def _add_entity_worker(self, list_id: str, ent_type: str, ent_val: str) -> None:
         try:
+            if self.is_app_shutting_down():
+                return
             with self.log_scope("watchlists"):
                 res: dict[str, Any] = self.client.add_entity(list_id, ent_type, ent_val)
+            if self.is_app_shutting_down():
+                return
             msg = f"Add entity result for '{ent_val}': {res.get('result', 'added')}"
             self.set_status(msg)
             self.append_log(msg)
             if list_id == self._current_list_id and not self.is_app_shutting_down():
-                self.run_on_ui(
-                    self._start_load_entities, list_id, list_name=self._current_list_name
-                )
+                self._refresh_entities_inline(list_id, update_status=False)
         except Exception as exc:
             self.report_error("Add Entity", exc)
 
@@ -1693,18 +1778,20 @@ class WatchlistsPane(BaseSocPane):
     ) -> None:
         label = display_name or ent_val
         try:
+            if self.is_app_shutting_down():
+                return
             with self.log_scope("watchlists"):
                 if is_id:
                     res = self.client.remove_entity(list_id, ent_val, is_id=True)
                 else:
                     res = self.client.remove_entity(list_id, ent_val, entity_type=ent_type)
+            if self.is_app_shutting_down():
+                return
             msg = f"Remove entity result for '{label}': {res.get('result', 'removed')}"
             self.set_status(msg)
             self.append_log(msg)
             if list_id == self._current_list_id and not self.is_app_shutting_down():
-                self.run_on_ui(
-                    self._start_load_entities, list_id, list_name=self._current_list_name
-                )
+                self._refresh_entities_inline(list_id, update_status=False)
         except Exception as exc:
             self.report_error("Remove Entity", exc)
 
@@ -1721,6 +1808,8 @@ class WatchlistsPane(BaseSocPane):
     @work(thread=True, exit_on_error=False)
     def _export_list_worker(self, list_id: str, out_path: str, fmt: str) -> None:
         try:
+            if self.is_app_shutting_down():
+                return
             dest = (
                 self.workspace_dir / out_path
                 if not out_path.startswith(("/", "\\"))
@@ -1728,6 +1817,8 @@ class WatchlistsPane(BaseSocPane):
             )
             with self.log_scope("watchlists"):
                 ok = export_watchlist(self.client, list_id, dest, file_format=fmt)
+            if self.is_app_shutting_down():
+                return
             msg = (
                 f"Exported {list_id} to {dest} ({fmt})."
                 if ok
