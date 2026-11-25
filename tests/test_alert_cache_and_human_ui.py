@@ -1619,3 +1619,202 @@ def test_debug_log_file_sink_redaction_and_logs_filters(tmp_path: Path) -> None:
                 assert btn.region.height >= 1
 
     asyncio.run(_run())
+
+
+def test_preload_invalidates_stale_rf_alert_details_on_status_change(tmp_path: Path) -> None:
+    from soclens.tui.rf_formatters import normalize_alert_v3
+
+    recent = _recent_iso(2)
+    cache_dir = tmp_path / ".soclens_cache" / "alerts"
+    seed = AlertCacheStore(cache_dir=cache_dir)
+
+    old_det_1 = {
+        "id": "rf-stale-1",
+        "title": "Stale Alert 1",
+        "rule": {"name": "Rule 1"},
+        "review": {"status_in_portal": "New", "priority": "High", "assignee": None},
+        "log": {"triggered": recent, "status_date": None},
+    }
+    old_det_2 = {
+        "id": "rf-stale-2",
+        "title": "Stale Alert 2",
+        "rule": {"name": "Rule 2"},
+        "review": {"status_in_portal": "New", "priority": "High", "assignee": None},
+        "log": {"triggered": recent, "status_date": None},
+    }
+    seed.put(
+        CACHE_SOURCE_RF,
+        [normalize_alert_v3(old_det_1), normalize_alert_v3(old_det_2)],
+        timeframe="last_24h",
+        meta={"total": 2, "details": {"rf-stale-1": old_det_1, "rf-stale-2": old_det_2}},
+    )
+
+    search_row_1 = {
+        "id": "rf-stale-1",
+        "title": "Stale Alert 1",
+        "rule": {"name": "Rule 1"},
+        # Search omits status change inside review, only updating status_date
+        "log": {"triggered": recent, "status_date": "2026-11-25T16:42:15Z"},
+    }
+    search_row_2 = {
+        "id": "rf-stale-2",
+        "title": "Stale Alert 2",
+        "rule": {"name": "Rule 2"},
+        "review": {"status_in_portal": "Resolved", "priority": "High"},
+        "log": {"triggered": recent, "status_date": "2026-11-25T17:00:00Z"},
+    }
+    fresh_details = {
+        "rf-stale-1": {
+            "id": "rf-stale-1",
+            "title": "Stale Alert 1",
+            "rule": {"name": "Rule 1"},
+            "review": {"status_in_portal": "Resolved", "priority": "High", "assignee": "soc1@cocc.com"},
+            "log": {"triggered": recent, "status_date": "2026-11-25T16:42:15Z"},
+        },
+        "rf-stale-2": {
+            "id": "rf-stale-2",
+            "title": "Stale Alert 2",
+            "rule": {"name": "Rule 2"},
+            "review": {"status_in_portal": "Resolved", "priority": "High", "assignee": "soc2@cocc.com"},
+            "log": {"triggered": recent, "status_date": "2026-11-25T17:00:00Z"},
+        },
+    }
+
+    rf_client = MagicMock()
+    rf_client.search_alerts_v3.return_value = {
+        "data": [search_row_1, search_row_2],
+        "counts": {"total": 2},
+    }
+    rf_client.get_alert_v3.side_effect = lambda aid: {"data": fresh_details[aid]}
+
+    app = create_app(
+        client=rf_client,
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        preload_alerts=False,
+    )
+    app.alert_cache.load_from_disk_sources()
+    app._preload_rf_alerts_24h()
+
+    assert rf_client.get_alert_v3.call_count == 2
+    entry = app.alert_cache.get(CACHE_SOURCE_RF)
+    assert entry is not None
+    by_id = {it["id"]: it for it in entry.items}
+    assert by_id["rf-stale-1"]["status"] == "Resolved"
+    assert by_id["rf-stale-2"]["status"] == "Resolved"
+    assert by_id["rf-stale-1"]["assignee"] == "soc1@cocc.com"
+
+    # Second preload with matching status/status_date reuses fresh details with 0 get_alert_v3 calls
+    search_row_1["review"] = {"status_in_portal": "Resolved", "priority": "High", "assignee": "soc1@cocc.com"}
+    search_row_2["review"] = {"status_in_portal": "Resolved", "priority": "High", "assignee": "soc2@cocc.com"}
+    app._preload_rf_alerts_24h()
+    assert rf_client.get_alert_v3.call_count == 2
+
+
+def test_preload_invalidates_stale_playbook_details_on_status_or_updated_change(tmp_path: Path) -> None:
+    from soclens.alert_cache import CACHE_SOURCE_RF_PLAYBOOK
+    from soclens.tui.rf_formatters import normalize_playbook_alert
+
+    t1 = _recent_iso(4)
+    t2 = _recent_iso(1)
+    cache_dir = tmp_path / ".soclens_cache" / "alerts"
+    seed = AlertCacheStore(cache_dir=cache_dir)
+
+    old_pb = {
+        "playbook_alert_id": "pb-stale-1",
+        "category": "domain_abuse",
+        "panel_status": {
+            "status": "New",
+            "priority": "High",
+            "updated": t1,
+            "entity_name": "spoof.example",
+        },
+        "panel_evidence_summary": {},
+    }
+    seed.put(
+        CACHE_SOURCE_RF_PLAYBOOK,
+        [normalize_playbook_alert(old_pb)],
+        timeframe="last_24h",
+        meta={"total": 1, "details": {"pb-stale-1": old_pb}, "image_keys": {}},
+    )
+
+    fresh_pb = {
+        "playbook_alert_id": "pb-stale-1",
+        "category": "domain_abuse",
+        "panel_status": {
+            "status": "Resolved",
+            "priority": "High",
+            "assignee_name": "soc@cocc.com",
+            "updated": t2,
+            "entity_name": "spoof.example",
+        },
+        "panel_evidence_summary": {},
+    }
+
+    rf_client = MagicMock()
+    rf_client.search_playbook_alerts.return_value = {
+        "data": [
+            {
+                "playbook_alert_id": "pb-stale-1",
+                "category": "domain_abuse",
+                "status": "Resolved",
+                "priority": "High",
+                "title": "spoof.example",
+                "updated": t2,
+            }
+        ],
+        "counts": {"total": 1},
+    }
+    rf_client.get_playbook_alert.return_value = {"data": fresh_pb}
+
+    app = create_app(
+        client=rf_client,
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        preload_alerts=False,
+    )
+    app.alert_cache.load_from_disk_sources()
+    app._preload_rf_playbook_24h()
+
+    assert rf_client.get_playbook_alert.call_count == 1
+    entry = app.alert_cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+    assert entry is not None
+    assert entry.items[0]["status"] == "Resolved"
+    assert entry.items[0]["assignee"] == "soc@cocc.com"
+
+    # Second preload with identical status & updated reuses cached detail with 0 detail fetches
+    app._preload_rf_playbook_24h()
+    assert rf_client.get_playbook_alert.call_count == 1
+
+
+def test_manual_detail_fetch_updates_alert_cache(tmp_path: Path) -> None:
+    cache_dir = tmp_path / ".soclens_cache" / "alerts"
+    store = AlertCacheStore(cache_dir=cache_dir)
+    store.put(
+        CACHE_SOURCE_RF,
+        [{"id": "rf-1", "title": "Alert 1", "status": "New"}],
+        timeframe="last_24h",
+        meta={"total": 1, "details": {"rf-1": {"id": "rf-1", "review": {"status_in_portal": "New"}}}},
+    )
+
+    fresh_detail = {
+        "id": "rf-1",
+        "review": {"status_in_portal": "Resolved", "assignee": "analyst@cocc.com"},
+        "log": {"status_date": "2026-11-25T18:00:00Z"},
+    }
+    ok = store.update_cached_item(
+        CACHE_SOURCE_RF,
+        "rf-1",
+        item_updates={"status": "Resolved", "assignee": "analyst@cocc.com"},
+        detail=fresh_detail,
+    )
+    assert ok is True
+
+    reloaded = AlertCacheStore(cache_dir=cache_dir)
+    entry = reloaded.get(CACHE_SOURCE_RF)
+    assert entry is not None
+    assert entry.items[0]["status"] == "Resolved"
+    assert entry.items[0]["assignee"] == "analyst@cocc.com"
+    assert entry.meta["details"]["rf-1"]["review"]["status_in_portal"] == "Resolved"

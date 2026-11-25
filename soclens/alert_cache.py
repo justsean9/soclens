@@ -275,6 +275,63 @@ class AlertCacheStore:
         self._persist_entry(entry)
         return entry
 
+    def update_cached_item(
+        self,
+        source: str,
+        item_id: str,
+        *,
+        item_updates: Mapping[str, Any] | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> bool:
+        """Update a single cached item and/or its detail record in memory and on disk."""
+        clean_id = str(item_id or "").strip()
+        if not clean_id:
+            return False
+        payload: dict[str, Any] | None = None
+        path: Path | None = None
+        with self._lock:
+            entry = self._entries.get(source)
+            if entry is None:
+                return False
+            found = False
+            updated_items: list[dict[str, Any]] = []
+            for it in entry.items:
+                if str(it.get("id") or "").strip() == clean_id:
+                    found = True
+                    copy_it = dict(it)
+                    if item_updates:
+                        copy_it.update(item_updates)
+                    updated_items.append(copy_it)
+                else:
+                    updated_items.append(dict(it))
+            if not found and detail is None:
+                return False
+            updated_meta = dict(entry.meta)
+            if detail is not None:
+                raw_details = updated_meta.get("details")
+                details_map = dict(raw_details) if isinstance(raw_details, Mapping) else {}
+                details_map[clean_id] = dict(detail)
+                updated_meta["details"] = details_map
+            updated_entry = AlertCacheEntry(
+                source=entry.source,
+                items=updated_items,
+                fetched_at=max(entry.fetched_at, time.time()),
+                timeframe=entry.timeframe,
+                meta=updated_meta,
+            )
+            self._entries[source] = updated_entry
+            path = self._entry_path(source)
+            if path is not None:
+                payload = updated_entry.to_payload()
+        if path is not None and payload is not None:
+            try:
+                serialized = json.dumps(payload, ensure_ascii=False, default=str)
+                with self._io_lock:
+                    _atomic_write_text(path, serialized, prefix=f".{source}.")
+            except Exception as exc:
+                logger.debug("Failed to persist alert cache %s: %s", source, exc)
+        return True
+
     def _persist_entry(self, entry: AlertCacheEntry) -> None:
         path = self._entry_path(entry.source)
         if path is None:

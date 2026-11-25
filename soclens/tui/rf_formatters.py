@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 from rich import box
@@ -559,6 +559,55 @@ def normalize_playbook_alert(item: dict[str, Any]) -> dict[str, Any]:
         "screenshots_meta": screenshots_meta,
         "raw": item,
     }
+
+
+def is_alert_v3_detail_stale(
+    search_item: Mapping[str, Any], cached_detail: Mapping[str, Any] | None
+) -> bool:
+    """Return True if a cached Alert v3 detail payload is stale relative to a fresh search row."""
+    if not isinstance(cached_detail, Mapping) or not cached_detail:
+        return True
+    cached_norm = normalize_alert_v3(dict(cached_detail))
+    if str(search_item.get("status_date") or "").strip() != str(
+        cached_norm.get("status_date") or ""
+    ).strip():
+        return True
+    s_st = normalize_status_key(search_item.get("status"))
+    c_st = normalize_status_key(cached_norm.get("status"))
+    if s_st and c_st and s_st != c_st:
+        return True
+    s_pr = str(search_item.get("priority") or "").strip().lower()
+    if s_pr not in ("", "-") and s_pr != str(cached_norm.get("priority") or "").strip().lower():
+        return True
+    s_as = str(search_item.get("assignee") or "").strip()
+    if s_as not in ("", "-") and s_as != str(cached_norm.get("assignee") or "").strip():
+        return True
+    s_note = str(search_item.get("note") or "").strip()
+    if s_note and s_note != str(cached_norm.get("note") or "").strip():
+        return True
+    s_hits = int(search_item.get("hits_count") or 0)
+    return s_hits > 0 and s_hits != int(cached_norm.get("hits_count") or 0)
+
+
+def is_playbook_detail_stale(
+    search_item: Mapping[str, Any], cached_detail: Mapping[str, Any] | None
+) -> bool:
+    """Return True if a cached Playbook Alert detail payload is stale relative to a fresh search row."""
+    if not isinstance(cached_detail, Mapping) or not cached_detail:
+        return True
+    cached_norm = normalize_playbook_alert(dict(cached_detail))
+    s_upd = str(search_item.get("updated") or "").strip()
+    if s_upd and s_upd != str(cached_norm.get("updated") or "").strip():
+        return True
+    s_st = normalize_status_key(search_item.get("status"))
+    c_st = normalize_status_key(cached_norm.get("status"))
+    if s_st and c_st and s_st != c_st:
+        return True
+    s_pr = str(search_item.get("priority") or "").strip().lower()
+    if s_pr not in ("", "-") and s_pr != str(cached_norm.get("priority") or "").strip().lower():
+        return True
+    s_as = str(search_item.get("assignee") or "").strip()
+    return s_as not in ("", "-") and s_as != str(cached_norm.get("assignee") or "").strip()
 
 
 def normalize_case(item: dict[str, Any]) -> dict[str, Any]:

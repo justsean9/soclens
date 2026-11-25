@@ -2219,7 +2219,11 @@ class SocLensApp(App[None]):
             from concurrent.futures import ThreadPoolExecutor
 
             from soclens.tui.filters import build_alerts_v3_triggered_param
-            from soclens.tui.rf_formatters import extract_alerts_v3, normalize_alert_v3
+            from soclens.tui.rf_formatters import (
+                extract_alerts_v3,
+                is_alert_v3_detail_stale,
+                normalize_alert_v3,
+            )
 
             rf_client, owns_client = self._get_preload_rf_client()
             try:
@@ -2244,11 +2248,54 @@ class SocLensApp(App[None]):
                         if isinstance(v, dict)
                     }
 
+                def _merge_alert_v3_detail(
+                    item: dict[str, Any], detail: dict[str, Any], *, is_fresh: bool
+                ) -> None:
+                    norm = normalize_alert_v3(detail)
+                    for field in (
+                        "note",
+                        "hits",
+                        "hits_count",
+                        "ai_insights",
+                        "primary_entity",
+                        "rule_name",
+                        "org_name",
+                        "portal_url",
+                    ):
+                        val = norm.get(field)
+                        if val not in ("", None, "-", [], 0) or not item.get(field):
+                            item[field] = val
+                    for field in ("status", "priority", "assignee", "status_date"):
+                        val = norm.get(field)
+                        if is_fresh:
+                            if val not in ("", None, "-", [], 0) or not item.get(field):
+                                item[field] = val
+                        elif item.get(field) in ("", None, "-") and val not in ("", None, "-"):
+                            item[field] = val
+                    if is_fresh and isinstance(norm.get("raw"), dict):
+                        item["raw"] = norm["raw"]
+
+                reusable_details: dict[str, dict[str, Any]] = {}
+                to_fetch: list[str] = []
+                stale_count = 0
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    if not aid:
+                        continue
+                    cached_det = existing_details.get(aid)
+                    if cached_det is not None and not is_alert_v3_detail_stale(item, cached_det):
+                        reusable_details[aid] = cached_det
+                        _merge_alert_v3_detail(item, cached_det, is_fresh=False)
+                    else:
+                        if cached_det is not None:
+                            stale_count += 1
+                        to_fetch.append(aid)
+
                 self.alert_cache.put(
                     CACHE_SOURCE_RF,
                     normalized,
                     timeframe="last_24h",
-                    meta={"total": total, "details": existing_details},
+                    meta={"total": total, "details": dict(reusable_details)},
                 )
                 self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
 
@@ -2256,18 +2303,8 @@ class SocLensApp(App[None]):
                 if not callable(get_detail_fn) or not normalized:
                     return
 
-                alert_ids = [
-                    str(item.get("id") or "").strip()
-                    for item in normalized
-                    if str(item.get("id") or "").strip()
-                ]
-                if not alert_ids:
-                    return
-
-                details_by_id: dict[str, dict[str, Any]] = {
-                    aid: existing_details[aid] for aid in alert_ids if aid in existing_details
-                }
-                to_fetch = [aid for aid in alert_ids if aid not in details_by_id]
+                details_by_id: dict[str, dict[str, Any]] = dict(reusable_details)
+                freshly_fetched: set[str] = set()
 
                 def _fetch_one(aid: str) -> tuple[str, dict[str, Any] | None]:
                     if self._stop_event.is_set() or self._shutting_down:
@@ -2283,7 +2320,7 @@ class SocLensApp(App[None]):
 
                 if to_fetch:
                     with ThreadPoolExecutor(
-                        max_workers=2, thread_name_prefix="soclens-rf-detail"
+                        max_workers=4, thread_name_prefix="soclens-rf-detail"
                     ) as pool:
                         for aid, detail in pool.map(_fetch_one, to_fetch):
                             if self._stop_event.is_set() or self._shutting_down:
@@ -2291,48 +2328,31 @@ class SocLensApp(App[None]):
                                 return
                             if detail is not None:
                                 details_by_id[aid] = detail
+                                freshly_fetched.add(aid)
 
-                if not details_by_id or self._stop_event.is_set() or self._shutting_down:
+                if self._stop_event.is_set() or self._shutting_down:
+                    status = "cancelled"
                     return
 
-                detail_fields = (
-                    "assignee",
-                    "status",
-                    "priority",
-                    "note",
-                    "hits",
-                    "hits_count",
-                    "ai_insights",
-                    "primary_entity",
-                    "rule_name",
-                    "org_name",
-                    "portal_url",
-                    "status_date",
-                )
-                for item in normalized:
-                    aid = str(item.get("id") or "").strip()
-                    detail = details_by_id.get(aid)
-                    if detail is None:
-                        continue
-                    norm = normalize_alert_v3(detail)
-                    for field in detail_fields:
-                        val = norm.get(field)
-                        if val not in ("", None, "-", [], 0) or not item.get(field):
-                            item[field] = val
-                    if isinstance(norm.get("raw"), dict):
-                        item["raw"] = norm["raw"]
+                if freshly_fetched:
+                    for item in normalized:
+                        aid = str(item.get("id") or "").strip()
+                        if aid in freshly_fetched:
+                            _merge_alert_v3_detail(item, details_by_id[aid], is_fresh=True)
 
-                self.alert_cache.put(
-                    CACHE_SOURCE_RF,
-                    normalized,
-                    timeframe="last_24h",
-                    meta={"total": total, "details": details_by_id},
-                )
-                self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
+                    self.alert_cache.put(
+                        CACHE_SOURCE_RF,
+                        normalized,
+                        timeframe="last_24h",
+                        meta={"total": total, "details": details_by_id},
+                    )
+                    self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
+
                 with contextlib.suppress(Exception):
                     self.record_log(
                         f"RF alerts_24h preload complete: {len(normalized)} alerts, "
-                        f"{len(details_by_id)} details ({len(to_fetch)} fetched) in "
+                        f"{len(details_by_id)} details ({len(freshly_fetched)}/{len(to_fetch)} fetched, "
+                        f"{stale_count} stale invalidated, {len(reusable_details)} reused) in "
                         f"{(time.perf_counter() - started):.2f}s.",
                         level="DEBUG",
                         source="cache",
@@ -2382,7 +2402,11 @@ class SocLensApp(App[None]):
             from concurrent.futures import ThreadPoolExecutor
 
             from soclens.tui.filters import build_playbook_date_range
-            from soclens.tui.rf_formatters import extract_playbook_alerts, normalize_playbook_alert
+            from soclens.tui.rf_formatters import (
+                extract_playbook_alerts,
+                is_playbook_detail_stale,
+                normalize_playbook_alert,
+            )
 
             rf_client, owns_client = self._get_preload_rf_client()
             try:
@@ -2415,14 +2439,29 @@ class SocLensApp(App[None]):
                     if isinstance(existing_entry.meta.get("image_keys"), dict):
                         existing_img_keys = dict(existing_entry.meta["image_keys"])
 
+                reusable_details: dict[str, dict[str, Any]] = {}
+                reusable_img_keys: dict[str, Any] = {}
+                stale_count = 0
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    if not aid:
+                        continue
+                    cached_det = existing_details.get(aid)
+                    if cached_det is not None and not is_playbook_detail_stale(item, cached_det):
+                        reusable_details[aid] = cached_det
+                        if aid in existing_img_keys:
+                            reusable_img_keys[aid] = existing_img_keys[aid]
+                    elif cached_det is not None:
+                        stale_count += 1
+
                 self.alert_cache.put(
                     CACHE_SOURCE_RF_PLAYBOOK,
                     normalized,
                     timeframe="last_24h",
                     meta={
                         "total": total,
-                        "details": existing_details,
-                        "image_keys": existing_img_keys,
+                        "details": reusable_details,
+                        "image_keys": reusable_img_keys,
                     },
                 )
                 self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
@@ -2438,18 +2477,21 @@ class SocLensApp(App[None]):
 
                 details_by_id: dict[str, dict[str, Any]] = {}
                 image_keys_by_alert: dict[str, list[tuple[str, str, str]]] = {}
+                fetched_count = 0
 
                 def _fetch_pb_full(
                     item: dict[str, Any],
-                ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
+                ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, bool]:
                     if self._stop_event.is_set() or self._shutting_down:
-                        return "", None, None
+                        return "", None, None, False
                     aid = str(item.get("id") or "").strip()
                     cat = str(item.get("category") or "").strip()
                     if not aid:
-                        return "", None, None
-                    detail = existing_details.get(aid)
+                        return "", None, None, False
+                    detail = reusable_details.get(aid)
+                    was_fetched = False
                     if detail is None:
+                        was_fetched = True
                         try:
                             resp: Any = None
                             if cat and cat != "-" and callable(get_pb):
@@ -2467,7 +2509,7 @@ class SocLensApp(App[None]):
                         except Exception:
                             detail = None
                     if not isinstance(detail, dict):
-                        return aid, None, None
+                        return aid, None, None, was_fetched
                     if not detail.get("category") and cat and cat != "-":
                         detail = {**detail, "category": cat}
                     norm = normalize_playbook_alert(detail)
@@ -2497,16 +2539,18 @@ class SocLensApp(App[None]):
                                 pass
                         if raw_bytes:
                             self._prepare_and_store_playbook_image(img_key, raw_bytes)
-                    return aid, detail, norm
+                    return aid, detail, norm, was_fetched
 
                 with ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="soclens-rf-pb"
                 ) as pool:
-                    for aid, detail, norm in pool.map(_fetch_pb_full, normalized):
+                    for aid, detail, norm, was_fetched in pool.map(_fetch_pb_full, normalized):
                         if self._stop_event.is_set() or self._shutting_down:
                             status = "cancelled"
                             return
                         if aid and detail is not None and norm is not None:
+                            if was_fetched:
+                                fetched_count += 1
                             details_by_id[aid] = detail
                             for entry in normalized:
                                 if str(entry.get("id") or "") == aid:
@@ -2515,6 +2559,10 @@ class SocLensApp(App[None]):
                                         updated_norm["category"] = entry["category"]
                                     if not detail.get("title") and entry.get("title"):
                                         updated_norm["title"] = entry["title"]
+                                    if not was_fetched:
+                                        for state_k in ("status", "priority", "updated", "assignee"):
+                                            if entry.get(state_k) not in ("", None, "-"):
+                                                updated_norm[state_k] = entry[state_k]
                                     entry.update(updated_norm)
                                     eff_cat = str(entry.get("category") or "domain_abuse")
                                     sc_ids = [str(s) for s in (entry.get("screenshot_ids") or []) if s][:4]
@@ -2541,7 +2589,8 @@ class SocLensApp(App[None]):
                 with contextlib.suppress(Exception):
                     self.record_log(
                         f"RF playbook_24h preload complete: {len(normalized)} alerts, "
-                        f"{len(details_by_id)} details, {sum(len(v) for v in image_keys_by_alert.values())} images "
+                        f"{len(details_by_id)} details ({fetched_count} fetched, {stale_count} stale invalidated, "
+                        f"{len(reusable_details)} reused), {sum(len(v) for v in image_keys_by_alert.values())} images "
                         f"in {(time.perf_counter() - started):.2f}s.",
                         level="DEBUG",
                         source="cache",

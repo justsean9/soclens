@@ -87,6 +87,7 @@ from soclens.tui.rf_formatters import (
     extract_sandbox_samples,
     extract_soar_results,
     format_timestamp,
+    is_alert_v3_detail_stale,
     normalize_alert_v3,
     normalize_case,
     normalize_entity_match,
@@ -673,6 +674,17 @@ class RFIntelPane(BaseSocPane):
             raw_total if isinstance(raw_total, int) else len(pb_entry.items)
         )
         pb_details = pb_entry.meta.get("details")
+        pb_detail_ids = (
+            {str(aid) for aid in pb_details if aid and isinstance(pb_details[aid], dict)}
+            if isinstance(pb_details, dict)
+            else set()
+        )
+        for item in pb_entry.items:
+            aid = str(item.get("id") or "").strip()
+            if aid and aid not in pb_detail_ids:
+                key = ("playbook", aid)
+                self._detail_cache.pop(key, None)
+                self._auto_enriched_keys.discard(key)
         if isinstance(pb_details, dict):
             for aid, detail in pb_details.items():
                 if aid and isinstance(detail, dict):
@@ -758,6 +770,17 @@ class RFIntelPane(BaseSocPane):
             raw_total if isinstance(raw_total, int) else len(entry.items)
         )
         cached_details = entry.meta.get("details")
+        cached_detail_ids = (
+            {str(aid) for aid in cached_details if aid and isinstance(cached_details[aid], dict)}
+            if isinstance(cached_details, dict)
+            else set()
+        )
+        for item in entry.items:
+            aid = str(item.get("id") or "").strip()
+            if aid and aid not in cached_detail_ids:
+                key = ("alerts_v3", aid)
+                self._detail_cache.pop(key, None)
+                self._auto_enriched_keys.discard(key)
         if isinstance(cached_details, dict):
             for aid, detail in cached_details.items():
                 if aid and isinstance(detail, dict):
@@ -2742,6 +2765,64 @@ class RFIntelPane(BaseSocPane):
                     assignee=assignee_val,
                 )
 
+            if mode in ("alerts_v3", "playbook"):
+                cache = getattr(self.app, "alert_cache", None)
+                if cache is not None and hasattr(cache, "update_cached_item"):
+                    cache_src = CACHE_SOURCE_RF if mode == "alerts_v3" else CACHE_SOURCE_RF_PLAYBOOK
+                    triage_updates: dict[str, Any] = {}
+                    if status_val is not None:
+                        triage_updates["status"] = status_val
+                    if priority_val is not None:
+                        triage_updates["priority"] = priority_val
+                    if assignee_val is not None:
+                        triage_updates["assignee"] = assignee_val
+                    if note_val is not None:
+                        triage_updates["note"] = note_val
+                    updated_detail: dict[str, Any] | None = None
+                    cache_entry = cache.get(cache_src)
+                    if cache_entry is not None and isinstance(cache_entry.meta.get("details"), dict):
+                        raw_det = cache_entry.meta["details"].get(item_id)
+                        if isinstance(raw_det, dict):
+                            updated_detail = dict(raw_det)
+                            if status_val is not None:
+                                updated_detail["status"] = status_val
+                                updated_detail["statusInPortal"] = status_val
+                                if isinstance(updated_detail.get("review"), dict):
+                                    updated_detail["review"] = {
+                                        **updated_detail["review"],
+                                        "status_in_portal": status_val,
+                                    }
+                                if isinstance(updated_detail.get("panel_status"), dict):
+                                    updated_detail["panel_status"] = {
+                                        **updated_detail["panel_status"],
+                                        "status": status_val,
+                                    }
+                            if priority_val is not None:
+                                updated_detail["priority"] = priority_val
+                                if isinstance(updated_detail.get("panel_status"), dict):
+                                    updated_detail["panel_status"] = {
+                                        **updated_detail["panel_status"],
+                                        "priority": priority_val,
+                                    }
+                            if assignee_val is not None:
+                                updated_detail["assignee"] = assignee_val
+                                if isinstance(updated_detail.get("review"), dict):
+                                    updated_detail["review"] = {
+                                        **updated_detail["review"],
+                                        "assignee": assignee_val,
+                                    }
+                            if note_val is not None and isinstance(updated_detail.get("review"), dict):
+                                updated_detail["review"] = {
+                                    **updated_detail["review"],
+                                    "note": note_val,
+                                }
+                    cache.update_cached_item(
+                        cache_src,
+                        item_id,
+                        item_updates=triage_updates or None,
+                        detail=updated_detail,
+                    )
+
             def _apply_local() -> None:
                 for entry in self._datasets.get(mode, []):
                     if str(entry.get("id") or "") == item_id:
@@ -3742,16 +3823,22 @@ class RFIntelPane(BaseSocPane):
                 cache = getattr(self.app, "alert_cache", None)
                 if cache is not None:
                     existing_entry = cache.get(CACHE_SOURCE_RF)
-                    existing_details = (
+                    raw_existing_details = (
                         existing_entry.meta.get("details")
                         if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict)
                         else {}
                     )
+                    reusable_details: dict[str, dict[str, Any]] = {}
+                    for item in normalized:
+                        aid = str(item.get("id") or "").strip()
+                        det = raw_existing_details.get(aid) if aid else None
+                        if isinstance(det, dict) and not is_alert_v3_detail_stale(item, det):
+                            reusable_details[aid] = det
                     cache.put(
                         CACHE_SOURCE_RF,
                         normalized,
                         timeframe="last_24h",
-                        meta={"total": total, "details": existing_details},
+                        meta={"total": total, "details": reusable_details},
                     )
 
             def _apply() -> tuple[list[dict[str, Any]], int] | None:
@@ -3785,6 +3872,34 @@ class RFIntelPane(BaseSocPane):
             if not isinstance(detail, dict):
                 detail = resp
             norm = normalize_alert_v3(detail)
+            cache = getattr(self.app, "alert_cache", None)
+            if cache is not None and hasattr(cache, "update_cached_item") and isinstance(detail, dict):
+                item_updates = {
+                    k: norm[k]
+                    for k in (
+                        "assignee",
+                        "status",
+                        "priority",
+                        "note",
+                        "hits",
+                        "hits_count",
+                        "ai_insights",
+                        "primary_entity",
+                        "rule_name",
+                        "org_name",
+                        "portal_url",
+                        "status_date",
+                    )
+                    if norm.get(k) not in ("", None, "-", [], 0)
+                }
+                if isinstance(norm.get("raw"), dict):
+                    item_updates["raw"] = norm["raw"]
+                cache.update_cached_item(
+                    CACHE_SOURCE_RF,
+                    alert_id,
+                    item_updates=item_updates,
+                    detail=detail,
+                )
 
             def _apply() -> None:
                 self._last_error_payload = None
@@ -3960,6 +4075,19 @@ class RFIntelPane(BaseSocPane):
             ):
                 detail = {**detail, "category": category}
             norm = normalize_playbook_alert(detail)
+            cache = getattr(self.app, "alert_cache", None)
+            if cache is not None and hasattr(cache, "update_cached_item") and isinstance(detail, dict):
+                pb_updates = {
+                    k: v
+                    for k, v in norm.items()
+                    if v not in ("", None, "-", [], 0) or k == "raw"
+                }
+                cache.update_cached_item(
+                    CACHE_SOURCE_RF_PLAYBOOK,
+                    alert_id,
+                    item_updates=pb_updates,
+                    detail=detail,
+                )
             effective_cat = str(
                 norm.get("category")
                 if norm.get("category") and norm.get("category") != "-"
