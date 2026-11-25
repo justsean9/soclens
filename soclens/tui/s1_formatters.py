@@ -13,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from soclens.timezone import format_iso_timestamp
+from soclens.tui.pivot import make_pivot_text
 from soclens.tui.rf_formatters import render_raw_json, truncate_text
 
 _CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
@@ -139,12 +140,12 @@ def _kv_table(rows: Sequence[tuple[str, str | Text]]) -> Table:
         if isinstance(val, Text):
             if val.plain.strip() in ("", "-"):
                 continue
-            tbl.add_row(label, val)
+            tbl.add_row(label, make_pivot_text(val, field=label))
         else:
             clean = str(val or "").strip()
             if not clean or clean == "-":
                 continue
-            tbl.add_row(label, Text(clean))
+            tbl.add_row(label, make_pivot_text(clean, field=label))
     return tbl
 
 

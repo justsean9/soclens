@@ -21,7 +21,7 @@ from soclens.config import get_splunk_config
 from soclens.splunk import SplunkClient, export_results_csv, export_results_json
 from soclens.splunk_rf_enrichment import SplunkRFEnricher
 from soclens.tui.filters import SPLUNK_TIME_PRESETS
-from soclens.tui.pivot import PivotPayload, build_spl_from_pivot
+from soclens.tui.pivot import PivotPayload, build_spl_from_pivot, make_pivot_text
 from soclens.tui.s1_formatters import format_s1_value as _format_human_value
 from soclens.tui.s1_formatters import pretty_s1_label as _pretty_field_label
 from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
@@ -506,7 +506,7 @@ class SplunkSearchPane(BaseSocPane):
             rendered = _format_human_value(value)
             if rendered and rendered != "-":
                 label = "Time" if key == "_time" else ("Raw Event" if key == "_raw" else _pretty_field_label(str(key)))
-                tbl.add_row(label, Text(rendered))
+                tbl.add_row(label, make_pivot_text(rendered, field=label))
         detail.write(
             Panel(
                 tbl,
@@ -598,6 +598,8 @@ class SplunkSearchPane(BaseSocPane):
 
     def on_click(self, event: events.Click) -> None:
         if event.button != 3:
+            return
+        if self.handle_field_pivot_right_click(event, source_tab="tab-splunk-search"):
             return
         event.stop()
         self._open_search_menu(

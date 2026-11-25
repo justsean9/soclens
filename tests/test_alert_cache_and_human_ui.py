@@ -374,3 +374,51 @@ def test_splunk_search_detail_is_human_readable(tmp_path: Path) -> None:
             assert '"action":' not in text
 
     asyncio.run(_run())
+
+
+def test_any_field_right_click_pivot_and_keyword_spl(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from soclens.tui.modals import ContextMenuModal
+    from soclens.tui.pivot import (
+        build_keyword_spl,
+        extract_pivot_from_click,
+        make_pivot_text,
+    )
+
+    assert build_keyword_spl("services.exe") == 'index=* "services.exe"'
+    assert build_keyword_spl("da39a3ee5e6b4b0d3255bfef95601890afd80709") == (
+        'index=* "da39a3ee5e6b4b0d3255bfef95601890afd80709"'
+    )
+
+    tagged = make_pivot_text("services.exe", field="Process")
+    span_style = tagged.spans[0].style
+    fake_event = SimpleNamespace(style=span_style)
+    assert extract_pivot_from_click(fake_event) == ("Process", "services.exe")
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(SentinelOnePane)
+            pane.open_field_pivot_menu("Process", "services.exe", origin=(10, 10))
+            await pilot.pause()
+            assert isinstance(app.screen, ContextMenuModal)
+            # Selecting the first item ("splunk_keyword") pivots to Splunk Search with index=* "services.exe"
+            app.screen.dismiss("splunk_keyword")
+            await pilot.pause()
+            await pilot.pause()
+            search_pane = app.query_one(SplunkSearchPane)
+            from textual.widgets import TextArea
+
+            spl_val = search_pane.query_one("#splunk-search-spl", TextArea).text
+            assert spl_val == 'index=* "services.exe"'
+
+    asyncio.run(_run())

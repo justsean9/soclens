@@ -57,7 +57,7 @@ from soclens.tui.filters import (
     timestamp_matches_timeframe,
 )
 from soclens.tui.modals import SplunkNotableTriageModal
-from soclens.tui.pivot import emit_pivot
+from soclens.tui.pivot import emit_pivot, make_pivot_text
 from soclens.tui.rf_formatters import render_raw_json
 from soclens.tui.s1_formatters import format_s1_value as _format_human_value
 from soclens.tui.s1_formatters import pretty_s1_label as _pretty_field_label
@@ -2880,7 +2880,8 @@ class SplunkESPane(BaseSocPane):
                     continue
                 rendered = _format_human_value(value)
                 if rendered and rendered != "-":
-                    tbl.add_row(_pretty_field_label(str(key)), Text(rendered))
+                    lbl = _pretty_field_label(str(key))
+                    tbl.add_row(lbl, make_pivot_text(rendered, field=lbl))
             detail.write(
                 Panel(
                     tbl,
@@ -2900,7 +2901,8 @@ class SplunkESPane(BaseSocPane):
                         continue
                     rendered = _format_human_value(rv)
                     if rendered and rendered != "-":
-                        extra_tbl.add_row(_pretty_field_label(str(rk)), Text(rendered))
+                        lbl = _pretty_field_label(str(rk))
+                        extra_tbl.add_row(lbl, make_pivot_text(rendered, field=lbl))
                         added += 1
                 if added > 0:
                     detail.write(
@@ -2935,7 +2937,7 @@ class SplunkESPane(BaseSocPane):
         tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
         tbl.add_column(ratio=1, overflow="fold")
         if tenant_badge and tenant_badge != "-":
-            tbl.add_row("Tenant", Text(tenant_badge, style="bold magenta"))
+            tbl.add_row("Tenant", make_pivot_text(Text(tenant_badge, style="bold magenta"), field="Tenant"))
         preferred = (
             "event_id",
             "rule_title",
@@ -2961,14 +2963,15 @@ class SplunkESPane(BaseSocPane):
             if rendered and rendered != "-":
                 seen.add(key)
                 label = "Time" if key == "_time" else _pretty_field_label(key)
-                tbl.add_row(label, Text(rendered))
+                tbl.add_row(label, make_pivot_text(rendered, field=label))
         for key, value in row.items():
             if key in seen or key in _RF_ENRICHMENT_KEYS or str(key).startswith("_"):
                 continue
             rendered = _format_human_value(value)
             if rendered and rendered != "-":
                 seen.add(key)
-                tbl.add_row(_pretty_field_label(str(key)), Text(rendered))
+                lbl = _pretty_field_label(str(key))
+                tbl.add_row(lbl, make_pivot_text(rendered, field=lbl))
 
         title_hint = str(row.get("rule_title") or row.get("title") or row.get("event_id") or "Finding")
         detail.write(
@@ -3242,6 +3245,8 @@ class SplunkESPane(BaseSocPane):
 
     def on_click(self, event: events.Click) -> None:
         if event.button != 3:
+            return
+        if self.handle_field_pivot_right_click(event, source_tab="tab-splunk-es"):
             return
         event.stop()
         self._open_es_menu(

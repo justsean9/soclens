@@ -15,6 +15,7 @@ from rich.table import Table
 from rich.text import Text
 
 from soclens.tui.image_render import render_screenshot_panel
+from soclens.tui.pivot import make_pivot_text
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -832,7 +833,7 @@ def _kv_table(rows: Sequence[tuple[str, str | Text]], *, title: str | None = Non
     table.add_column("Value", overflow="fold")
     for k, v in rows:
         cell = v if isinstance(v, Text) else Text(_as_str(v) or "-")
-        table.add_row(Text(k, style="bold dim"), cell)
+        table.add_row(Text(k, style="bold dim"), make_pivot_text(cell, field=k))
     return table
 
 

@@ -86,7 +86,9 @@ def _kv_table(rows: list[tuple[str, str | Text]], *, title: str | None = None) -
     table.add_column("Value", overflow="fold")
     for k, v in rows:
         cell = v if isinstance(v, Text) else Text(_as_str(v) or "-")
-        table.add_row(Text(k, style="bold dim"), cell)
+        from soclens.tui.pivot import make_pivot_text
+
+        table.add_row(Text(k, style="bold dim"), make_pivot_text(cell, field=k))
     return table
 
 

@@ -5,20 +5,56 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from rich.style import Style
+from rich.text import Text
+
 from soclens.config import PivotPayload, extract_tenant_from_site_name
 
 __all__ = [
     "PivotPayload",
+    "build_keyword_spl",
     "build_spl_from_pivot",
     "emit_pivot",
+    "extract_pivot_from_click",
     "extract_tenant_from_site_name",
     "format_copilot_context",
+    "make_pivot_text",
 ]
 
 
 def _spl_quote(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def build_keyword_spl(keyword: str) -> str:
+    """Build a universal Splunk keyword search query ``index=* "<keyword>"``."""
+    clean = str(keyword or "").strip()
+    if not clean:
+        return "index=*"
+    return f"index=* {_spl_quote(clean)}"
+
+
+def make_pivot_text(value: str | Text, *, field: str = "") -> Text:
+    """Attach right-click pivot metadata (``pivot_field``/``pivot_value``) to a Rich ``Text``."""
+    text = value.copy() if isinstance(value, Text) else Text(str(value))
+    plain = text.plain.strip()
+    if plain and plain != "-":
+        text.stylize(Style(meta={"pivot_field": field, "pivot_value": plain}))
+    return text
+
+
+def extract_pivot_from_click(event: Any) -> tuple[str, str] | None:
+    """Extract ``(field_label, value)`` from a Textual click event's Rich style metadata."""
+    style = getattr(event, "style", None)
+    meta = getattr(style, "meta", None) if style is not None else None
+    if not isinstance(meta, dict):
+        return None
+    raw_val = str(meta.get("pivot_value") or "").strip()
+    if not raw_val or raw_val == "-":
+        return None
+    raw_field = str(meta.get("pivot_field") or "Value").strip() or "Value"
+    return raw_field, raw_val
 
 
 def build_spl_from_pivot(payload: PivotPayload) -> tuple[str, bool]:

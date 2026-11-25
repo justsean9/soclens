@@ -27,6 +27,12 @@ from soclens.client import (
 from soclens.config import ConfigurationError, get_workspace_dir
 from soclens.tui.clipboard import copy_text_to_clipboard
 from soclens.tui.modals import ConfirmActionModal, ContextMenuModal, CopyTextModal
+from soclens.tui.pivot import (
+    PivotPayload,
+    build_keyword_spl,
+    emit_pivot,
+    extract_pivot_from_click,
+)
 
 
 def extract_table_row_text(table: DataTable[Any], row_index: int | None = None) -> str:
@@ -424,6 +430,104 @@ class BaseSocPane(VerticalScroll):
             ContextMenuModal(items, title=title, origin=origin),
             _handle_result,
         )
+
+    def open_field_pivot_menu(
+        self,
+        field_label: str,
+        value: str,
+        *,
+        origin: tuple[int, int] = (2, 2),
+        source_tab: str = "",
+    ) -> None:
+        """Open a universal right-click search & pivot menu for any clicked field value."""
+        clean_val = str(value or "").strip()
+        if not clean_val or clean_val == "-":
+            return
+        short_val = clean_val if len(clean_val) <= 34 else f"{clean_val[:31]}..."
+        spl_preview = build_keyword_spl(short_val)
+        items: list[tuple[str, str]] = [
+            ("splunk_keyword", f"Splunk Search: {spl_preview}"),
+            ("research", f"Deep Research (RF + OSINT): {short_val}"),
+            ("rf_intel", "RF Intel Lookup (v2 / Entity Match)"),
+            ("splunk_es", "Search Splunk ES Notables"),
+            ("sentinelone", "Search SentinelOne"),
+            ("llm", "Analyze in Local LLM (F7)"),
+            ("copy_value", f"Copy Value ({field_label})"),
+        ]
+
+        def _on_select(action_id: str) -> None:
+            if action_id == "copy_value":
+                self.copy_to_clipboard(clean_val, label=field_label)
+                return
+            if action_id == "splunk_keyword":
+                spl = build_keyword_spl(clean_val)
+                open_fn = getattr(self.app, "open_splunk_search", None)
+                if callable(open_fn):
+                    open_fn(spl, auto_run=False)
+                else:
+                    emit_pivot(
+                        self.app,
+                        PivotPayload(
+                            source_tab=source_tab or self.LOG_SOURCE,
+                            target_tab="tab-splunk-search",
+                            entity=clean_val,
+                            spl_query=spl,
+                        ),
+                    )
+                return
+            target_map = {
+                "research": "tab-research",
+                "rf_intel": "tab-rf-intel",
+                "splunk_es": "tab-splunk-es",
+                "sentinelone": "tab-sentinelone",
+                "llm": "tab-llm",
+            }
+            target_tab = target_map.get(action_id)
+            if not target_tab:
+                return
+            emit_pivot(
+                self.app,
+                PivotPayload(
+                    source_tab=source_tab or self.LOG_SOURCE,
+                    target_tab=target_tab,
+                    entity=clean_val,
+                    entity_type="auto",
+                    summary=f"{field_label}: {clean_val}",
+                ),
+            )
+
+        self.open_context_menu(
+            items,
+            title=f"Pivot {field_label}: {short_val}",
+            origin=origin,
+            on_select=_on_select,
+        )
+
+    def handle_field_pivot_right_click(
+        self,
+        event: events.Click,
+        *,
+        source_tab: str = "",
+    ) -> bool:
+        """If ``event`` is a right-click on a pivotable field value, open the pivot menu."""
+        if event.button != 3:
+            return False
+        hit = extract_pivot_from_click(event)
+        if hit is None:
+            return False
+        field_label, value = hit
+        event.stop()
+        self.open_field_pivot_menu(
+            field_label,
+            value,
+            origin=(event.screen_x, event.screen_y),
+            source_tab=source_tab,
+        )
+        return True
+
+    def on_click(self, event: events.Click) -> None:
+        """Default pane right-click handler enabling any-field search & pivot."""
+        self.handle_field_pivot_right_click(event)
 
     def confirm_destructive_action(
         self,

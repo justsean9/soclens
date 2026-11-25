@@ -854,6 +854,8 @@ class ResearchPane(BaseSocPane):
     def on_click(self, event: events.Click) -> None:
         if event.button != 3:
             return
+        if self.handle_field_pivot_right_click(event, source_tab="tab-research"):
+            return
         event.stop()
         self._open_research_context_menu(origin=(event.screen_x, event.screen_y))
 

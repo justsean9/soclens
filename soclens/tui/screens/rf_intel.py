@@ -2120,6 +2120,8 @@ class RFIntelPane(BaseSocPane):
     def on_click(self, event: events.Click) -> None:
         if event.button != 3:
             return
+        if self.handle_field_pivot_right_click(event, source_tab="tab-rf-intel"):
+            return
         event.stop()
         in_detail = False
         try:
