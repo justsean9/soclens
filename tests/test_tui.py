@@ -1969,7 +1969,8 @@ def test_tui_playbook_auto_downloads_screenshots_renders_inline_and_opens_modal(
             await pilot.pause()
 
             images_btn = app.query_one("#rf-images-btn", Button)
-            assert images_btn.disabled is True
+            assert images_btn.disabled is False
+            assert "Images (2)" in str(images_btn.label)
 
             await pilot.click("#rf-fetch-detail-btn")
             await app.workers.wait_for_complete()

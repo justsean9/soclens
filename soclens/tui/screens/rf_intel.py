@@ -88,6 +88,7 @@ from soclens.tui.rf_formatters import (
     extract_soar_results,
     format_timestamp,
     is_alert_v3_detail_stale,
+    is_playbook_detail_stale,
     normalize_alert_v3,
     normalize_case,
     normalize_entity_match,
@@ -1559,7 +1560,14 @@ class RFIntelPane(BaseSocPane):
             pass
 
         item = self._get_selected_item() if has_sel else None
-        sc_ids = (item.get("screenshot_ids") or []) if item and self._active_mode == "playbook" else []
+        sc_ids: list[Any] = []
+        if item and self._active_mode == "playbook":
+            sc_ids = list(item.get("screenshot_ids") or [])
+            if not sc_ids:
+                item_id = str(item.get("id") or "")
+                cached_pb = self._detail_cache.get(("playbook", item_id))
+                if isinstance(cached_pb, dict):
+                    sc_ids = list(normalize_playbook_alert(cached_pb).get("screenshot_ids") or [])
         if sc_ids:
             images_btn.disabled = False
             images_btn.label = (
@@ -1624,28 +1632,67 @@ class RFIntelPane(BaseSocPane):
         self, category: str, alert_id: str, screenshot_ids: list[str]
     ) -> None:
         cache = getattr(self.app, "alert_cache", None)
+        is_unavail_fn = getattr(cache, "is_image_unavailable", None)
+        mark_unavail_fn = getattr(cache, "mark_image_unavailable", None)
+        get_img_fn = getattr(self.client, "get_playbook_alert_image", None)
         results: dict[str, dict[str, Any] | None] = {}
+        downloaded_count = 0
+        prepared_count = 0
         try:
             for sid in screenshot_ids:
                 if self.is_app_shutting_down():
                     return
                 img_key = f"{category}__{alert_id}__{sid}"
+                if callable(is_unavail_fn) and is_unavail_fn(img_key):
+                    results[sid] = {"error": "Screenshot unavailable (HTTP 404 from Recorded Future)"}
+                    continue
                 prepared = (
                     cache.get_prepared_image(img_key)
                     if cache is not None and hasattr(cache, "get_prepared_image")
                     else None
                 )
-                if prepared is None and cache is not None:
-                    raw_bytes = cache.get_image_bytes(img_key)
-                    if raw_bytes:
+                if prepared is None:
+                    raw_bytes = cache.get_image_bytes(img_key) if cache is not None else None
+                    if raw_bytes is None and self._auto_enrich_enabled and callable(get_img_fn):
+                        try:
+                            fetched = get_img_fn(category, alert_id, sid)
+                            if isinstance(fetched, (bytes, bytearray)) and len(fetched) > 8:
+                                raw_bytes = bytes(fetched)
+                                downloaded_count += 1
+                                if cache is not None:
+                                    cache.put_image_bytes(img_key, raw_bytes)
+                            else:
+                                prepared = {
+                                    "error": "Empty or unsupported screenshot response"
+                                }
+                        except RecordedFutureError as img_exc:
+                            if img_exc.status_code == 404:
+                                if callable(mark_unavail_fn):
+                                    mark_unavail_fn(img_key)
+                                prepared = {
+                                    "error": "Screenshot unavailable (HTTP 404 from Recorded Future)"
+                                }
+                            else:
+                                prepared = {"error": self.format_exception(img_exc)}
+                        except Exception as img_exc:
+                            prepared = {"error": self.format_exception(img_exc)}
+                    if prepared is None and raw_bytes:
                         try:
                             prepared = prepare_image_cache_entry(raw_bytes)
-                            if hasattr(cache, "put_prepared_image"):
+                            prepared_count += 1
+                            if cache is not None and hasattr(cache, "put_prepared_image"):
                                 cache.put_prepared_image(img_key, prepared)
                         except Exception as exc:
                             prepared = {"error": self.format_exception(exc)}
                 results[sid] = prepared
         finally:
+            if downloaded_count or prepared_count:
+                self.record_app_log(
+                    f"Playbook screenshot worker ({alert_id}): downloaded={downloaded_count}, prepared={prepared_count}.",
+                    level="DEBUG",
+                    source="cache",
+                )
+
             def _apply() -> None:
                 for sid in screenshot_ids:
                     self._preparing_image_keys.discard((category, alert_id, sid))
@@ -1686,6 +1733,7 @@ class RFIntelPane(BaseSocPane):
 
         cache = getattr(self.app, "alert_cache", None)
         get_prepared = getattr(cache, "get_prepared_image", None)
+        is_unavail_fn = getattr(cache, "is_image_unavailable", None)
         loading_fn = getattr(self.app, "is_cache_source_loading", None)
         pb_loading = callable(loading_fn) and bool(loading_fn(CACHE_SOURCE_RF_PLAYBOOK))
         pb_has_key_set: set[str] = set()
@@ -1699,18 +1747,25 @@ class RFIntelPane(BaseSocPane):
         missing_for_bg: list[str] = []
         for sc_id in sc_ids[:4]:
             sid = str(sc_id)
+            img_key = f"{category}__{alert_id}__{sid}"
             img_tuple = (category, alert_id, sid)
             entry = self._image_cache.get(img_tuple)
             if entry is None and callable(get_prepared):
-                prepared = get_prepared(f"{category}__{alert_id}__{sid}")
+                prepared = get_prepared(img_key)
                 if isinstance(prepared, dict):
                     self._image_cache[img_tuple] = prepared
                     entry = prepared
             if entry is None:
-                if sid in pb_has_key_set or pb_loading:
+                if callable(is_unavail_fn) and is_unavail_fn(img_key):
+                    sc_map[sid] = {"error": "Screenshot unavailable (HTTP 404 from Recorded Future)"}
+                elif sid in pb_has_key_set:
                     sc_map[sid] = {"loading": True}
-                    if sid in pb_has_key_set:
-                        missing_for_bg.append(sid)
+                    missing_for_bg.append(sid)
+                elif pb_loading:
+                    sc_map[sid] = {"loading": True}
+                elif self._auto_enrich_enabled:
+                    sc_map[sid] = {"loading": True}
+                    missing_for_bg.append(sid)
                 continue
 
             view_entry = dict(entry)
@@ -1825,10 +1880,13 @@ class RFIntelPane(BaseSocPane):
             cat = str(item.get("category") or "domain_abuse")
             avail_w = self.query_one("#rf-log", RichLog).scrollable_content_region.width
             effective_w = max(48, avail_w or 84)
+            sc_ids = list(item.get("screenshot_ids") or [])
+            if not sc_ids and isinstance(cached_full, dict):
+                sc_ids = list(normalize_playbook_alert(cached_full).get("screenshot_ids") or [])
             sc_map = self._prepare_inline_screenshots(
                 cat,
                 item_id,
-                list(item.get("screenshot_ids") or []),
+                sc_ids,
                 effective_w,
             )
             rendered = render_playbook_alert_detail(
@@ -3424,7 +3482,7 @@ class RFIntelPane(BaseSocPane):
         raw_obj = item.get("raw")
         raw = raw_obj if isinstance(raw_obj, dict) else {}
         if mode == "playbook":
-            return not item.get("assignee") and not isinstance(raw.get("panel_status"), dict)
+            return not isinstance(raw.get("panel_status"), dict)
         if mode == "alerts_v3":
             return not item.get("assignee")
         if mode == "cases":
@@ -3531,6 +3589,8 @@ class RFIntelPane(BaseSocPane):
                             if isinstance(raw_data, dict)
                             else (resp if isinstance(resp, dict) else {})
                         )
+                        if not detail:
+                            return None
                         if not detail.get("category") and cat and cat != "-":
                             detail = {**detail, "category": cat}
                         norm = normalize_playbook_alert(detail)
@@ -3541,14 +3601,28 @@ class RFIntelPane(BaseSocPane):
                         )
                         sc_ids = [str(s) for s in (norm.get("screenshot_ids") or []) if s][:4]
                         cache = getattr(self.app, "alert_cache", None)
+                        is_unavail_fn = getattr(cache, "is_image_unavailable", None)
+                        mark_unavail_fn = getattr(cache, "mark_image_unavailable", None)
+                        if cache is not None and hasattr(cache, "update_cached_item") and isinstance(detail, dict):
+                            cache.update_cached_item(
+                                CACHE_SOURCE_RF_PLAYBOOK,
+                                aid,
+                                item_updates=norm,
+                                detail=detail,
+                            )
                         for sid in sc_ids:
                             if self.is_app_shutting_down() or seq != self._enrich_seq:
                                 break
                             img_tuple = (eff_cat, aid, sid)
                             if img_tuple in self._image_cache and not self._image_cache[img_tuple].get("error"):
                                 continue
+                            img_key = f"{eff_cat}__{aid}__{sid}"
+                            if callable(is_unavail_fn) and is_unavail_fn(img_key):
+                                self._image_cache[img_tuple] = {
+                                    "error": "Screenshot unavailable (HTTP 404 from Recorded Future)"
+                                }
+                                continue
                             try:
-                                img_key = f"{eff_cat}__{aid}__{sid}"
                                 raw_bytes = (
                                     cache.get_image_bytes(img_key) if cache is not None else None
                                 )
@@ -3560,11 +3634,26 @@ class RFIntelPane(BaseSocPane):
                                         raw_bytes = bytes(fetched)
                                         if cache is not None:
                                             cache.put_image_bytes(img_key, raw_bytes)
+                                    else:
+                                        self._image_cache[img_tuple] = {
+                                            "error": "Empty or unsupported screenshot response"
+                                        }
                                 if raw_bytes:
                                     prepared = prepare_image_cache_entry(bytes(raw_bytes))
                                     self._image_cache[img_tuple] = prepared
                                     if cache is not None and hasattr(cache, "put_prepared_image"):
                                         cache.put_prepared_image(img_key, prepared)
+                            except RecordedFutureError as img_exc:
+                                if img_exc.status_code == 404:
+                                    if callable(mark_unavail_fn):
+                                        mark_unavail_fn(img_key)
+                                    self._image_cache[img_tuple] = {
+                                        "error": "Screenshot unavailable (HTTP 404 from Recorded Future)"
+                                    }
+                                else:
+                                    self._image_cache[img_tuple] = {
+                                        "error": self.format_exception(img_exc)
+                                    }
                             except Exception as img_exc:
                                 self._image_cache[img_tuple] = {
                                     "error": self.format_exception(img_exc)
@@ -3598,6 +3687,8 @@ class RFIntelPane(BaseSocPane):
                             if isinstance(raw_data, dict)
                             else (resp if isinstance(resp, dict) else {})
                         )
+                        if not detail:
+                            return None
                         norm = normalize_alert_v3(detail)
                         return aid, norm, detail
                     except Exception as exc:
@@ -3639,6 +3730,10 @@ class RFIntelPane(BaseSocPane):
                         "targets",
                         "attackers",
                         "actions_taken",
+                        "logo_hashes",
+                        "logotypes",
+                        "screenshot_ids",
+                        "screenshots_meta",
                         "updated",
                         "risk_score",
                     ):
@@ -3815,25 +3910,55 @@ class RFIntelPane(BaseSocPane):
                     total = len(by_id)
 
             normalized = [normalize_alert_v3(item) for item in raw_items]
-            if (
-                str(f.get("timeframe") or "any") == "last_24h"
-                and not active_statuses
-                and assignee_val.lower() == "any"
-            ):
-                cache = getattr(self.app, "alert_cache", None)
-                if cache is not None:
-                    existing_entry = cache.get(CACHE_SOURCE_RF)
-                    raw_existing_details = (
-                        existing_entry.meta.get("details")
-                        if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict)
-                        else {}
-                    )
-                    reusable_details: dict[str, dict[str, Any]] = {}
-                    for item in normalized:
-                        aid = str(item.get("id") or "").strip()
-                        det = raw_existing_details.get(aid) if aid else None
-                        if isinstance(det, dict) and not is_alert_v3_detail_stale(item, det):
-                            reusable_details[aid] = det
+
+            def _merge_v3_det(entry: dict[str, Any], det: dict[str, Any]) -> None:
+                norm_det = normalize_alert_v3(det)
+                for field in (
+                    "note",
+                    "hits",
+                    "hits_count",
+                    "ai_insights",
+                    "primary_entity",
+                    "rule_name",
+                    "org_name",
+                    "portal_url",
+                ):
+                    val = norm_det.get(field)
+                    if val not in ("", None, "-", [], 0) or not entry.get(field):
+                        entry[field] = val
+                for field in ("status", "priority", "assignee", "status_date"):
+                    if entry.get(field) in ("", None, "-") and norm_det.get(field) not in (
+                        "",
+                        None,
+                        "-",
+                    ):
+                        entry[field] = norm_det[field]
+                if isinstance(norm_det.get("raw"), dict):
+                    entry["raw"] = norm_det["raw"]
+
+            cache = getattr(self.app, "alert_cache", None)
+            reusable_details: dict[str, dict[str, Any]] = {}
+            stale_ids: set[str] = set()
+            if cache is not None:
+                existing_entry = cache.get(CACHE_SOURCE_RF)
+                raw_existing_details = (
+                    existing_entry.meta.get("details")
+                    if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict)
+                    else {}
+                )
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    det = raw_existing_details.get(aid) if aid else None
+                    if isinstance(det, dict) and not is_alert_v3_detail_stale(item, det):
+                        reusable_details[aid] = det
+                        _merge_v3_det(item, det)
+                    elif aid:
+                        stale_ids.add(aid)
+                if (
+                    str(f.get("timeframe") or "any") == "last_24h"
+                    and not active_statuses
+                    and assignee_val.lower() == "any"
+                ):
                     cache.put(
                         CACHE_SOURCE_RF,
                         normalized,
@@ -3844,6 +3969,22 @@ class RFIntelPane(BaseSocPane):
             def _apply() -> tuple[list[dict[str, Any]], int] | None:
                 if seq != self._request_seq:
                     return None
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    if not aid:
+                        continue
+                    key = ("alerts_v3", aid)
+                    if aid in reusable_details:
+                        self._detail_cache[key] = reusable_details[aid]
+                        self._auto_enriched_keys.add(key)
+                    elif aid in stale_ids or aid not in self._detail_cache:
+                        ui_det = self._detail_cache.get(key)
+                        if isinstance(ui_det, dict) and not is_alert_v3_detail_stale(item, ui_det):
+                            _merge_v3_det(item, ui_det)
+                            self._auto_enriched_keys.add(key)
+                        else:
+                            self._detail_cache.pop(key, None)
+                            self._auto_enriched_keys.discard(key)
                 self._datasets["alerts_v3"] = normalized
                 self._dataset_totals["alerts_v3"] = total
                 self._active_mode = "alerts_v3"
@@ -4029,9 +4170,65 @@ class RFIntelPane(BaseSocPane):
             raw_items, total = extract_playbook_alerts(data)
             normalized = [normalize_playbook_alert(item) for item in raw_items]
 
+            def _merge_pb_det(entry: dict[str, Any], det: dict[str, Any]) -> None:
+                norm_det = dict(normalize_playbook_alert(det))
+                if norm_det.get("category") == "-" and entry.get("category"):
+                    norm_det["category"] = entry["category"]
+                if not det.get("title") and entry.get("title"):
+                    norm_det["title"] = entry["title"]
+                for state_k in ("status", "priority", "updated", "assignee"):
+                    if entry.get(state_k) not in ("", None, "-"):
+                        norm_det[state_k] = entry[state_k]
+                entry.update(norm_det)
+
+            cache = getattr(self.app, "alert_cache", None)
+            reusable_pb_details: dict[str, dict[str, Any]] = {}
+            stale_pb_ids: set[str] = set()
+            if cache is not None:
+                pb_entry = cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+                raw_pb_details = (
+                    pb_entry.meta.get("details")
+                    if pb_entry is not None and isinstance(pb_entry.meta.get("details"), dict)
+                    else {}
+                )
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    det = raw_pb_details.get(aid) if aid else None
+                    if isinstance(det, dict) and not is_playbook_detail_stale(item, det):
+                        reusable_pb_details[aid] = det
+                        _merge_pb_det(item, det)
+                    elif aid:
+                        stale_pb_ids.add(aid)
+
             def _apply() -> tuple[list[dict[str, Any]], int] | None:
                 if seq != self._request_seq:
                     return None
+                get_prepared = getattr(cache, "get_prepared_image", None)
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    if not aid:
+                        continue
+                    key = ("playbook", aid)
+                    if aid in reusable_pb_details:
+                        self._detail_cache[key] = reusable_pb_details[aid]
+                        self._auto_enriched_keys.add(key)
+                    elif aid in stale_pb_ids or key in self._detail_cache:
+                        ui_det = self._detail_cache.get(key)
+                        if isinstance(ui_det, dict) and not is_playbook_detail_stale(item, ui_det):
+                            _merge_pb_det(item, ui_det)
+                            self._auto_enriched_keys.add(key)
+                        else:
+                            self._detail_cache.pop(key, None)
+                            self._auto_enriched_keys.discard(key)
+                    if callable(get_prepared):
+                        eff_cat = str(item.get("category") or "domain_abuse")
+                        for sid in item.get("screenshot_ids") or []:
+                            sid_s = str(sid)
+                            img_tuple = (eff_cat, aid, sid_s)
+                            if img_tuple not in self._image_cache:
+                                prep = get_prepared(f"{eff_cat}__{aid}__{sid_s}")
+                                if isinstance(prep, dict) and prep.get("decoded") is not None:
+                                    self._image_cache[img_tuple] = prep
                 self._datasets["playbook"] = normalized
                 self._dataset_totals["playbook"] = total
                 self._active_mode = "playbook"

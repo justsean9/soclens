@@ -1818,3 +1818,158 @@ def test_manual_detail_fetch_updates_alert_cache(tmp_path: Path) -> None:
     assert entry.items[0]["status"] == "Resolved"
     assert entry.items[0]["assignee"] == "analyst@cocc.com"
     assert entry.meta["details"]["rf-1"]["review"]["status_in_portal"] == "Resolved"
+
+
+def test_playbook_button_preserves_cached_screenshots_and_auto_downloads_missing(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Button
+
+    from soclens.alert_cache import CACHE_SOURCE_RF_PLAYBOOK
+    from soclens.tui.image_render import DecodedImage, encode_png
+    from soclens.tui.rf_formatters import normalize_playbook_alert
+
+    recent = _recent_iso(1)
+    rgb_rows = [bytes([25, 110, 210] * 16) for _ in range(16)]
+    png_bytes = encode_png(
+        DecodedImage(width=16, height=16, color_type=2, bit_depth=8, raw_size=0, rgb_rows=rgb_rows)
+    )
+
+    cache_dir = tmp_path / ".soclens_cache" / "alerts"
+    seed = AlertCacheStore(cache_dir=cache_dir)
+    cached_detail = {
+        "playbook_alert_id": "pb-cached-1",
+        "category": "domain_abuse",
+        "panel_status": {
+            "status": "New",
+            "priority": "High",
+            "updated": recent,
+            "entity_name": "cached-brand.example",
+        },
+        "panel_evidence_summary": {
+            "screenshots": [{"image_id": "img-cached-1", "description": "Cached screenshot"}]
+        },
+    }
+    ondemand_detail = {
+        "playbook_alert_id": "pb-ondemand-3",
+        "category": "domain_abuse",
+        "panel_status": {
+            "status": "New",
+            "priority": "Moderate",
+            "updated": recent,
+            "entity_name": "ondemand.example",
+        },
+        "panel_evidence_summary": {
+            "screenshots": [{"image_id": "img-ondemand-3", "description": "Missing from disk"}]
+        },
+    }
+    seed.put(
+        CACHE_SOURCE_RF_PLAYBOOK,
+        [normalize_playbook_alert(cached_detail), normalize_playbook_alert(ondemand_detail)],
+        timeframe="last_24h",
+        meta={
+            "total": 2,
+            "details": {"pb-cached-1": cached_detail, "pb-ondemand-3": ondemand_detail},
+            "image_keys": {"pb-cached-1": [["domain_abuse", "pb-cached-1", "domain_abuse__pb-cached-1__img-cached-1"]]},
+        },
+    )
+    seed.put_image_bytes("domain_abuse__pb-cached-1__img-cached-1", png_bytes)
+
+    rf_client = MagicMock()
+    rf_client.search_playbook_alerts.return_value = {
+        "data": [
+            {
+                "playbook_alert_id": "pb-cached-1",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "cached-brand.example",
+                "updated": recent,
+            },
+            {
+                "playbook_alert_id": "pb-new-2",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "new-brand.example",
+                "updated": recent,
+            },
+            {
+                "playbook_alert_id": "pb-ondemand-3",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "Moderate",
+                "title": "ondemand.example",
+                "updated": recent,
+            },
+        ],
+        "counts": {"total": 3},
+    }
+    rf_client.get_playbook_alert.return_value = {
+        "data": {
+            "playbook_alert_id": "pb-new-2",
+            "category": "domain_abuse",
+            "panel_status": {
+                "status": "InProgress",
+                "priority": "High",
+                "assignee_name": "soc@cocc.com",
+                "updated": recent,
+                "entity_name": "new-brand.example",
+            },
+            "panel_evidence_summary": {
+                "screenshots": [{"image_id": "img-new-2", "description": "New screenshot"}]
+            },
+        }
+    }
+    rf_client.get_playbook_alert_image.return_value = png_bytes
+
+    app = create_app(
+        client=rf_client,
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        preload_alerts=False,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            app.activate_tab("tab-rf-intel")
+            await pilot.pause()
+            await pilot.pause()
+            rf_pane = app.query_one(RFIntelPane)
+
+            # Clicking Playbook Alerts keeps pb-cached-1's screenshots/prepared image and auto-downloads pb-new-2
+            await pilot.click("#rf-pb-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert rf_pane._active_mode == "playbook"
+            rf_client.get_playbook_alert.assert_called_once_with("domain_abuse", "pb-new-2")
+            by_id = {it["id"]: it for it in rf_pane._datasets["playbook"]}
+            assert by_id["pb-cached-1"]["screenshot_ids"] == ["img-cached-1"]
+            assert by_id["pb-new-2"]["screenshot_ids"] == ["img-new-2"]
+            assert rf_pane._image_cache[("domain_abuse", "pb-cached-1", "img-cached-1")].get("decoded") is not None
+            assert rf_pane._image_cache[("domain_abuse", "pb-new-2", "img-new-2")].get("decoded") is not None
+            assert app.query_one("#rf-images-btn", Button).disabled is False
+
+            # Selecting pb-ondemand-3 (whose image wasn't on disk yet) auto-downloads img-ondemand-3
+            table = rf_pane.query_one("#rf-results-table", DoubleClickDataTable)
+            ondemand_idx = next(
+                idx for idx, it in enumerate(rf_pane._visible_items) if it.get("id") == "pb-ondemand-3"
+            )
+            table.move_cursor(row=ondemand_idx, column=0)
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert rf_pane._image_cache[("domain_abuse", "pb-ondemand-3", "img-ondemand-3")].get("decoded") is not None
+            assert app.alert_cache.get_image_bytes("domain_abuse__pb-ondemand-3__img-ondemand-3") == png_bytes
+            img_calls = [call.args for call in rf_client.get_playbook_alert_image.call_args_list]
+            assert ("domain_abuse", "pb-new-2", "img-new-2") in img_calls
+            assert ("domain_abuse", "pb-ondemand-3", "img-ondemand-3") in img_calls
+            assert ("domain_abuse", "pb-cached-1", "img-cached-1") not in img_calls
+
+    asyncio.run(_run())
