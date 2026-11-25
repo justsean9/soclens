@@ -278,14 +278,16 @@ def test_tui_alerts_auto_enrich_on_screen_assignee_and_toggle(tmp_path: Path) ->
             assert "alice_soc" in row_vals
             assert "InProgress" in row_vals
 
-            # 2. Playbook Alerts automatically fetches lightweight panels=["status"] WITHOUT image downloads
+            # 2. Playbook Alerts automatically preloads full details and precaches screenshots
             await pilot.click("#rf-pb-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
             mock_client.get_playbook_alert.assert_called_once_with(
-                "domain_abuse", "pb-enr-1", panels=["status"]
+                "domain_abuse", "pb-enr-1"
             )
-            assert mock_client.get_playbook_alert_image.call_count == 0
+            mock_client.get_playbook_alert_image.assert_called_once_with(
+                "domain_abuse", "pb-enr-1", "shot-should-not-download"
+            )
             pb_row = [str(c) for c in table.get_row_at(0)]
             assert "bob_analyst" in pb_row
             assert "InProgress" in pb_row

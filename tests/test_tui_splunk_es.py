@@ -1175,14 +1175,23 @@ def test_tui_splunk_es_item_type_pill_reloads_from_investigations_and_pivot_host
 def test_tui_splunk_es_preset_reload_from_investigations_and_pivot_user_dash(
     tmp_path: Path,
 ) -> None:
+    from datetime import UTC, datetime, timedelta
+
     from textual.widgets import Checkbox
 
     from soclens.config import get_splunk_es_tenant_settings
 
     fake_es = _make_mc_fake_es()
+    now_utc = datetime.now(UTC)
     finding_items = [
-        dict(fake_es.query_findings_hybrid(item_type="all")["items"][0]),
-        dict(fake_es.query_findings_hybrid(item_type="all")["items"][1]),
+        {
+            **fake_es.query_findings_hybrid(item_type="all")["items"][0],
+            "_time": (now_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        {
+            **fake_es.query_findings_hybrid(item_type="all")["items"][1],
+            "_time": (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
     ]
     inv_items = list(fake_es.list_investigations.return_value)
     inv_rows_ref: list[list[dict[str, Any]]] = [inv_items]
