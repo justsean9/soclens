@@ -1008,3 +1008,338 @@ def test_tui_splunk_es_80x24_long_status_and_banners_clamp_and_restore(tmp_path:
                     assert w.styles.inline.get_rule("overflow_y") is None
 
     asyncio.run(_run())
+
+
+def test_tui_splunk_es_item_type_pill_reloads_from_investigations_and_pivot_hostname(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Checkbox
+
+    fake_es = _make_mc_fake_es()
+    finding_items = [
+        dict(fake_es.query_findings_hybrid(item_type="all")["items"][0]),
+        dict(fake_es.query_findings_hybrid(item_type="all")["items"][1]),
+    ]
+    group_item = {
+        "event_id": "grp-1@@finding_group@@1",
+        "finding_id": "grp-1@@finding_group@@1",
+        "rule_title": "Grouped Host Risk",
+        "rule_name": "grouped_host_risk",
+        "urgency": "high",
+        "status": 1,
+        "status_label": "New",
+        "owner": "unassigned",
+        "tenant_id": "ACME",
+        "item_type": "finding_group",
+        "is_investigation": False,
+        "source_backend": "mc_v2",
+        "_time": "2026-11-24T12:05:00Z",
+        "raw": {"event_id": "grp-1@@finding_group@@1", "tenant_id": "ACME"},
+    }
+    inv_items = list(fake_es.list_investigations.return_value)
+    query_calls: list[str] = []
+
+    def _query_side_effect(**kwargs: Any) -> dict[str, Any]:
+        itype = str(kwargs.get("item_type") or "all")
+        query_calls.append(itype)
+        if itype == "investigations":
+            rows = inv_items
+        elif itype == "findings":
+            rows = finding_items
+        elif itype == "finding_groups":
+            rows = [group_item]
+        else:
+            rows = [*finding_items, group_item]
+        return {
+            "items": rows,
+            "total": len(rows),
+            "offset": 0,
+            "limit": 100,
+            "source_backend": "mc_v2",
+        }
+
+    fake_es.query_findings_hybrid.side_effect = _query_side_effect
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=False,
+        initial_tab="tab-splunk-es",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        with patch.object(SplunkESPane, "_build_es_client", return_value=fake_es):
+            async with app.run_test(size=(150, 42)) as pilot:
+                await pilot.pause()
+                pane = app.query_one(SplunkESPane)
+                app.query_one("#es-auto-enrich-cb", Checkbox).value = False
+                await pilot.click("#es-refresh-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                table = app.query_one("#es-table", DataTable)
+                assert query_calls == ["all"]
+                assert pane._loaded_item_type == "all"
+                assert table.row_count == 3
+
+                # Client-side filter from "all" -> "findings" -> "all" does not reload
+                await pilot.click("#es-type-findings-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all"]
+                assert table.row_count == 2
+
+                await pilot.click("#es-type-all-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all"]
+                assert table.row_count == 3
+
+                # Switch to Investigations (reloads)
+                await pilot.click("#es-type-investigations-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all", "investigations"]
+                assert pane._loaded_item_type == "investigations"
+                assert table.row_count == 1
+                assert "Existing Investigation" in [str(c) for c in table.get_row_at(0)]
+
+                # Switch back to Findings WITHOUT clicking #es-refresh-btn -> reloads!
+                await pilot.click("#es-type-findings-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all", "investigations", "findings"]
+                assert pane._loaded_item_type == "findings"
+                assert table.row_count == 2
+
+                # Switch from Findings -> All WITHOUT clicking #es-refresh-btn -> reloads!
+                await pilot.click("#es-type-all-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all", "investigations", "findings", "all"]
+                assert pane._loaded_item_type == "all"
+                assert table.row_count == 3
+
+                # Switch to Investigations, then Clear Filters WITHOUT clicking #es-refresh-btn -> reloads!
+                await pilot.click("#es-type-investigations-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert table.row_count == 1
+                await pilot.click("#es-clear-filter-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == [
+                    "all",
+                    "investigations",
+                    "findings",
+                    "all",
+                    "investigations",
+                    "all",
+                ]
+                assert table.row_count == 3
+
+                # Verify _build_pivot_payload hostname fallback from risk_object
+                p_host = pane._build_pivot_payload(
+                    "tab-sentinelone",
+                    {
+                        "risk_object": "wkstn-1001-01.example.test",
+                        "risk_object_type": "system",
+                        "src": "198.51.100.10",
+                    },
+                )
+                assert p_host.hostname == "wkstn-1001-01.example.test"
+
+                p_ip = pane._build_pivot_payload(
+                    "tab-sentinelone",
+                    {
+                        "risk_object": "203.0.113.45",
+                        "risk_object_type": "system",
+                        "src": "198.51.100.10",
+                    },
+                )
+                assert p_ip.hostname is None
+
+                p_user = pane._build_pivot_payload(
+                    "tab-sentinelone",
+                    {
+                        "risk_object": "jdoe@example.test",
+                        "risk_object_type": "user",
+                        "src": "198.51.100.10",
+                    },
+                )
+                assert p_user.hostname is None
+
+    asyncio.run(_run())
+
+
+def test_tui_splunk_es_preset_reload_from_investigations_and_pivot_user_dash(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Checkbox
+
+    from soclens.config import get_splunk_es_tenant_settings
+
+    fake_es = _make_mc_fake_es()
+    finding_items = [
+        dict(fake_es.query_findings_hybrid(item_type="all")["items"][0]),
+        dict(fake_es.query_findings_hybrid(item_type="all")["items"][1]),
+    ]
+    inv_items = list(fake_es.list_investigations.return_value)
+    inv_rows_ref: list[list[dict[str, Any]]] = [inv_items]
+    query_calls: list[str] = []
+
+    def _query_side_effect(**kwargs: Any) -> dict[str, Any]:
+        itype = str(kwargs.get("item_type") or "all")
+        query_calls.append(itype)
+        rows = inv_rows_ref[0] if itype == "investigations" else finding_items
+        return {
+            "items": rows,
+            "total": len(rows),
+            "offset": 0,
+            "limit": 100,
+            "source_backend": "mc_v2",
+        }
+
+    fake_es.query_findings_hybrid.side_effect = _query_side_effect
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=False,
+        initial_tab="tab-splunk-es",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        with patch.object(SplunkESPane, "_build_es_client", return_value=fake_es):
+            async with app.run_test(size=(150, 42)) as pilot:
+                await pilot.pause()
+                pane = app.query_one(SplunkESPane)
+                app.query_one("#es-auto-enrich-cb", Checkbox).value = False
+                await pilot.click("#es-refresh-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                table = app.query_one("#es-table", DataTable)
+                assert query_calls == ["all"]
+
+                # Switch to non-empty investigations, then built-in preset "active_24h"
+                await pilot.click("#es-type-investigations-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert pane._loaded_item_type == "investigations"
+                assert table.row_count == 1
+
+                app.query_one("#es-preset-select", Select).value = "active_24h"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all", "investigations", "all"]
+                assert pane._item_type == "all"
+                assert pane._loaded_item_type == "all"
+                assert table.row_count >= 1
+
+                # Switch to EMPTY investigations (0 rows), then built-in preset "all"
+                inv_rows_ref[0] = []
+                await pilot.click("#es-type-investigations-btn")
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert pane._loaded_item_type == "investigations"
+                assert table.row_count == 0
+
+                app.query_one("#es-preset-select", Select).value = "all"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert query_calls == ["all", "investigations", "all", "investigations", "all"]
+                assert pane._item_type == "all"
+                assert pane._loaded_item_type == "all"
+                assert table.row_count == 2
+
+                # Placeholder "-" in dest_host must not become hostname
+                p_dash = pane._build_pivot_payload(
+                    "tab-sentinelone",
+                    {"dest_host": "-", "src": "198.51.100.10"},
+                )
+                assert p_dash.hostname is None
+
+                # Local username placed into row["entity"] by _prepare_notable_display_row
+                prepared = pane._prepare_notable_display_row(
+                    {"event_id": "e1", "user": "jdoe"},
+                    (),
+                    get_splunk_es_tenant_settings(),
+                )
+                assert prepared["entity"] == "jdoe"
+                p_local_user = pane._build_pivot_payload("tab-sentinelone", prepared)
+                assert p_local_user.hostname is None
+
+                # DOMAIN\user string must not become hostname
+                p_dom_user = pane._build_pivot_payload(
+                    "tab-sentinelone",
+                    {"risk_object": r"CORP\jdoe", "src": "198.51.100.10"},
+                )
+                assert p_dom_user.hostname is None
+
+    asyncio.run(_run())
+
+
+def test_es_modals_on_mount_shutdown_guard_and_ar_close_btn(tmp_path: Path) -> None:
+    from unittest.mock import PropertyMock
+
+    from textual.widgets import Button
+
+    from soclens.tui.screens.es_modals import (
+        ESAdaptiveResponseModal,
+        ESBulkTriageModal,
+        ESCreateFindingModal,
+        ESInvestigationModal,
+        ESNoteModal,
+        ESSavedViewModal,
+    )
+
+    modals = [
+        ESBulkTriageModal(event_ids=["e1"], dry_run=True),
+        ESInvestigationModal(finding_ids=["e1"], dry_run=True),
+        ESAdaptiveResponseModal(event_id="e1", orig_sid="s1", orig_rid="0", dry_run=True),
+        ESCreateFindingModal(dry_run=True),
+        ESSavedViewModal(default_name="My View"),
+        ESNoteModal(event_id="e1", dry_run=True),
+    ]
+    for fake_app in (
+        MagicMock(is_running=False, _exit=False),
+        MagicMock(is_running=True, _exit=True),
+    ):
+        for modal in modals:
+            with patch.object(type(modal), "app", new_callable=PropertyMock, return_value=fake_app):
+                modal.on_mount()
+
+    fake_es = _make_mc_fake_es()
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-splunk-es",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        with patch.object(SplunkESPane, "_build_es_client", return_value=fake_es):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                dismissed: list[dict[str, Any] | None] = []
+                ar_modal = ESAdaptiveResponseModal(
+                    event_id="e1",
+                    orig_sid="s1",
+                    orig_rid="0",
+                    available_actions=[{"name": "ping", "label": "Ping Host"}],
+                    dry_run=True,
+                )
+                await app.push_screen(ar_modal, dismissed.append)
+                await pilot.pause()
+                assert app.screen is ar_modal
+                assert app.focused is ar_modal.query_one("#es-ar-action-select", Select)
+                ar_modal.query_one("#es-ar-close-btn", Button).press()
+                await pilot.pause()
+                assert dismissed == [None]
+
+    asyncio.run(_run())
+

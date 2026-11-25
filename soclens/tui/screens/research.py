@@ -351,7 +351,7 @@ class ResearchPane(BaseSocPane):
             return
         raw_kind, raw_val = primary
         clean = raw_val.strip()
-        if not clean:
+        if not clean or clean == "-":
             self.set_status("Pivot payload contained an empty IOC or entity to research.")
             return
 

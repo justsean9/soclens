@@ -217,7 +217,7 @@ class PivotPayload:
 
     def primary_ioc(self) -> tuple[str, str] | None:
         """Return the highest-priority ``(entity_type, value)`` tuple for RF/Research pivots."""
-        if self.entity and self.entity.strip():
+        if self.entity and self.entity.strip() and self.entity.strip() != "-":
             return (self.entity_type or "auto", self.entity.strip())
         for kind, val in (
             ("hash", self.sha256),
@@ -227,7 +227,7 @@ class PivotPayload:
             ("host", self.hostname),
             ("user", self.username),
         ):
-            if val and val.strip():
+            if val and val.strip() and val.strip() != "-":
                 return (kind, val.strip())
         return None
 

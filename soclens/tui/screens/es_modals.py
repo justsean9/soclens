@@ -240,6 +240,8 @@ class ESBulkTriageModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Apply Triage", id="es-bulk-apply-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#es-bulk-status-select", Select).focus()
 
     @on(Button.Pressed, "#es-bulk-cancel-btn")
@@ -451,6 +453,8 @@ class ESInvestigationModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Submit", id="es-inv-submit-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self._sync_mode_visibility()
         self.query_one("#es-inv-mode-select", Select).focus()
 
@@ -673,6 +677,8 @@ class ESAdaptiveResponseModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Dispatch Action", id="es-ar-dispatch-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         log = self.query_one("#es-ar-history-log", RichLog)
         if not self._invocations:
             log.write("No Adaptive Response invocations recorded for this finding.")
@@ -879,6 +885,8 @@ class ESCreateFindingModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Create Finding", id="es-create-submit-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#es-create-title-input", Input).focus()
 
     @on(Button.Pressed, "#es-create-cancel-btn")
@@ -985,6 +993,8 @@ class ESSavedViewModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Save View", id="es-saved-view-save-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#es-saved-view-name-input", Input).focus()
 
     @on(Button.Pressed, "#es-saved-view-cancel-btn")
@@ -1106,6 +1116,8 @@ class ESNoteModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Post Note", id="es-note-submit-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#es-note-text", TextArea).focus()
 
     @on(Button.Pressed, "#es-note-cancel-btn")

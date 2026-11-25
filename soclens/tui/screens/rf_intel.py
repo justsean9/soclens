@@ -795,7 +795,7 @@ class RFIntelPane(BaseSocPane):
             return
         raw_kind, raw_val = primary
         clean_val = raw_val.strip()
-        if not clean_val:
+        if not clean_val or clean_val == "-":
             self.set_status("Pivot payload contained an empty IOC or entity.")
             return
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from collections.abc import Mapping
@@ -569,6 +570,7 @@ class SplunkESPane(BaseSocPane):
         self._loading: bool = False
         self._source_backend: str = "spl_fallback"
         self._item_type: str = "all"
+        self._loaded_item_type: str | None = None
         self._inspector_tab: str = "overview"
         self._selected_ids: set[str] = set()
         self._group_by_tenant: bool = False
@@ -720,7 +722,7 @@ class SplunkESPane(BaseSocPane):
             yield Button("+ Investigation", id="es-new-inv-btn", compact=True)
 
         with Collapsible(
-            title="Structured Filters (tenant_id, disposition, owner, domain, entity, hash, _raw)",
+            title="Structured Filters (tenant_id, owner, domain, entity, hash, _raw)",
             collapsed=True,
             id="es-structured-filter-collapsible",
         ):
@@ -1108,7 +1110,9 @@ class SplunkESPane(BaseSocPane):
     def handle_view_changed(self, event: Select.Changed) -> None:
         view = str(event.value or "notables")
         self._request_seq += 1
+        self._loading = False
         self._raw_rows = []
+        self._loaded_item_type = None
         self._current_rows = []
         self._displayed_rows = []
         self._selected_ids.clear()
@@ -1579,10 +1583,13 @@ class SplunkESPane(BaseSocPane):
         *,
         header_label: str,
         select_row: int = 0,
+        loaded_item_type: str | None = None,
     ) -> None:
         self._raw_rows = list(rows)
         self._raw_columns = list(columns)
         self._raw_header_label = header_label
+        if loaded_item_type is not None:
+            self._loaded_item_type = loaded_item_type
         self._page_offset = 0
         self._render_filtered_table(select_row=select_row)
 
@@ -1668,12 +1675,20 @@ class SplunkESPane(BaseSocPane):
                 s_inp = self.query_one("#es-search-input", Input)
                 with s_inp.prevent(Input.Changed):
                     s_inp.value = str(preset.get("search_text") or "")
-            if "item_type" in preset:
-                self._set_item_type_ui(str(preset.get("item_type") or "all"))
+            self._set_item_type_ui(str(preset.get("item_type") or "all"))
         finally:
             self._syncing_es_filters = False
 
-        if self._raw_rows:
+        if (
+            self._raw_rows
+            and self._needs_item_type_reload(self._item_type)
+        ) or (
+            self._loaded_item_type is not None
+            and self._loaded_item_type != self._item_type
+            and self._needs_item_type_reload(self._item_type)
+        ):
+            self.handle_refresh()
+        elif self._raw_rows:
             self._render_filtered_table()
         else:
             self._update_summary_bar()
@@ -1798,7 +1813,16 @@ class SplunkESPane(BaseSocPane):
                     inp.value = ""
         finally:
             self._syncing_es_filters = False
-        if self._raw_rows:
+        if (
+            self._raw_rows
+            and self._needs_item_type_reload(self._item_type)
+        ) or (
+            self._loaded_item_type is not None
+            and self._loaded_item_type != self._item_type
+            and self._needs_item_type_reload(self._item_type)
+        ):
+            self.handle_refresh()
+        elif self._raw_rows:
             self._render_filtered_table()
         else:
             self._update_summary_bar()
@@ -1820,6 +1844,23 @@ class SplunkESPane(BaseSocPane):
             except Exception:
                 pass
 
+    def _needs_item_type_reload(self, target_type: str) -> bool:
+        if not self._raw_rows:
+            return True
+        loaded = self._loaded_item_type
+        if loaded is None:
+            if target_type == "investigations":
+                return True
+            return all(
+                bool(r.get("is_investigation") or r.get("item_type") == "investigation")
+                for r in self._raw_rows
+            )
+        if target_type == loaded:
+            return False
+        if loaded == "all" and target_type in {"findings", "finding_groups"}:
+            return False
+        return True
+
     @on(Button.Pressed, "#es-type-all-btn")
     @on(Button.Pressed, "#es-type-investigations-btn")
     @on(Button.Pressed, "#es-type-groups-btn")
@@ -1829,10 +1870,10 @@ class SplunkESPane(BaseSocPane):
         mapping = {pid: pval for pid, _, pval in _ITEM_TYPE_PILLS}
         target_type = mapping.get(btn_id, "all")
         self._set_item_type_ui(target_type)
-        if self._raw_rows and target_type != "investigations":
-            self._render_filtered_table()
-        else:
+        if self._needs_item_type_reload(target_type):
             self.handle_refresh()
+        else:
+            self._render_filtered_table()
 
     @on(Button.Pressed, "#es-group-tenant-btn")
     def handle_toggle_group_by_tenant(self) -> None:
@@ -2563,30 +2604,56 @@ class SplunkESPane(BaseSocPane):
         raw_obj: Mapping[str, Any] = raw_val if isinstance(raw_val, Mapping) else {}
         cf_val = row.get("custom_fields")
         cf_obj: Mapping[str, Any] = cf_val if isinstance(cf_val, Mapping) else {}
-        tenant_val = str(row.get("tenant_id") or "").strip()
-        if tenant_val == "-":
-            tenant_val = ""
-        hostname = str(
-            row.get("dest_host")
-            or row.get("src_host")
-            or raw_obj.get("dest_host")
-            or raw_obj.get("src_host")
-            or raw_obj.get("dvc")
-            or raw_obj.get("host")
-            or ""
-        ).strip()
-        sha1 = str(raw_obj.get("sha1") or cf_obj.get("sha1") or "").strip() or None
-        sha256 = (
-            str(
-                raw_obj.get("sha256")
-                or raw_obj.get("file_hash")
-                or cf_obj.get("sha256")
-                or cf_obj.get("file_hash")
+        def _clean_non_dash(val: Any) -> str:
+            s = str(val or "").strip()
+            return "" if s == "-" else s
+
+        tenant_val = _clean_non_dash(row.get("tenant_id"))
+        hostname = (
+            _clean_non_dash(row.get("dest_host"))
+            or _clean_non_dash(row.get("src_host"))
+            or _clean_non_dash(raw_obj.get("dest_host"))
+            or _clean_non_dash(raw_obj.get("src_host"))
+            or _clean_non_dash(raw_obj.get("dvc"))
+            or _clean_non_dash(raw_obj.get("host"))
+        )
+        if not hostname:
+            candidate = (
+                _clean_non_dash(row.get("risk_object"))
+                or _clean_non_dash(raw_obj.get("risk_object"))
+                or _clean_non_dash(row.get("entity"))
+            )
+            risk_type = str(
+                row.get("risk_object_type")
+                or raw_obj.get("risk_object_type")
+                or row.get("entity_type")
                 or ""
-            ).strip()
+            ).strip().lower()
+            row_user = _clean_non_dash(row.get("user")) or _clean_non_dash(raw_obj.get("user"))
+            if (
+                candidate
+                and risk_type in {"", "system", "host", "hostname", "endpoint", "machine", "asset"}
+                and "@" not in candidate
+                and "\\" not in candidate
+                and (not row_user or candidate != row_user)
+            ):
+                try:
+                    ipaddress.ip_address(candidate)
+                except ValueError:
+                    hostname = candidate
+        sha1 = _clean_non_dash(raw_obj.get("sha1")) or _clean_non_dash(cf_obj.get("sha1")) or None
+        sha256 = (
+            _clean_non_dash(raw_obj.get("sha256"))
+            or _clean_non_dash(raw_obj.get("file_hash"))
+            or _clean_non_dash(cf_obj.get("sha256"))
+            or _clean_non_dash(cf_obj.get("file_hash"))
             or None
         )
-        orig_sid = str(row.get("orig_sid") or raw_obj.get("orig_sid") or "").strip() or None
+        orig_sid = (
+            _clean_non_dash(row.get("orig_sid"))
+            or _clean_non_dash(raw_obj.get("orig_sid"))
+            or None
+        )
         earliest = self.query_one("#es-earliest-input", Input).value.strip() or "-24h"
         rf_blob: dict[str, Any] | None = None
         if "rf_observables" in row or "rf_max_risk_score" in row:
@@ -2600,14 +2667,18 @@ class SplunkESPane(BaseSocPane):
             source_tab="tab-splunk-es",
             target_tab=target_tab,
             tenant_id=tenant_val or None,
-            entity=str(row.get("entity") or row.get("risk_object") or "").strip() or None,
-            entity_type=str(row.get("risk_object_type") or "").strip() or None,
-            src_ip=str(row.get("src") or "").strip() or None,
-            dest_ip=str(row.get("dest") or "").strip() or None,
+            entity=_clean_non_dash(row.get("entity")) or _clean_non_dash(row.get("risk_object")) or None,
+            entity_type=(
+                _clean_non_dash(row.get("risk_object_type"))
+                or _clean_non_dash(row.get("entity_type"))
+                or None
+            ),
+            src_ip=_clean_non_dash(row.get("src")) or None,
+            dest_ip=_clean_non_dash(row.get("dest")) or None,
             sha1=sha1,
             sha256=sha256,
             hostname=hostname or None,
-            username=str(row.get("user") or "").strip() or None,
+            username=_clean_non_dash(row.get("user")) or None,
             orig_sid=orig_sid if use_orig_sid else None,
             earliest=earliest,
             latest="now",
@@ -3348,6 +3419,8 @@ class SplunkESPane(BaseSocPane):
         include_private_ips: bool = False,
         field_map_override: str | None = None,
     ) -> None:
+        if seq != self._request_seq or self._current_view != expected_view:
+            return
         self._loading = True
         try:
             self.set_status(f"Loading Splunk ES findings/notables ({earliest} to now)...")
@@ -3433,6 +3506,7 @@ class SplunkESPane(BaseSocPane):
                 notables,
                 cols,
                 header_label="Notable Events",
+                loaded_item_type=item_type,
             )
             msg = f"Loaded {len(notables)} Splunk ES finding/notable(s) [{backend}]."
             self.set_status(msg)
@@ -3467,6 +3541,7 @@ class SplunkESPane(BaseSocPane):
                         enriched,
                         cols,
                         header_label="Notable Events",
+                        loaded_item_type=item_type,
                     )
                     done_msg = (
                         f"Loaded {len(enriched)} Splunk ES finding(s); "
@@ -3485,7 +3560,8 @@ class SplunkESPane(BaseSocPane):
             if seq == self._request_seq and self._current_view == expected_view:
                 self.report_error("Load ES Notables", exc)
         finally:
-            self._loading = False
+            if seq == self._request_seq:
+                self._loading = False
 
     @work(thread=True, exit_on_error=False)
     def _load_correlations_worker(
