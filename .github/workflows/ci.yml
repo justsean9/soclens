@@ -1,10 +1,8 @@
 name: CI
 
+# Disabled automatic CI runs on push/PR; trigger manually via Actions tab if needed.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   lint-type-test:
