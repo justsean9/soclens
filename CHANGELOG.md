@@ -6,21 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Changed
-- Rebranded the project, Python package (`soclens`), CLI (`soclens`), PowerShell launcher (`soclens.ps1`), automation scripts (`scripts/soclens-brand-sync*`), configuration directory, and environment variables (`SOCLENS_*`) to **SOCLens**.
-- Removed legacy root helper scripts (`main.py`, `bundle.py`, `manage_env.py`, `manage.sh`, `manage.fish`, `scripts/spawn_splunk.*`), `RF.md`, and stale pre-rebrand `bundles/v2.0.0/` archives.
-
-## [2.0.0] - 2026-11-24
+## [2.0.0] - 2026-11-25
 
 ### Breaking / Behavioral Changes
-- **User vs. Admin TUI Views (`F2` / `--view` / `--admin`)**: `soclens tui` now defaults to **User View**, displaying the 8 day-to-day analyst & per-user tabs (**RF Intel & Alerts** `4`, **Research** `7` initial tab, **Logs** `8`, **SentinelOne** `9`, **Local LLM** `F7`, **Splunk Search** `F8`, **Splunk ES** `F9`, and **Settings** `0`/`F10`) while hiding admin/configuration tabs (**Dashboard & Diagnostics** `1`, **Watchlists** `2`, **Brand Logos** `3`, **Sigma Rules** `5`, **Splunk & Bundle** `6`) and watchlist-mutation pivots until toggled via `F2`, the top selector bar, `--view admin` / `--admin`, or `SOCLENS_UI_VIEW=admin` (automatically enabled when specifying an admin `initial_tab`).
+- **Rebrand to SOCLens (`soclens`)**: Renamed the Python package (`soclens`), CLI (`soclens`), PowerShell launcher (`soclens.ps1`), automation scripts (`scripts/soclens-brand-sync*`), configuration directory, and environment variables (`SOCLENS_*`), removing legacy root helper scripts (`main.py`, `bundle.py`, `manage_env.py`, `manage.sh`, `manage.fish`, `scripts/spawn_splunk.*`), `RF.md`, and stale pre-rebrand `bundles/v2.0.0/` archives.
+- **User vs. Admin TUI Views (`F2` / `--view` / `--admin`)**: `soclens tui` now defaults to **User View**, displaying the 8 day-to-day analyst & per-user tabs (**RF Intel & Alerts** `4`, **Research** `7` initial tab, **Logs** `8`, **SentinelOne** `9`, **Local LLM** `F7`, **Splunk Search** `F8`, **Splunk ES** `F9`, and **Settings** `0`/`F10`) while hiding admin/configuration tabs (**Dashboard & Diagnostics** `1`, **Watchlists** `2`, **Brand Logos** `3`, **Sigma Rules** `5`, **Splunk & Bundle** `6`) and admin/destructive mutations until toggled via `F2`, the top selector bar, `--view admin` / `--admin`, or `SOCLENS_UI_VIEW=admin` (automatically enabled when specifying an admin `initial_tab`).
 
 ### Added
+- **Pluggable Secret Manager / PAM Integration & Dynamic TUI Dropdowns (`soclens.secret_stores`, `soclens secrets`)**:
+  - Cross-platform `ConfiguredSession()` integrations for **Thycotic / Delinea Secret Server** (password, Delinea Platform client credentials, and token auth with proactive refresh & `401` retry), **HashiCorp Vault KV v2** (Token & AppRole auth), **1Password Connect Server**, and **Bitwarden (`bw serve`)** with zero new third-party runtime dependencies.
+  - Strictly persists only `vault_secret_map` references to `settings.json` (`0600`), hydrating secret values in memory via `set_session_overrides(...)` while preserving environment-variable precedence and supporting `rf_llm_api_key`.
+  - Added **Secret Manager (PAM / Vault)** (`cat-secrets`) in **Settings** (`0`/`F10`), dynamic `Input <-> Select` vault reference dropdown switching across RF, Splunk, and SentinelOne credential fields, non-blocking TUI startup hydration, `--no-secret-store`, and `soclens secrets` CLI (`test`, `list`, `fields`, `map`, `unmap`, `pull`).
+- **Splunk ES 8.6 Mission Control Workbench & Custom Tenant Fields (`soclens.splunk_es`, `F9`)**:
+  - Hybrid Mission Control v2 REST primary (`/servicesNS/nobody/missioncontrol/public/v2/...`) with automatic Splunk ES 7.x SPL / `/services/notable_update` fallback, preset and user-saved queue views, item-type pills, timeframe/auto-refresh controls, toggleable summary strip, multi-select bulk triage, 6-tab Finding Inspector (`Overview | Metadata & Custom | Src / Dest | RF Enrichment | Notes & History | Raw JSON`), Markdown notes with optional RF dual-posting, Adaptive Response invocations/dispatch, and Investigations.
+  - First-class configurable tenant extraction (`splunk_es_tenant_field`, defaulting to `tenant_id` with configurable aliases), `Group by Tenant` queue rollup, `conf-incident_review` / `conf-log_review` `event_attributes` custom-field auto-discovery, `Custom / Org Fields` Inspector panel, and `splunk_es_custom_fields` pinning/create support.
+- **SentinelOne Multi-Site Tier Grouping, Tenant Admin & Exclusion Cloning (`soclens.sentinelone`, `soclens s1`, `9`)**:
+  - Added `Global -> Account -> Site -> Group` hierarchy, configurable case-insensitive `s1_tier_rules` (`MDR-*`, `MSSP-*`, `Other`), Tier Filter Pills, searchable multi-site selector, 4 alert grouping modes (`Flat Alert Stream`, `Service Tier`, `Site`, `Tier + File Hash (SHA1)`), and Cloud/STAR alerts.
+  - Expanded `SentinelOne` (`9`) across 5 sub-workbenches (`Alerts & Threats`, `Sites Admin`, `Users & RBAC Admin`, `Exclusions & Site-to-Site Cloning`, `Agents & Blocklist`) read-only in User View and strictly gated behind Admin View (`F2`/`--admin`), `ConfirmActionModal` / exact site-name confirmation, `--yes` / `SOCLENS_AUTO_APPROVE`, and `--dry-run`, with `limit <= 100` cursor pagination, `429` backoff, non-empty mutation `filter` guardrails, `<= 15` req/s exclusion cloning with dry-run diff preview, and matching `soclens s1` CLI commands.
+- **Cross-Workbench Pivot Bus & Local LLM Copilot (`soclens.tui.pivot`, `soclens.llm`, `F7`)**:
+  - Added `s1_site_tenant_map` and regex tier-capture tenant mapping, auto-run scoped read-only pivots (`F9 <-> 9`, `4`, `7`), safe `F8` SPL pre-fill (`auto_run=True` only on `orig_sid`), and bundled `[ES + Tenant + S1 + RF]` attack-chain & closing-note context attached directly into **Local LLM** (`F7`).
 - **Per-User Settings UI Tab & CLI (`soclens.settings`, `soclens settings`, `0` / `F10`)**:
   - Cross-platform per-user settings persistence (`settings.json` with `0600` POSIX permissions), named profiles (`default`, `prod`, `lab`, etc.), secret masking, `soclens settings import-env` / `set` / `unset` / `use` / `reset`, and live in-TUI credential/configuration reload across RF Core, Sandbox, ASI, PFI, RiskRecon, Splunk, SentinelOne, and proxy/SSL settings.
 - **Splunk Enterprise Search, Splunk ES & Automated RF Enrichment (`soclens.splunk`, `soclens.splunk_es`, `soclens.splunk_rf_enrichment`)**:
   - **Splunk Search** workbench tab (`F8`) and `soclens splunk search/indexes/saved-searches/dispatch` CLI with paginated results, saved-search browser, and **Recorded Future IOC Enrichment** pivot.
-  - **Splunk ES** workbench tab (`F9`) and `soclens splunk es` CLI covering notable event triage/updates (`SplunkNotableTriageModal`), correlation searches, threat-intel KVStore collections, assets/identities, risk scores, and automated RF entity/IP/domain/hash/URL enrichment (`soclens splunk es enrich` + **Enrich Selected / All** & **Post RF Comment**).
+  - Automated RF entity/IP/domain/hash/URL enrichment (`soclens splunk es enrich` + **Enrich Selected / All** & **Post RF Comment**).
 - **Local LLM Workbench (`soclens.llm`, `soclens llm`, `F7`)**:
   - Native Ollama and OpenAI-compatible REST integration (`RF_LLM_PROVIDER`, `RF_LLM_BASE_URL`, `RF_LLM_MODEL`) with SOC prompt templates, interactive **Local LLM** chat tab (`F7`), and one-click **Explain with Local LLM** pivots from Sigma Rules and RF Intel alerts.
 - **Sigma Detection Pipeline, Custom Index Maps & Table Fields (`soclens.sigma`, `5`)**:
@@ -38,7 +47,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Windows-Safe Image Rendering & Native OS Viewer Default (`soclens.tui.image_render`, `--os-image-viewer`)**:
   - Automatic Kitty TGP suppression on Windows / Windows Terminal in favor of true-color half-blocks, right-click screenshot preview actions (`o`), and persistent `OS Image Viewer` default toggle.
 
-### Security & Hygiene
+### Fixed & Security
+- Stabilized lazy-mounted TUI worker races (`watchlists.py` `WorkerCancelled` sequence gating and `rf_intel.py` initial auto-enrichment) and added a 4-tier + Tier 5 offline E2E regression suite.
 - Added `settings.json`, `.soclens_settings.json`, and `.soclens_tui_settings.json` to both `soclens.bundler.EXCLUDED_FILE_NAMES` and `scripts/build_release_bundles.py` `FORBIDDEN_EXACT_NAMES`.
 
 ## [1.0.2] - 2026-11-24
