@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly timer for Recorded Future SOC Brand Logo Watchlist Sync
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=1h
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

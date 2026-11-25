@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Acme Bank</title>
+  <link rel="manifest" href="/app/manifest.json">
+  <link rel="mask-icon" href="/assets/safari-pinned-brand.svg" color="#004488">
+  <meta name="msapplication-TileImage" content="/assets/ms-tile-logo.png">
+  <meta property="og:image" content="https://acme.example/images/og-hero-banner.jpg">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "BankOrCreditUnion",
+        "name": "Acme Bank",
+        "logo": {"@type": "ImageObject", "url": "/assets/jsonld-logo.png"}
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <header>
+    <div class="elementor-widget-container">
+      <div class="hs_cos_wrapper_widget">
+        <a href="/" rel="home" class="brand-link">
+          <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAHgAAAAoCAYAAAA16j4lAAAAmUlEQVR4nO3UsQ3AMAACwYzuzZ0F0r8UrqBH8PA85176cQa5AVIwCCwYBC56FILcACkYBBYMAhc9CkFugBQMAgsGgYsehSA3QAoGgQWDwEWPQpAbIAWDwIJB4KJHIcgNkIJBYMEgcNGjEOQGSMEgsGAQuOhRCHIDpGAQWDAIXPQoBLkBUjAILBgELnoUgtwAKRgEFgyC853BC9pKvTNM+001AAAAAElFTkSuQmCC" alt="Acme Inline Data Logo" class="site-logo">
+          <img data-lazy-src="/assets/lazy-brand-logo.png" alt="Acme Lazy Logo" class="brand-img">
+          <img srcset="/cdn-cgi/image/w=200,fit=contain/logo.png 1x, /cdn-cgi/image/w=400,fit=contain/logo.png 2x" src="/cdn-cgi/image/w=200,fit=contain/logo.png" alt="Acme CDN Logo">
+          <svg class="brand-logo" viewBox="0 0 120 40" width="120" height="40">
+            <!-- header mark -->
+            <rect width="120" height="40" fill="#004488" />
+          </svg>
+        </a>
+      </div>
+    </div>
+  </header>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[Unit]
+Description=SOCLens Brand Logo Watchlist Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/soclens/soclens.env
+WorkingDirectory=/opt/soclens
+ExecStart=/opt/soclens/.venv/bin/soclens watchlist sync-logos ${RF_BRAND_LIST_ID} --domains-file /opt/soclens/domains.txt --ignore-hashes-file /opt/soclens/ignored_hashes.txt
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/soclens
+
+# Note: For continuous daemon mode (--watch), switch Type=simple and invoke
+# run_continuous_brand_sync / `soclens watchlist sync-logos ... --watch --interval 3600`.

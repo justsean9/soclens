@@ -1,0 +1,639 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-11-24T16:58:07Z",
+  "package_name": "recorded-future-soc",
+  "python_versions": [
+    "3.12",
+    "3.13",
+    "3.14"
+  ],
+  "target_platforms": [
+    "win_amd64",
+    "linux_x86_64",
+    "macosx_arm64"
+  ],
+  "runtime_packages": [
+    {
+      "name": "beautifulsoup4",
+      "version": "4.15.0"
+    },
+    {
+      "name": "certifi",
+      "version": "2026.11.20"
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.5.3"
+    },
+    {
+      "name": "diskcache",
+      "version": "5.6.3"
+    },
+    {
+      "name": "diskcache-community",
+      "version": "5.8.5"
+    },
+    {
+      "name": "google-re2",
+      "version": "1.1.20251105"
+    },
+    {
+      "name": "idna",
+      "version": "3.20"
+    },
+    {
+      "name": "jinja2",
+      "version": "3.1.6"
+    },
+    {
+      "name": "jq",
+      "version": "1.13.0"
+    },
+    {
+      "name": "linkify-it-py",
+      "version": "2.2.0"
+    },
+    {
+      "name": "markdown-it-py",
+      "version": "4.3.0"
+    },
+    {
+      "name": "markupsafe",
+      "version": "3.0.4"
+    },
+    {
+      "name": "mdit-py-plugins",
+      "version": "0.7.0"
+    },
+    {
+      "name": "mdurl",
+      "version": "0.1.2"
+    },
+    {
+      "name": "packaging",
+      "version": "26.4"
+    },
+    {
+      "name": "platformdirs",
+      "version": "4.14.8"
+    },
+    {
+      "name": "pygments",
+      "version": "2.21.0"
+    },
+    {
+      "name": "pyparsing",
+      "version": "3.3.3"
+    },
+    {
+      "name": "pysigma",
+      "version": "2.1.1"
+    },
+    {
+      "name": "pysigma-backend-splunk",
+      "version": "3.0.1"
+    },
+    {
+      "name": "pyyaml",
+      "version": "6.0.4"
+    },
+    {
+      "name": "requests",
+      "version": "2.34.2"
+    },
+    {
+      "name": "rich",
+      "version": "15.0.0"
+    },
+    {
+      "name": "soupsieve",
+      "version": "4.1.3"
+    },
+    {
+      "name": "textual",
+      "version": "8.2.8"
+    },
+    {
+      "name": "types-pyyaml",
+      "version": "6.0.12.20261122"
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0"
+    },
+    {
+      "name": "urllib3",
+      "version": "2.8.0"
+    }
+  ],
+  "build_packages": [
+    {
+      "name": "setuptools",
+      "version": "84.2.1"
+    },
+    {
+      "name": "wheel",
+      "version": "0.48.0"
+    }
+  ],
+  "wheel_count": 62,
+  "total_bytes": 18177171,
+  "wheels": [
+    {
+      "filename": "beautifulsoup4-4.15.0-py3-none-any.whl",
+      "package": "beautifulsoup4",
+      "version": "4.15.0",
+      "role": "runtime",
+      "sha256": "d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9",
+      "size": 109924
+    },
+    {
+      "filename": "certifi-2026.11.20-py3-none-any.whl",
+      "package": "certifi",
+      "version": "2026.11.20",
+      "role": "runtime",
+      "sha256": "7422df25243767b9877031a2248cb14d09ddac9beee846f4cef3d5c9191d488f",
+      "size": 127913
+    },
+    {
+      "filename": "charset_normalizer-3.5.3-py3-none-any.whl",
+      "package": "charset-normalizer",
+      "version": "3.5.3",
+      "role": "runtime",
+      "sha256": "96e268b0cbda016ac519513294fcd17032264085b600abaac58b93049477e132",
+      "size": 68878
+    },
+    {
+      "filename": "diskcache-5.6.3-py3-none-any.whl",
+      "package": "diskcache",
+      "version": "5.6.3",
+      "role": "runtime",
+      "sha256": "5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19",
+      "size": 45550
+    },
+    {
+      "filename": "diskcache_community-5.8.5-py3-none-any.whl",
+      "package": "diskcache-community",
+      "version": "5.8.5",
+      "role": "runtime",
+      "sha256": "a4f603839e2f802fb49a29f7239206017b12e001eb1e26a696af4fa0290cd7df",
+      "size": 83349
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp312-cp312-macosx_13_0_arm64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "b30f09b4d63249c72e65ccae4cbf6b331b48c22fc7cb439f1d85f347b9d07ceb",
+      "size": 485591
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "809c5fa5d08279413b29c2e2c5c528e85cd94a0e0fd897db595a0c09eeee2782",
+      "size": 591348
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp312-cp312-win_amd64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "062313c309f93dfeb6966372f4c446580e98879133ec155522eea8aaf568a5cd",
+      "size": 491726
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp313-cp313-macosx_13_0_arm64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "9f3cf610e857a7d6f02916cf2b7fc159a5429b8bcb23164500d46e5e233f2924",
+      "size": 485549
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "a52cb204e49d20cdbb66faf394d57f476e96c39c23a328442ab0194fc6bd1a2b",
+      "size": 591386
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp313-cp313-win_amd64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "0bcba63ad3ea8926fb0c71bb5044e33d405bb9395f5b5444393cd5f28f0bf6d3",
+      "size": 491734
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp314-cp314-macosx_13_0_arm64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "cc151cf6a585d9ebe711da32b23683fcff40f78db8c8587c7f4b209ef4658809",
+      "size": 484719
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "a7bfaa2cf55daf0c5c650e68526bb20b61e37d7f3ae53f6893013acc1c91c116",
+      "size": 591483
+    },
+    {
+      "filename": "google_re2-1.1.20251105-1-cp314-cp314-win_amd64.whl",
+      "package": "google-re2",
+      "version": "1.1.20251105",
+      "role": "runtime",
+      "sha256": "6d4d5fdadd329a2ed193463899d00ef2fd126172f36a4c01c9def271f19801b6",
+      "size": 491893
+    },
+    {
+      "filename": "idna-3.20-py3-none-any.whl",
+      "package": "idna",
+      "version": "3.20",
+      "role": "runtime",
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+      "size": 69583
+    },
+    {
+      "filename": "jinja2-3.1.6-py3-none-any.whl",
+      "package": "jinja2",
+      "version": "3.1.6",
+      "role": "runtime",
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+      "size": 134899
+    },
+    {
+      "filename": "jq-1.13.0-cp312-cp312-macosx_11_0_arm64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "5ea486552289b32845d1d39f23364e19937ee42114302a0cf371a5e205656d20",
+      "size": 424260
+    },
+    {
+      "filename": "jq-1.13.0-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "2974d3eed7401073b8f6508da0c5d2d2087a4928e5fbc00749338d81329b1f92",
+      "size": 771716
+    },
+    {
+      "filename": "jq-1.13.0-cp312-cp312-win_amd64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "5cc47913839db9ea5a114d9aeca462bd7f28f29437ed6227fef4130a0f0a7b8e",
+      "size": 418689
+    },
+    {
+      "filename": "jq-1.13.0-cp313-cp313-macosx_11_0_arm64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "b5e7f5388a1ec10bb88b2a547fa4985feef0d3c09b1455e97a4b79556e686db9",
+      "size": 423807
+    },
+    {
+      "filename": "jq-1.13.0-cp313-cp313-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "e12227f4cef42c114a757579e4898926a7258047ced2d65624dfcb43f5194374",
+      "size": 764881
+    },
+    {
+      "filename": "jq-1.13.0-cp313-cp313-win_amd64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "c31a82b24de7187697d503e72ba7d84f26976ec396f7377651e7825877643106",
+      "size": 419452
+    },
+    {
+      "filename": "jq-1.13.0-cp314-cp314-macosx_11_0_arm64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "a5d1e81d25a249d71f19281684836f72a042a655a6cddb5ec043a83c7551dcbe",
+      "size": 424651
+    },
+    {
+      "filename": "jq-1.13.0-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "7e295fc95f1003d8395ade8975de9b948d9b25cae57dd123698a7c9131331caf",
+      "size": 758007
+    },
+    {
+      "filename": "jq-1.13.0-cp314-cp314-win_amd64.whl",
+      "package": "jq",
+      "version": "1.13.0",
+      "role": "runtime",
+      "sha256": "8a5f33a85fc2fd22889b147a03da8f1ac2563d8581eed121b0feae9f979ef392",
+      "size": 437465
+    },
+    {
+      "filename": "linkify_it_py-2.2.0-py3-none-any.whl",
+      "package": "linkify-it-py",
+      "version": "2.2.0",
+      "role": "runtime",
+      "sha256": "3adc40eb5af300b2605fcfdb968c24e1d780a90f1f2221af7c15e5111e94d443",
+      "size": 21971
+    },
+    {
+      "filename": "markdown_it_py-4.3.0-py3-none-any.whl",
+      "package": "markdown-it-py",
+      "version": "4.3.0",
+      "role": "runtime",
+      "sha256": "7aa1511a46c39138de78d9eba92ce47e63124d8003fc98b3a351909e04239efa",
+      "size": 96951
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp312-cp312-macosx_11_0_arm64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "0930db9bdc62d22944e10b066448bb65dc9abe9112880c7cab8da54db4284d5f",
+      "size": 12050
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "8e124f974786f831d6043728e38296969d3579db8896fe004682f5758e613581",
+      "size": 22985
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp312-cp312-win_amd64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "11935df9bf455ed0c04eb87bcd720f02b1fe5e02128a9430f23aed6f93336fc7",
+      "size": 14303
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp313-cp313-macosx_11_0_arm64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "73e77980c7207854f00fc4e71fb1626868d5740ab4012623d55c7a99ad122a72",
+      "size": 12061
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "434139499bb20b502ed3baa1f169e618f924a97e7a777fea1a49446d80106cf6",
+      "size": 23017
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp313-cp313-win_amd64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "1f1f9477e174582b0a1b583d60b66e1f2cf5d3fe12cee985e4aedf44766600e5",
+      "size": 14313
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp314-cp314-macosx_11_0_arm64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "52704c5d36eb6dda8866493decd61111fff86244c9b1ad225ca01b9e91e5970f",
+      "size": 12061
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "a8e9f292fcda89b324f2f5c91d13f1424a153e40fc2756f38ee23b15835ff300",
+      "size": 23049
+    },
+    {
+      "filename": "markupsafe-3.0.4-cp314-cp314-win_amd64.whl",
+      "package": "markupsafe",
+      "version": "3.0.4",
+      "role": "runtime",
+      "sha256": "c1bc67752d5f21013cfe430df4062441714eab79f65a6a05e01505957e9c35fe",
+      "size": 14501
+    },
+    {
+      "filename": "mdit_py_plugins-0.7.0-py3-none-any.whl",
+      "package": "mdit-py-plugins",
+      "version": "0.7.0",
+      "role": "runtime",
+      "sha256": "7f8e30403f3dd8bfe3afcdcbc6e61066d3f2e714167507b9c26eb385ec399353",
+      "size": 72937
+    },
+    {
+      "filename": "mdurl-0.1.2-py3-none-any.whl",
+      "package": "mdurl",
+      "version": "0.1.2",
+      "role": "runtime",
+      "sha256": "84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8",
+      "size": 9979
+    },
+    {
+      "filename": "packaging-26.4-py3-none-any.whl",
+      "package": "packaging",
+      "version": "26.4",
+      "role": "runtime",
+      "sha256": "81383611a09c1bc0b08b76e0fd5829d7c6824c65b27a6aee339da133f4233ea2",
+      "size": 140049
+    },
+    {
+      "filename": "platformdirs-4.14.8-py3-none-any.whl",
+      "package": "platformdirs",
+      "version": "4.14.8",
+      "role": "runtime",
+      "sha256": "1e34af590de4d978631b751eb2202f2fee4497537a17c1720b12fcf57b331392",
+      "size": 94267
+    },
+    {
+      "filename": "pygments-2.21.0-py3-none-any.whl",
+      "package": "pygments",
+      "version": "2.21.0",
+      "role": "runtime",
+      "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
+      "size": 1250147
+    },
+    {
+      "filename": "pyparsing-3.3.3-py3-none-any.whl",
+      "package": "pyparsing",
+      "version": "3.3.3",
+      "role": "runtime",
+      "sha256": "ece8c00a69cf01b45d0b1dedabb469c90d8caf996d4fda40f147627a122849a4",
+      "size": 126420
+    },
+    {
+      "filename": "pysigma-2.1.1-py3-none-any.whl",
+      "package": "pysigma",
+      "version": "2.1.1",
+      "role": "runtime",
+      "sha256": "468daab4d18699d49128a49983006d6bfed62ca2d53f8d6dd6052e7d82633ba8",
+      "size": 199633
+    },
+    {
+      "filename": "pysigma_backend_splunk-3.0.1-py3-none-any.whl",
+      "package": "pysigma-backend-splunk",
+      "version": "3.0.1",
+      "role": "runtime",
+      "sha256": "cb983c86c409227d25b3c39f4420b0508f630db012071fff0920a999cce92a05",
+      "size": 25944
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp312-cp312-macosx_11_0_arm64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "4d30c2f186612bd2f9f07c08a4c96721af59cfc8da3ec7cb27dfa2834e8bb019",
+      "size": 179510
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "93bfb2459195406a518e2f487a9bbf01df240175f31e06f5a252ac6734c7bbf0",
+      "size": 849249
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp312-cp312-win_amd64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "131d11bd9b60d705a6388366d77ed67850995a4d2be85fe149785a257c17e531",
+      "size": 154452
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp313-cp313-macosx_11_0_arm64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "9d4211f080920629a90c9e31c51e326fb70cfae38f18d4128b9913c23642bace",
+      "size": 179961
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "50588147ab2c6a59b5f990a4905db80899a6c2bd197e046a6201f1e67587e794",
+      "size": 838459
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp313-cp313-win_amd64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "0a3a351f04dc124f9357512bdb80ac37cd1750cf1371da33e7cbb96d80ac865f",
+      "size": 154298
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp314-cp314-macosx_11_0_arm64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "7335809813ec838d9cd334b1744cda33deb141c9ef23a9c0df371c37980d3851",
+      "size": 181969
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "c604dc2613c417130479cdd6e55c2faa691b6365aa82b3dafddfcecc2eaf1ac7",
+      "size": 819491
+    },
+    {
+      "filename": "pyyaml-6.0.4-cp314-cp314-win_amd64.whl",
+      "package": "pyyaml",
+      "version": "6.0.4",
+      "role": "runtime",
+      "sha256": "1d2f08c122727c86f8303bb1dd45159ca1de1f2d68798e671ec46974e321008e",
+      "size": 157525
+    },
+    {
+      "filename": "requests-2.34.2-py3-none-any.whl",
+      "package": "requests",
+      "version": "2.34.2",
+      "role": "runtime",
+      "sha256": "2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0",
+      "size": 73075
+    },
+    {
+      "filename": "rich-15.0.0-py3-none-any.whl",
+      "package": "rich",
+      "version": "15.0.0",
+      "role": "runtime",
+      "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+      "size": 310654
+    },
+    {
+      "filename": "setuptools-84.2.1-py3-none-any.whl",
+      "package": "setuptools",
+      "version": "84.2.1",
+      "role": "build",
+      "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
+      "size": 876263
+    },
+    {
+      "filename": "soupsieve-4.1.3-py3-none-any.whl",
+      "package": "soupsieve",
+      "version": "4.1.3",
+      "role": "runtime",
+      "sha256": "7a390d1a57d1ab7bb228531e9b8a750a5ebf87db774e0ef6faeeac057d22a5bf",
+      "size": 59792
+    },
+    {
+      "filename": "textual-8.2.8-py3-none-any.whl",
+      "package": "textual",
+      "version": "8.2.8",
+      "role": "runtime",
+      "sha256": "267375fd402dc8d981457212efa71f0e3365fd17bba144ba9bb3ed7563cb374a",
+      "size": 731418
+    },
+    {
+      "filename": "types_pyyaml-6.0.12.20261122-py3-none-any.whl",
+      "package": "types-pyyaml",
+      "version": "6.0.12.20261122",
+      "role": "runtime",
+      "sha256": "689fbbe883b60471166dede9dba6ac0dbdbcf0ea98062d7ec195430f5bbdb009",
+      "size": 21356
+    },
+    {
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "package": "typing-extensions",
+      "version": "4.16.0",
+      "role": "runtime",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "size": 45571
+    },
+    {
+      "filename": "urllib3-2.8.0-py3-none-any.whl",
+      "package": "urllib3",
+      "version": "2.8.0",
+      "role": "runtime",
+      "sha256": "0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3",
+      "size": 135717
+    },
+    {
+      "filename": "wheel-0.48.0-py3-none-any.whl",
+      "package": "wheel",
+      "version": "0.48.0",
+      "role": "build",
+      "sha256": "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab",
+      "size": 33320
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+*.whl binary
+*.zip binary
+*.sh text eol=lf
+*.ps1 text

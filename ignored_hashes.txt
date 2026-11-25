@@ -1,0 +1,38 @@
+# Recorded Future SOC - Ignored / Tuned-Out Image Hashes
+#
+# This file defines image hashes (MD5, SHA-1, or SHA-256) that should be tuned out
+# and excluded during brand logo scraping and watchlist synchronization.
+#
+# Format:
+#   <hash> [<optional comment / reason>]
+#   Lines starting with '#' or empty lines are ignored.
+#   CSV format (<hash>,<reason>) and JSON ({<hash>: <reason>}) are also supported.
+#
+# Supported Algorithms:
+#   - MD5:    32 hexadecimal characters
+#   - SHA-1:  40 hexadecimal characters
+#   - SHA-256: 64 hexadecimal characters
+
+# -----------------------------------------------------------------------------
+# WordPress Default & CMS Placeholders
+# -----------------------------------------------------------------------------
+6bdb369337ac2496761c6f063bffea0aa6a91d4662279c399071a468251f51f0 # WordPress default favicon (SHA-256)
+4236a047946cb67d6a7e839ec4fee7092e36705e2ebb69f80a5614aa3adf8eee # WordPress error placeholder favicon (SHA-256)
+050f283d5a420b9eef89c7ad62002575 # WordPress default favicon (MD5)
+f3e05a8f4c39f1503c80ff1ff91bdf1a # WordPress icon variant (MD5)
+3d6f1bf8b6b19e2e604f32e2933bbecab9500057 # WordPress default favicon (SHA-1)
+
+# -----------------------------------------------------------------------------
+# Transparent Spacers & Tracking Pixels
+# -----------------------------------------------------------------------------
+d6f77ffdaebe6142823d2cf503a13040 # 1x1 Transparent spacer GIF (MD5)
+adc83b19e793491b1c6ea0fd8b46cd9f32e592fc # 1x1 Transparent spacer GIF (SHA-1)
+bc575397455d311910243468ab9fb05b8719875f2843793740e53a7ff311fb9e # 1x1 Transparent spacer GIF (SHA-256)
+7249911e389e7c5b6ff7b7119f906f71 # 1x1 Transparent spacer PNG (MD5)
+a937a09c256a4263bc3ee40250085dda4c5d31a54687d605c3b069ef49870be8 # 1x1 Transparent spacer PNG (SHA-256)
+
+# -----------------------------------------------------------------------------
+# Add Custom Organization / Vendor Noise Below:
+# -----------------------------------------------------------------------------
+c965a500f698483526faf92ac286047cecd825608cd1d83276de392b30a13a83 # Shared default CMS favicon across unrelated sites (PNG 80x80)
+5c670a347d9ab7859dfd3336133f56a53f2115c8b000ce39ec5394eedf3173ab # Shared Kentico/CMS default favicon across bank sites (ICO 48x48)

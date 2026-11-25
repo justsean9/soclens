@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Packaging & Distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Testing & Linting
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Logs & Temporary Files
+logs/
+reports/
+scratch/
+apikey.key
+settings.json
+.soclens_settings.json
+.soclens_tui_settings.json
+*.log
+validate_savedsearches.log
+soclens-bundle.zip
+
+# Runtime & Local Caches
+validation_results.json
+sigma_rules_cache.json
+savedsearches*.conf
+discovered_images.json
+brand_sync_state.json
+.brand_sync.lock
+test_locations*
+brands.csv
+watchlist.csv
