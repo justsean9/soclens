@@ -848,15 +848,32 @@ class SplunkESPane(BaseSocPane):
             return False
         entry = cache.get(CACHE_SOURCE_ES)
         if entry is None:
+            loading_fn = getattr(self.app, "is_cache_source_loading", None)
+            if not self._raw_rows and callable(loading_fn) and loading_fn(CACHE_SOURCE_ES):
+                self.set_status(
+                    "Background preload in progress for Splunk ES Notables (24h)... Data will populate automatically."
+                )
             return False
-        if not force and self._raw_rows and (
-            not getattr(self, "_hydrated_from_cache", False)
-            or entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
-        ):
+        if not force and self._selected_ids:
+            return False
+        manual_loaded = bool(self._raw_rows) and not getattr(self, "_hydrated_from_cache", False)
+        if not force and manual_loaded:
+            return False
+        already_same = (
+            getattr(self, "_hydrated_from_cache", False)
+            and getattr(self, "_cache_fetched_at", 0.0) > 0.0
+            and entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
+        )
+        if not force and already_same:
             return False
         self._source_backend = str(entry.meta.get("source_backend") or "cached")
         self._hydrated_from_cache = True
         self._cache_fetched_at = entry.fetched_at
+        self.record_app_log(
+            f"Hydrated Splunk ES Notables cache ({len(entry.items)} item(s)).",
+            level="DEBUG",
+            source="cache",
+        )
         cols = self._get_notable_columns()
         self._populate_table(
             entry.items,

@@ -1087,3 +1087,535 @@ def test_legacy_right_click_menus_removed_across_panes(tmp_path: Path) -> None:
                 )
 
     asyncio.run(_run())
+
+
+def test_alert_cache_store_nonblocking_load_prepared_images_and_404_negative_cache(
+    tmp_path: Path,
+) -> None:
+    from soclens.alert_cache import CACHE_SOURCE_RF_PLAYBOOK
+
+    cache_dir = tmp_path / "alert_cache"
+    seed = AlertCacheStore(cache_dir=cache_dir)
+    seed.put(CACHE_SOURCE_RF, [{"id": "old-1"}], fetched_at=100.0)
+    seed.put(CACHE_SOURCE_RF_PLAYBOOK, [{"id": "pb-1"}], fetched_at=100.0)
+    seed.mark_image_unavailable("domain_abuse__pb-1__missing-img")
+
+    # load_on_init=False keeps constructor instant; newer in-memory entries are preserved
+    store = AlertCacheStore(cache_dir=cache_dir, load_on_init=False)
+    assert store.get(CACHE_SOURCE_RF) is None
+    assert store.is_image_unavailable("domain_abuse__pb-1__missing-img") is False
+
+    store.put(CACHE_SOURCE_RF, [{"id": "newer-in-mem"}], fetched_at=500.0)
+    loaded = store.load_from_disk_sources()
+    assert CACHE_SOURCE_RF_PLAYBOOK in loaded
+    assert CACHE_SOURCE_RF not in loaded
+    assert store.get(CACHE_SOURCE_RF).items == [{"id": "newer-in-mem"}]  # type: ignore[union-attr]
+    assert store.is_image_unavailable("domain_abuse__pb-1__missing-img") is True
+
+    # Prepared image storage & retrieval
+    store.put_prepared_image("k1", {"bytes": b"abc", "crop_checked": True})
+    got = store.get_prepared_image("k1")
+    assert got is not None and got["crop_checked"] is True
+
+    # Writing actual image bytes clears the 404 negative cache entry
+    store.put_image_bytes("domain_abuse__pb-1__missing-img", b"\x89PNG\r\n\x1a\n123456")
+    assert store.is_image_unavailable("domain_abuse__pb-1__missing-img") is False
+
+
+def test_rf_tab_hydrates_without_ui_image_decoding_or_api_calls(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import soclens.tui.image_render as image_render_mod
+    import soclens.tui.screens.rf_intel as rf_intel_mod
+    from soclens.tui.image_render import DecodedImage, encode_png
+
+    recent = _recent_iso(1)
+    rgb_rows = [bytes([20, 80, 160] * 16) for _ in range(16)]
+    png_bytes = encode_png(
+        DecodedImage(width=16, height=16, color_type=2, bit_depth=8, raw_size=0, rgb_rows=rgb_rows)
+    )
+
+    rf_client = MagicMock()
+    rf_client.search_alerts_v3.return_value = {
+        "data": [
+            {
+                "id": "rf-u1",
+                "title": "Background RF Alert",
+                "rule": {"name": "Lookalike"},
+                "review": {"status": "New"},
+                "log": {"triggered": recent},
+            }
+        ],
+        "counts": {"total": 1},
+    }
+    rf_client.get_alert_v3.return_value = {
+        "data": {
+            "id": "rf-u1",
+            "title": "Background RF Alert",
+            "rule": {"name": "Lookalike"},
+            "review": {"status": "New", "assignee": "soc_analyst"},
+            "log": {"triggered": recent},
+        }
+    }
+    rf_client.search_playbook_alerts.return_value = {
+        "data": [
+            {
+                "playbook_alert_id": "pb-u1",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "fake-login.example",
+                "updated": recent,
+            }
+        ],
+        "counts": {"total": 1},
+    }
+    rf_client.get_playbook_alert.return_value = {
+        "data": {
+            "playbook_alert_id": "pb-u1",
+            "category": "domain_abuse",
+            "panel_status": {"status": "New", "priority": "High", "entity_name": "fake-login.example"},
+            "panel_evidence_summary": {
+                "screenshots": [{"image_id": "img-u1", "description": "Login spoof"}]
+            },
+        }
+    }
+    rf_client.get_playbook_alert_image.return_value = png_bytes
+
+    es_client = MagicMock()
+    es_client.query_findings_hybrid.return_value = {"items": [], "source_backend": "mc_v2"}
+
+    app = create_app(
+        client=rf_client,
+        dry_run=True,
+        initial_tab="tab-splunk-es",
+        workspace_dir=tmp_path,
+        preload_alerts=True,
+        alert_cache_refresh_seconds=0,
+    )
+    app.splunk_es_client = es_client  # type: ignore[attr-defined]
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            def _forbid_ui_work(*_args, **_kwargs):
+                raise AssertionError("UI thread must not decode/crop/blur/encode cached images!")
+
+            monkeypatch.setattr(rf_intel_mod, "blur_decoded_image", _forbid_ui_work)
+            monkeypatch.setattr(rf_intel_mod, "encode_png", _forbid_ui_work)
+            monkeypatch.setattr(image_render_mod, "decode_image", _forbid_ui_work)
+            monkeypatch.setattr(image_render_mod, "auto_crop_margins", _forbid_ui_work)
+            monkeypatch.setattr(image_render_mod, "blur_decoded_image", _forbid_ui_work)
+            monkeypatch.setattr(image_render_mod, "encode_png", _forbid_ui_work)
+
+            # Visiting RF Alerts hydrates Alerts v3 + Playbook Alerts with zero UI image decode
+            app.activate_tab("tab-rf-intel")
+            await pilot.pause()
+            await pilot.pause()
+            rf_pane = app.query_one(RFIntelPane)
+            assert rf_pane._active_mode == "alerts_v3"
+            assert rf_pane.query_one("#rf-results-table", DoubleClickDataTable).row_count == 1
+
+            # Switch to Playbook Alerts view: renders inline pre-blurred screenshot with ZERO UI decode/blur!
+            from textual.widgets import Select
+
+            rf_pane.query_one("#rf-view-select", Select).value = "playbook"
+            await pilot.pause()
+            await pilot.pause()
+            assert rf_pane._active_mode == "playbook"
+            assert rf_pane.query_one("#rf-results-table", DoubleClickDataTable).row_count == 1
+            assert rf_client.search_alerts_v3.call_count == 1
+            assert rf_client.search_playbook_alerts.call_count == 1
+            assert rf_client.get_playbook_alert_image.call_count == 1
+
+    asyncio.run(_run())
+
+
+def test_cold_disk_cache_warms_in_background_and_skips_404_images(tmp_path: Path) -> None:
+    from soclens.alert_cache import CACHE_SOURCE_RF_PLAYBOOK
+    from soclens.client import RecordedFutureError
+    from soclens.tui.image_render import DecodedImage, encode_png
+    from soclens.tui.rf_formatters import normalize_alert_v3
+
+    recent = _recent_iso(1)
+    rgb_rows = [bytes([60, 120, 200] * 16) for _ in range(16)]
+    png_bytes = encode_png(
+        DecodedImage(width=16, height=16, color_type=2, bit_depth=8, raw_size=0, rgb_rows=rgb_rows)
+    )
+
+    cache_dir = tmp_path / ".soclens_cache" / "alerts"
+    seed = AlertCacheStore(cache_dir=cache_dir)
+    seed.put(
+        CACHE_SOURCE_RF,
+        [
+            normalize_alert_v3(
+                {
+                    "id": "disk-a1",
+                    "title": "Disk Alert",
+                    "rule": {"name": "Disk Rule"},
+                    "review": {"status": "New"},
+                    "ai_insights": {"priority": "High"},
+                    "log": {"triggered": recent},
+                }
+            )
+        ],
+        meta={"total": 1, "details": {}},
+    )
+    seed.put(
+        CACHE_SOURCE_RF_PLAYBOOK,
+        [
+            {
+                "id": "disk-pb-1",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "disk-pb.example",
+                "updated": recent,
+                "screenshot_ids": ["img-disk-1"],
+            }
+        ],
+        meta={
+            "total": 1,
+            "details": {
+                "disk-pb-1": {
+                    "playbook_alert_id": "disk-pb-1",
+                    "category": "domain_abuse",
+                    "panel_status": {"status": "New", "priority": "High"},
+                    "panel_evidence_summary": {"screenshots": [{"image_id": "img-disk-1"}]},
+                }
+            },
+            "image_keys": {"disk-pb-1": [["domain_abuse", "disk-pb-1", "domain_abuse__disk-pb-1__img-disk-1"]]},
+        },
+    )
+    seed.put_image_bytes("domain_abuse__disk-pb-1__img-disk-1", png_bytes)
+    seed.mark_image_unavailable("domain_abuse__disk-pb-2__img-404")
+
+    rf_client = MagicMock()
+    rf_client.search_alerts_v3.return_value = {"data": [], "counts": {"total": 0}}
+    rf_client.search_playbook_alerts.return_value = {
+        "data": [
+            {
+                "playbook_alert_id": "disk-pb-2",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "missing-img.example",
+                "updated": recent,
+            }
+        ],
+        "counts": {"total": 1},
+    }
+    rf_client.get_playbook_alert.return_value = {
+        "data": {
+            "playbook_alert_id": "disk-pb-2",
+            "category": "domain_abuse",
+            "panel_status": {"status": "New", "priority": "High"},
+            "panel_evidence_summary": {"screenshots": [{"image_id": "img-404"}]},
+        }
+    }
+    rf_client.get_playbook_alert_image.side_effect = RecordedFutureError(
+        404, "Not found", endpoint="/playbook-alert/domain_abuse/disk-pb-2/image/img-404"
+    )
+
+    app = create_app(
+        client=rf_client,
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        preload_alerts=False,
+    )
+    # Constructor did not synchronously load disk cache
+    assert app.alert_cache.get(CACHE_SOURCE_RF) is None
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            # Background disk warmer loaded JSON + prepared image bytes
+            assert app.alert_cache.get(CACHE_SOURCE_RF) is not None
+            assert app.alert_cache.get_prepared_image("domain_abuse__disk-pb-1__img-disk-1") is not None
+
+            # Running playbook preload skips the already-marked 404 image completely
+            app._preload_rf_playbook_24h()
+            assert rf_client.get_playbook_alert_image.call_count == 0
+
+            # Switching to RF Intel hydrates instantly
+            app.activate_tab("tab-rf-intel")
+            await pilot.pause()
+            await pilot.pause()
+            rf_pane = app.query_one(RFIntelPane)
+            assert rf_pane.query_one("#rf-results-table", DoubleClickDataTable).row_count == 1
+
+    asyncio.run(_run())
+
+
+def test_per_source_workers_independent_when_one_source_blocks(tmp_path: Path) -> None:
+    import threading
+
+    recent = _recent_iso(1)
+    pb_gate = threading.Event()
+    pb_started = threading.Event()
+
+    rf_client = MagicMock()
+    rf_client.search_alerts_v3.return_value = {
+        "data": [
+            {
+                "id": "rf-fast-1",
+                "title": "Fast RF Alert",
+                "rule": {"name": "Rule"},
+                "review": {"status": "New"},
+                "log": {"triggered": recent},
+            }
+        ],
+        "counts": {"total": 1},
+    }
+    rf_client.get_alert_v3.return_value = {"data": {"id": "rf-fast-1", "title": "Fast RF Alert"}}
+
+    def _slow_playbook(**_kwargs):
+        pb_started.set()
+        pb_gate.wait(timeout=5.0)
+        return {"data": [], "counts": {"total": 0}}
+
+    rf_client.search_playbook_alerts.side_effect = _slow_playbook
+
+    es_client = MagicMock()
+    es_client.query_findings_hybrid.return_value = {
+        "items": [{"event_id": "es-fast-1", "rule_title": "Fast ES", "urgency": "high", "_time": recent}],
+        "source_backend": "mc_v2",
+    }
+    s1_client = MagicMock()
+    s1_client.console_url = "https://tenant.sentinelone.net"
+    s1_client.list_threats.return_value = []
+    s1_client.list_sites.return_value = []
+
+    app = create_app(
+        client=rf_client,
+        s1_client=s1_client,
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        preload_alerts=True,
+        alert_cache_refresh_seconds=0,
+    )
+    app.splunk_es_client = es_client  # type: ignore[attr-defined]
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            # Wait for slow playbook worker to start, while fast workers finish independently
+            assert pb_started.wait(timeout=3.0)
+            for _ in range(30):
+                if (
+                    app.alert_cache.get(CACHE_SOURCE_RF) is not None
+                    and app.alert_cache.get(CACHE_SOURCE_ES) is not None
+                    and app.alert_cache.get(CACHE_SOURCE_S1) is not None
+                ):
+                    break
+                await pilot.pause(0.05)
+
+            assert app.alert_cache.get(CACHE_SOURCE_RF) is not None
+            assert app.alert_cache.get(CACHE_SOURCE_ES) is not None
+            assert app.alert_cache.get(CACHE_SOURCE_S1) is not None
+
+            # Switch to RF Alerts while Playbook worker is STILL blocked -> instant Alerts v3 hydration!
+            app.activate_tab("tab-rf-intel")
+            await pilot.pause()
+            await pilot.pause()
+            rf_pane = app.query_one(RFIntelPane)
+            assert rf_pane.query_one("#rf-results-table", DoubleClickDataTable).row_count == 1
+            # Visiting tab did NOT re-trigger search_alerts_v3
+            assert rf_client.search_alerts_v3.call_count == 1
+
+            pb_gate.set()
+            await app.workers.wait_for_complete()
+
+    asyncio.run(_run())
+
+
+def test_api_access_registry_and_research_skips_denied_apis(tmp_path: Path) -> None:
+    import json
+
+    from soclens.api_access import (
+        ApiAccessRegistry,
+        credential_fingerprint,
+        is_permanent_access_denial,
+    )
+    from soclens.client import RecordedFutureAPIError, RecordedFutureAuthError
+    from soclens.research import probe_api_capabilities, research_target
+
+    assert is_permanent_access_denial(401, message="Bad authorization token") is True
+    assert is_permanent_access_denial(403, permission_type="missing_api_privileges") is True
+    assert is_permanent_access_denial(403, permission_type="proxy_blocked") is False
+    assert is_permanent_access_denial(429, message="Rate limit") is False
+    assert is_permanent_access_denial(400, message="Bad arg") is False
+
+    # Seed from rf_api_errors.jsonl
+    err_log = tmp_path / "logs" / "rf_api_errors.jsonl"
+    err_log.parent.mkdir(parents=True, exist_ok=True)
+    now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    err_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": now_iso,
+                        "endpoint": "/risk/history",
+                        "method": "POST",
+                        "status_code": 403,
+                        "message": "Access requires Risk Api privilege",
+                        "category": "core_flat",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": now_iso,
+                        "endpoint": "/search",
+                        "method": "GET",
+                        "status_code": 401,
+                        "message": "Bad authorization token.",
+                        "category": "sandbox_v0",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    reg = ApiAccessRegistry(state_path=tmp_path / ".soclens_cache" / "api_access.json")
+    fp1 = credential_fingerprint("token-one")
+    sb_fp1 = credential_fingerprint("bad-sandbox")
+    seeded = reg.seed_from_error_log(err_log, rf_core_fp=fp1, rf_sandbox_fp=sb_fp1)
+    assert seeded == 2
+    assert reg.is_denied("risk_history", credential_fp=fp1) is True
+    assert reg.is_denied("sandbox_v0", credential_fp=sb_fp1) is True
+
+    # Different token invalidates cached denials automatically
+    fp2 = credential_fingerprint("token-two")
+    assert reg.is_denied("risk_history", credential_fp=fp2) is False
+
+    # research_target records 403 denials on first call and skips them on second call with 0 HTTP calls
+    reg2 = ApiAccessRegistry(state_path=tmp_path / ".soclens_cache" / "api_access_2.json")
+    client = MagicMock()
+    client._stop_event = None
+    client.api_token = "tok-a"
+    client.sandbox_token = "tok-sb"
+    client.asi_api_key = None
+    client.riskrecon_token = None
+    client.entity_match.return_value = [{"id": "idn:evil.example", "name": "evil.example", "type": "InternetDomainName"}]
+    client.entity_lookup.return_value = {"name": "evil.example"}
+    client.v2_lookup.return_value = {"data": {"entity": {"id": "idn:evil.example", "name": "evil.example"}, "risk": {"score": 50}}}
+    client.v2_company_by_domain.side_effect = RecordedFutureAuthError(
+        403, "Missing Data permissions", permission_type="missing_data_permissions"
+    )
+    client.search_collective_insights.side_effect = RecordedFutureAuthError(
+        403, "Not enough privileges", permission_type="missing_api_privileges"
+    )
+    client.search_risk_history.side_effect = RecordedFutureAuthError(
+        403, "Access requires Risk Api privilege", permission_type="missing_api_privileges"
+    )
+    client.identity_search.side_effect = RecordedFutureAuthError(
+        403, "User does not have access", permission_type="missing_api_privileges"
+    )
+    client.sandbox_search.side_effect = RecordedFutureAuthError(
+        401, "Bad authorization token", permission_type="unauthorized"
+    )
+    client.soar_enrich.return_value = {"data": []}
+    client.links_search.return_value = {"data": []}
+    client.search_analyst_notes.return_value = {"data": []}
+    client.search_detection_rules.return_value = []
+    client.malware_intel_query_iocs.side_effect = RecordedFutureAPIError(500, "Transient")
+    client.search_alerts_v3.return_value = {"data": []}
+    client.search_playbook_alerts.return_value = {"data": []}
+
+    d1 = research_target(
+        client,
+        "evil.example",
+        include_osint=False,
+        access_registry=reg2,
+    )
+    assert d1.sections["collective_insights"].status == "not_entitled"
+    assert d1.sections["risk_history"].status == "not_entitled"
+    assert d1.sections["identity"].status == "not_entitled"
+    assert d1.sections["sandbox"].status == "not_entitled"
+    assert "Missing Data permissions" in str(d1.sections["v2_intel"].data["company_by_domain_note"])
+
+    # Second research run must NOT call those denied APIs again, while transient 500 IS retried
+    d2 = research_target(
+        client,
+        "evil2.example",
+        include_osint=False,
+        access_registry=reg2,
+    )
+    assert d2.sections["collective_insights"].status == "not_entitled"
+    assert "Skipped (no API access cached" in d2.sections["collective_insights"].message
+    assert client.search_collective_insights.call_count == 1
+    assert client.search_risk_history.call_count == 1
+    assert client.identity_search.call_count == 1
+    assert client.sandbox_search.call_count == 1
+    assert client.v2_company_by_domain.call_count == 1
+    assert client.malware_intel_query_iocs.call_count == 2
+
+    # probe_api_capabilities also updates access_registry
+    probe_api_capabilities(client, access_registry=reg2)
+    assert reg2.is_denied("v2_company", credential_fp=credential_fingerprint("tok-a")) is True
+
+
+def test_debug_log_file_sink_redaction_and_logs_filters(tmp_path: Path) -> None:
+    from textual.widgets import Button, Select
+
+    from soclens.tui.logging_bridge import AppLogStore, LogEntry
+
+    log_file = tmp_path / "logs" / "soclens_debug.log"
+    store = AppLogStore()
+    store.set_file_sink(log_file, max_bytes=10_000)
+    store.append(
+        LogEntry(
+            timestamp="12:00:00",
+            level="DEBUG",
+            source="cache",
+            logger_name="AlertPreloader",
+            message="Loaded cache with X-RFToken: secret-tok-123 and Bearer abcdefgh12345",
+        )
+    )
+    content = log_file.read_text(encoding="utf-8")
+    assert "secret-tok-123" not in content
+    assert "abcdefgh12345" not in content
+    assert "<REDACTED>" in content
+    assert "[DEBUG] [cache|AlertPreloader]" in content
+
+    app = create_app(client=MagicMock(), dry_run=True, initial_tab="tab-logs", workspace_dir=tmp_path)
+
+    async def _run() -> None:
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            app.record_log("Cache debug msg", level="DEBUG", source="cache", logger_name="AlertPreloader")
+            app.record_log("Cache info msg", level="INFO", source="cache", logger_name="AlertPreloader")
+            app.record_log("Other info msg", level="INFO", source="tui", logger_name="SocLensApp")
+            await pilot.pause()
+
+            await pilot.click("#logs-cache-btn")
+            await pilot.pause()
+            assert app.query_one("#logs-source-select", Select).value == "cache"
+            txt = extract_richlog_text(app.query_one("#app-log", RichLog))
+            assert "Cache debug msg" in txt
+            assert "Cache info msg" in txt
+            assert "Other info msg" not in txt
+
+            await pilot.click("#logs-debug-btn")
+            await pilot.pause()
+            assert app.query_one("#logs-level-select", Select).value == "DEBUG_ONLY"
+            dbg_txt = extract_richlog_text(app.query_one("#app-log", RichLog))
+            assert "Cache debug msg" in dbg_txt
+            assert "Cache info msg" not in dbg_txt
+
+            # Verify narrow 80x24 layout keeps new Cache & Debug buttons unclipped
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause()
+            for btn_id in ("#logs-cache-btn", "#logs-debug-btn", "#logs-tz-btn"):
+                btn = app.query_one(btn_id, Button)
+                assert btn.region.height >= 1
+
+    asyncio.run(_run())

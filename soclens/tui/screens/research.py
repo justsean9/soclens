@@ -1117,6 +1117,7 @@ class ResearchPane(BaseSocPane):
                     osint_sources=osint_sources,
                     osint_client=osint_client,
                     workspace_dir=self.workspace_dir,
+                    access_registry=getattr(self.app, "api_access", None),
                 )
             if seq != self._request_seq or self.is_app_shutting_down():
                 return

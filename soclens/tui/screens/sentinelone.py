@@ -548,10 +548,21 @@ class SentinelOnePane(BaseSocPane):
             return False
         entry = cache.get(CACHE_SOURCE_S1)
         if entry is None:
+            loading_fn = getattr(self.app, "is_cache_source_loading", None)
+            if not self._records and callable(loading_fn) and loading_fn(CACHE_SOURCE_S1):
+                self.set_status(
+                    "Background preload in progress for SentinelOne Alerts (24h)... Data will populate automatically."
+                )
             return False
-        if not force and self._records and (
-            not self._hydrated_from_cache or entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
-        ):
+        manual_loaded = bool(self._records) and not getattr(self, "_hydrated_from_cache", False)
+        if not force and manual_loaded:
+            return False
+        already_same = (
+            getattr(self, "_hydrated_from_cache", False)
+            and getattr(self, "_cache_fetched_at", 0.0) > 0.0
+            and entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
+        )
+        if not force and already_same:
             return False
         cached_sites = entry.meta.get("sites")
         if isinstance(cached_sites, list) and cached_sites and not self._cached_sites:
@@ -559,6 +570,11 @@ class SentinelOnePane(BaseSocPane):
         self._loaded_timeframe_filter = "last_24h"
         self._hydrated_from_cache = True
         self._cache_fetched_at = entry.fetched_at
+        self.record_app_log(
+            f"Hydrated SentinelOne cache ({len(entry.items)} item(s)).",
+            level="DEBUG",
+            source="cache",
+        )
         self._populate_table(entry.items)
         self.set_status(
             f"Loaded {len(entry.items)} cached SentinelOne alert(s) "

@@ -187,17 +187,20 @@ class TestClientResearchAPIs(unittest.TestCase):
         )
         body = self.mock_session.request.call_args.kwargs["json"]
         self.assertEqual(body["start_date"], "2023-11-01")
+        self.assertEqual(body["page"], 0)
         self.assertTrue(
             self.mock_session.request.call_args.kwargs["url"].endswith("/malware-intelligence/v1/query")
         )
 
         self.client.malware_intel_query_nl("cobalt strike c2", field="ip_address")
+        self.assertEqual(self.mock_session.request.call_args.kwargs["json"]["page"], 0)
         self.assertTrue(
             self.mock_session.request.call_args.kwargs["url"].endswith("/malware-intelligence/v1/query_nl")
         )
 
         self.client.malware_intel_query_iocs(ip_list=["1.2.3.4"], operator="and")
         self.assertEqual(self.mock_session.request.call_args.kwargs["json"]["operator"], "and")
+        self.assertEqual(self.mock_session.request.call_args.kwargs["json"]["page"], 0)
 
         self.client.malware_intel_sandbox_reports("a" * 64, "family:cobalt")
         self.assertTrue(

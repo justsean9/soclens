@@ -7,6 +7,7 @@ import contextlib
 import inspect
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import datetime
@@ -31,7 +32,16 @@ from soclens.alert_cache import (
     AlertCacheStore,
     get_alert_cache_refresh_seconds,
 )
-from soclens.client import RecordedFutureClient
+from soclens.api_access import (
+    ApiAccessRegistry,
+    credential_fingerprint,
+    is_permanent_access_denial,
+)
+from soclens.client import (
+    RecordedFutureAuthError,
+    RecordedFutureClient,
+    RecordedFutureError,
+)
 from soclens.config import (
     IMAGE_VIEWER_OS,
     UI_VIEW_ADMIN,
@@ -41,6 +51,7 @@ from soclens.config import (
     ensure_utf8_console,
     format_image_viewer_status,
     get_image_viewer_mode,
+    get_rf_sandbox_token,
     get_rf_token,
     get_rf_verify_ssl,
     get_sentinelone_config,
@@ -53,7 +64,7 @@ from soclens.config import (
     save_tui_settings,
     suppress_insecure_ssl_warnings,
 )
-from soclens.sentinelone import SentinelOneClient
+from soclens.sentinelone import SentinelOneAuthError, SentinelOneClient
 from soclens.settings import (
     clear_session_overrides,
     clear_unlocked_keys,
@@ -64,6 +75,7 @@ from soclens.tui.image_render import (
     get_recommended_image_viewer_mode,
     get_terminal_probe_result,
     is_truecolor_kitty_env,
+    prepare_image_cache_entry,
 )
 from soclens.tui.logging_bridge import (
     AppLogStore,
@@ -1239,11 +1251,24 @@ class SocLensApp(App[None]):
         self._preload_alerts_opt: bool | None = preload_alerts
         self._alert_cache_refresh_override: int | None = alert_cache_refresh_seconds
         self._preload_lock = threading.Lock()
-        self._preload_running: bool = False
+        self._preload_inflight: set[str] = set()
+        self._preload_status: dict[str, str] = {}
+        self._initial_preload_started: bool = False
+        self._image_prep_lock = threading.Lock()
         self._alert_refresh_timer: Any = None
         self.alert_cache = AlertCacheStore(
-            cache_dir=self.workspace_dir / ".soclens_cache" / "alerts"
+            cache_dir=self.workspace_dir / ".soclens_cache" / "alerts",
+            load_on_init=False,
         )
+        self.api_access = ApiAccessRegistry(
+            state_path=self.workspace_dir / ".soclens_cache" / "api_access.json"
+        )
+        if not self.is_headless or os.environ.get("SOCLENS_DEBUG_LOG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            self.log_store.set_file_sink(self.workspace_dir / "logs" / "soclens_debug.log")
         self._update_subtitle()
 
     @property
@@ -1938,6 +1963,8 @@ class SocLensApp(App[None]):
                 pane.on_settings_updated()
             except Exception:
                 pass
+        if self._ui_mounted and self._should_preload_alerts() and not is_settings_locked():
+            self._start_alert_preloader()
 
     def _focus_main_tabs(self) -> None:
         """Keep focus on the main tab bar rather than the top view-mode chrome."""
@@ -1964,11 +1991,16 @@ class SocLensApp(App[None]):
             self._apply_view_mode_to_ui()
             self._sync_responsive_chrome()
             self._focus_main_tabs()
+        cache_dir = self.alert_cache.cache_dir
+        err_log_path = self.workspace_dir / "logs" / "rf_api_errors.jsonl"
+        if (cache_dir is not None and cache_dir.is_dir()) or err_log_path.is_file():
+            self._warm_disk_cache_worker()
         if is_settings_locked():
             self._prompt_settings_unlock()
-        elif not self.no_secret_store:
-            self._hydrate_secrets_worker()
-        self._start_alert_preloader()
+        else:
+            if not self.no_secret_store:
+                self._hydrate_secrets_worker()
+            self._start_alert_preloader()
 
     def _should_preload_alerts(self) -> bool:
         """Return True when startup/periodic 24h alert preloading should run."""
@@ -1981,10 +2013,92 @@ class SocLensApp(App[None]):
             return max(0, int(self._alert_cache_refresh_override))
         return get_alert_cache_refresh_seconds()
 
+    def is_cache_source_loading(self, source: str) -> bool:
+        """Return True when the background worker for ``source`` is actively running."""
+        with self._preload_lock:
+            return source in self._preload_inflight
+
+    def _claim_preload_source(self, source: str) -> bool:
+        if self._stop_event.is_set() or self._shutting_down:
+            return False
+        with self._preload_lock:
+            if source in self._preload_inflight:
+                return False
+            self._preload_inflight.add(source)
+            self._preload_status[source] = "loading"
+            return True
+
+    def _release_preload_source(self, source: str, status: str) -> None:
+        with self._preload_lock:
+            self._preload_inflight.discard(source)
+            self._preload_status[source] = status
+
+    def _rf_core_credential_fp(self) -> str:
+        if self._custom_client_injected:
+            tok = getattr(self.client, "api_token", None)
+            return credential_fingerprint(tok if isinstance(tok, str) else "injected-rf")
+        return credential_fingerprint(get_rf_token(required=False))
+
+    def _rf_sandbox_credential_fp(self) -> str:
+        if self._custom_client_injected:
+            tok = getattr(self.client, "sandbox_token", None) or getattr(self.client, "api_token", None)
+            return credential_fingerprint(tok if isinstance(tok, str) else "injected-rf-sandbox")
+        core_tok = get_rf_token(required=False)
+        return credential_fingerprint(get_rf_sandbox_token(required=False, default_core_token=core_tok))
+
+    def _es_credential_fp(self) -> str:
+        if getattr(self, "splunk_es_client", None) is not None:
+            return credential_fingerprint("injected-es")
+        cfg = get_splunk_config(app="SplunkEnterpriseSecuritySuite", required=False)
+        return credential_fingerprint(cfg.host, cfg.token or cfg.username)
+
+    def _s1_credential_fp(self) -> str:
+        if self.s1_client is not None:
+            return credential_fingerprint("injected-s1")
+        cfg = get_sentinelone_config(required=False)
+        return credential_fingerprint(cfg.console_url, cfg.api_token)
+
+    def _get_preload_rf_client(self) -> tuple[Any, bool]:
+        """Return ``(client, owns_client)`` with a dedicated session for background threads."""
+        if self._custom_client_injected:
+            return self.client, False
+        rf_client = RecordedFutureClient(
+            verify_ssl=self.get_effective_verify_ssl(),
+            stop_event=self._stop_event,
+        )
+        return rf_client, True
+
+    def _prepare_and_store_playbook_image(self, img_key: str, raw_bytes: bytes) -> bool:
+        """Decode, auto-crop, and pre-blur a Playbook image off the UI thread."""
+        if (
+            not img_key
+            or not raw_bytes
+            or self._stop_event.is_set()
+            or self._shutting_down
+        ):
+            return False
+        if self.alert_cache.get_prepared_image(img_key) is not None:
+            return False
+        try:
+            with self._image_prep_lock:
+                if self._stop_event.is_set() or self._shutting_down:
+                    return False
+                if self.alert_cache.get_prepared_image(img_key) is not None:
+                    return False
+                prepared = prepare_image_cache_entry(raw_bytes)
+                self.alert_cache.put_prepared_image(img_key, prepared)
+            if not self.is_headless:
+                time.sleep(0.01)
+            return True
+        except Exception as exc:
+            self._log_preload_debug(f"Playbook image prepare ({img_key})", exc)
+            return False
+
     def _start_alert_preloader(self) -> None:
         if self._shutting_down or not self._should_preload_alerts():
             return
-        self._preload_alerts_worker()
+        self._initial_preload_started = True
+        self._launch_preload_workers()
         interval = self._effective_alert_refresh_seconds()
         if interval > 0 and self._alert_refresh_timer is None:
             with contextlib.suppress(Exception):
@@ -1995,317 +2109,499 @@ class SocLensApp(App[None]):
     def _on_alert_refresh_tick(self) -> None:
         if self._shutting_down or self._stop_event.is_set():
             return
-        self._preload_alerts_worker()
+        self._launch_preload_workers()
+
+    def _launch_preload_workers(self) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        self._preload_rf_alerts_worker()
+        self._preload_rf_playbook_worker()
+        self._preload_es_notables_worker()
+        self._preload_s1_threats_worker()
+
+    def _preload_alerts_worker(self) -> None:
+        """Backwards-compatible entry point launching independent per-source background workers."""
+        self._launch_preload_workers()
 
     @work(thread=True, exit_on_error=False)
-    def _preload_alerts_worker(self) -> None:
-        """Preload and refresh last-24h RF Alerts, Splunk ES Notables, and S1 Alerts."""
+    def _warm_disk_cache_worker(self) -> None:
+        """Warm persisted alert caches, API denial registry, and Playbook images off the UI thread."""
         if self._stop_event.is_set() or self._shutting_down:
             return
-        with self._preload_lock:
-            if self._preload_running:
+        started = time.perf_counter()
+        loaded = self.alert_cache.load_from_disk_sources()
+        seeded = self.api_access.seed_from_error_log(
+            self.workspace_dir / "logs" / "rf_api_errors.jsonl",
+            rf_core_fp=self._rf_core_credential_fp(),
+            rf_sandbox_fp=self._rf_sandbox_credential_fp(),
+        )
+        if loaded or seeded:
+            with contextlib.suppress(Exception):
+                self.record_log(
+                    f"Disk cache warmed {len(loaded)} source(s) ({', '.join(loaded) or 'none'}), "
+                    f"seeded {seeded} API access denial(s) in {(time.perf_counter() - started) * 1000:.0f}ms.",
+                    level="DEBUG",
+                    source="cache",
+                    logger_name="AlertPreloader",
+                )
+        for source in loaded:
+            if self._stop_event.is_set() or self._shutting_down:
                 return
-            self._preload_running = True
-        try:
-            from concurrent.futures import ThreadPoolExecutor
+            entry = self.alert_cache.get(source)
+            if entry is not None:
+                self._notify_cache_updated(source, len(entry.items))
 
-            tasks: list[tuple[str, Callable[[], None]]] = [
-                (CACHE_SOURCE_RF, self._preload_rf_alerts_24h),
-                (CACHE_SOURCE_RF_PLAYBOOK, self._preload_rf_playbook_24h),
-                (CACHE_SOURCE_ES, self._preload_es_notables_24h),
-                (CACHE_SOURCE_S1, self._preload_s1_threats_24h),
-            ]
-            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="soclens-preload") as pool:
-                futures = [pool.submit(fn) for _, fn in tasks]
-                for fut in futures:
-                    with contextlib.suppress(Exception):
-                        fut.result()
-        finally:
-            with self._preload_lock:
-                self._preload_running = False
+        pb_entry = self.alert_cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+        if pb_entry is None or self._stop_event.is_set() or self._shutting_down:
+            return
+        pb_img_keys = pb_entry.meta.get("image_keys")
+        if not isinstance(pb_img_keys, dict) or not pb_img_keys:
+            return
+        prep_count = 0
+        for entries in pb_img_keys.values():
+            if not isinstance(entries, list):
+                continue
+            for rec in entries:
+                if self._stop_event.is_set() or self._shutting_down:
+                    return
+                if not isinstance(rec, (list, tuple)) or len(rec) != 3:
+                    continue
+                img_key = str(rec[2])
+                if not img_key or self.alert_cache.get_prepared_image(img_key) is not None:
+                    continue
+                raw_bytes = self.alert_cache.get_image_bytes(img_key)
+                if raw_bytes and self._prepare_and_store_playbook_image(img_key, raw_bytes):
+                    prep_count += 1
+        if prep_count and not self._stop_event.is_set() and not self._shutting_down:
+            with contextlib.suppress(Exception):
+                self.record_log(
+                    f"Background disk-warm prepared {prep_count} Playbook screenshot(s).",
+                    level="DEBUG",
+                    source="cache",
+                    logger_name="AlertPreloader",
+                )
+            self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(pb_entry.items))
+
+    @work(thread=True, exit_on_error=False)
+    def _preload_rf_alerts_worker(self) -> None:
+        self._preload_rf_alerts_24h()
+
+    @work(thread=True, exit_on_error=False)
+    def _preload_rf_playbook_worker(self) -> None:
+        self._preload_rf_playbook_24h()
+
+    @work(thread=True, exit_on_error=False)
+    def _preload_es_notables_worker(self) -> None:
+        self._preload_es_notables_24h()
+
+    @work(thread=True, exit_on_error=False)
+    def _preload_s1_threats_worker(self) -> None:
+        self._preload_s1_threats_24h()
 
     def _preload_rf_alerts_24h(self) -> None:
-        if self._stop_event.is_set() or self._shutting_down:
+        if not self._claim_preload_source(CACHE_SOURCE_RF):
             return
-        if not self._custom_client_injected and not get_rf_token(required=False):
-            return
+        status = "done"
         try:
+            if not self._custom_client_injected and not get_rf_token(required=False):
+                status = "unconfigured"
+                return
+            core_fp = self._rf_core_credential_fp()
+            denial = self.api_access.get_denial("alerts_v3", credential_fp=core_fp)
+            if denial is not None:
+                status = "denied"
+                self._log_preload_debug(
+                    "RF alerts (24h)",
+                    RuntimeError(f"Skipped (no API access cached: {denial.get('reason')})"),
+                )
+                return
+
             from concurrent.futures import ThreadPoolExecutor
 
             from soclens.tui.filters import build_alerts_v3_triggered_param
             from soclens.tui.rf_formatters import extract_alerts_v3, normalize_alert_v3
 
-            triggered = build_alerts_v3_triggered_param("last_24h")
-            call_kw: dict[str, Any] = {"limit": 100}
-            if triggered:
-                call_kw["triggered"] = triggered
-            data = self.client.search_alerts_v3(**call_kw)
-            raw_items, total = extract_alerts_v3(data)
-            normalized = [normalize_alert_v3(item) for item in raw_items]
-            if self._stop_event.is_set() or self._shutting_down:
-                return
-
-            # Reuse any already-cached alert details while publishing the fresh list immediately
-            existing_entry = self.alert_cache.get(CACHE_SOURCE_RF)
-            existing_details: dict[str, dict[str, Any]] = {}
-            if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict):
-                existing_details = {
-                    str(k): v
-                    for k, v in existing_entry.meta["details"].items()
-                    if isinstance(v, dict)
-                }
-
-            self.alert_cache.put(
-                CACHE_SOURCE_RF,
-                normalized,
-                timeframe="last_24h",
-                meta={"total": total, "details": existing_details},
-            )
-            self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
-
-            # Preload full Alert v3 details for all 24h alerts so clicking any row is instant
-            get_detail_fn = getattr(self.client, "get_alert_v3", None)
-            if not callable(get_detail_fn) or not normalized:
-                return
-
-            alert_ids = [
-                str(item.get("id") or "").strip()
-                for item in normalized
-                if str(item.get("id") or "").strip()
-            ]
-            if not alert_ids:
-                return
-
-            details_by_id: dict[str, dict[str, Any]] = {
-                aid: existing_details[aid] for aid in alert_ids if aid in existing_details
-            }
-            to_fetch = [aid for aid in alert_ids if aid not in details_by_id]
-
-            def _fetch_one(aid: str) -> tuple[str, dict[str, Any] | None]:
+            rf_client, owns_client = self._get_preload_rf_client()
+            try:
+                started = time.perf_counter()
+                triggered = build_alerts_v3_triggered_param("last_24h")
+                call_kw: dict[str, Any] = {"limit": 100}
+                if triggered:
+                    call_kw["triggered"] = triggered
+                data = rf_client.search_alerts_v3(**call_kw)
+                raw_items, total = extract_alerts_v3(data)
+                normalized = [normalize_alert_v3(item) for item in raw_items]
                 if self._stop_event.is_set() or self._shutting_down:
-                    return aid, None
-                try:
-                    resp = get_detail_fn(aid)
-                    if not isinstance(resp, dict):
+                    status = "cancelled"
+                    return
+
+                existing_entry = self.alert_cache.get(CACHE_SOURCE_RF)
+                existing_details: dict[str, dict[str, Any]] = {}
+                if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict):
+                    existing_details = {
+                        str(k): v
+                        for k, v in existing_entry.meta["details"].items()
+                        if isinstance(v, dict)
+                    }
+
+                self.alert_cache.put(
+                    CACHE_SOURCE_RF,
+                    normalized,
+                    timeframe="last_24h",
+                    meta={"total": total, "details": existing_details},
+                )
+                self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
+
+                get_detail_fn = getattr(rf_client, "get_alert_v3", None)
+                if not callable(get_detail_fn) or not normalized:
+                    return
+
+                alert_ids = [
+                    str(item.get("id") or "").strip()
+                    for item in normalized
+                    if str(item.get("id") or "").strip()
+                ]
+                if not alert_ids:
+                    return
+
+                details_by_id: dict[str, dict[str, Any]] = {
+                    aid: existing_details[aid] for aid in alert_ids if aid in existing_details
+                }
+                to_fetch = [aid for aid in alert_ids if aid not in details_by_id]
+
+                def _fetch_one(aid: str) -> tuple[str, dict[str, Any] | None]:
+                    if self._stop_event.is_set() or self._shutting_down:
                         return aid, None
-                    detail = resp.get("data") if isinstance(resp.get("data"), dict) else resp
-                    return (aid, detail) if isinstance(detail, dict) else (aid, None)
-                except Exception:
-                    return aid, None
+                    try:
+                        resp = get_detail_fn(aid)
+                        if not isinstance(resp, dict):
+                            return aid, None
+                        detail = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+                        return (aid, detail) if isinstance(detail, dict) else (aid, None)
+                    except Exception:
+                        return aid, None
 
-            if to_fetch:
-                with ThreadPoolExecutor(
-                    max_workers=4, thread_name_prefix="soclens-rf-detail"
-                ) as pool:
-                    for aid, detail in pool.map(_fetch_one, to_fetch):
-                        if self._stop_event.is_set() or self._shutting_down:
-                            return
-                        if detail is not None:
-                            details_by_id[aid] = detail
+                if to_fetch:
+                    with ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="soclens-rf-detail"
+                    ) as pool:
+                        for aid, detail in pool.map(_fetch_one, to_fetch):
+                            if self._stop_event.is_set() or self._shutting_down:
+                                status = "cancelled"
+                                return
+                            if detail is not None:
+                                details_by_id[aid] = detail
 
-            if not details_by_id or self._stop_event.is_set() or self._shutting_down:
-                return
+                if not details_by_id or self._stop_event.is_set() or self._shutting_down:
+                    return
 
-            detail_fields = (
-                "assignee",
-                "status",
-                "priority",
-                "note",
-                "hits",
-                "hits_count",
-                "ai_insights",
-                "primary_entity",
-                "rule_name",
-                "org_name",
-                "portal_url",
-                "status_date",
-            )
-            for item in normalized:
-                aid = str(item.get("id") or "").strip()
-                detail = details_by_id.get(aid)
-                if detail is None:
-                    continue
-                norm = normalize_alert_v3(detail)
-                for field in detail_fields:
-                    val = norm.get(field)
-                    if val not in ("", None, "-", [], 0) or not item.get(field):
-                        item[field] = val
-                if isinstance(norm.get("raw"), dict):
-                    item["raw"] = norm["raw"]
+                detail_fields = (
+                    "assignee",
+                    "status",
+                    "priority",
+                    "note",
+                    "hits",
+                    "hits_count",
+                    "ai_insights",
+                    "primary_entity",
+                    "rule_name",
+                    "org_name",
+                    "portal_url",
+                    "status_date",
+                )
+                for item in normalized:
+                    aid = str(item.get("id") or "").strip()
+                    detail = details_by_id.get(aid)
+                    if detail is None:
+                        continue
+                    norm = normalize_alert_v3(detail)
+                    for field in detail_fields:
+                        val = norm.get(field)
+                        if val not in ("", None, "-", [], 0) or not item.get(field):
+                            item[field] = val
+                    if isinstance(norm.get("raw"), dict):
+                        item["raw"] = norm["raw"]
 
-            self.alert_cache.put(
-                CACHE_SOURCE_RF,
-                normalized,
-                timeframe="last_24h",
-                meta={"total": total, "details": details_by_id},
-            )
-            self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
-        except Exception as exc:
+                self.alert_cache.put(
+                    CACHE_SOURCE_RF,
+                    normalized,
+                    timeframe="last_24h",
+                    meta={"total": total, "details": details_by_id},
+                )
+                self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
+                with contextlib.suppress(Exception):
+                    self.record_log(
+                        f"RF alerts_24h preload complete: {len(normalized)} alerts, "
+                        f"{len(details_by_id)} details ({len(to_fetch)} fetched) in "
+                        f"{(time.perf_counter() - started):.2f}s.",
+                        level="DEBUG",
+                        source="cache",
+                        logger_name="AlertPreloader",
+                    )
+            finally:
+                if owns_client:
+                    with contextlib.suppress(Exception):
+                        rf_client.session.close()
+        except RecordedFutureAuthError as exc:
+            status = "denied"
+            if is_permanent_access_denial(
+                exc.status_code, permission_type=exc.permission_type, message=str(exc)
+            ):
+                self.api_access.record_denial(
+                    "alerts_v3",
+                    credential_fp=self._rf_core_credential_fp(),
+                    status_code=exc.status_code,
+                    reason=str(exc),
+                    permission_type=exc.permission_type,
+                )
             self._log_preload_debug("RF alerts (24h)", exc)
+        except Exception as exc:
+            status = "error"
+            self._log_preload_debug("RF alerts (24h)", exc)
+        finally:
+            self._release_preload_source(CACHE_SOURCE_RF, status)
 
     def _preload_rf_playbook_24h(self) -> None:
-        if self._stop_event.is_set() or self._shutting_down:
+        if not self._claim_preload_source(CACHE_SOURCE_RF_PLAYBOOK):
             return
-        if not self._custom_client_injected and not get_rf_token(required=False):
-            return
-        search_pb = getattr(self.client, "search_playbook_alerts", None)
-        if not callable(search_pb):
-            return
+        status = "done"
         try:
+            if not self._custom_client_injected and not get_rf_token(required=False):
+                status = "unconfigured"
+                return
+            core_fp = self._rf_core_credential_fp()
+            denial = self.api_access.get_denial("playbook_alerts", credential_fp=core_fp)
+            if denial is not None:
+                status = "denied"
+                self._log_preload_debug(
+                    "RF Playbook alerts (24h)",
+                    RuntimeError(f"Skipped (no API access cached: {denial.get('reason')})"),
+                )
+                return
+
             from concurrent.futures import ThreadPoolExecutor
 
             from soclens.tui.filters import build_playbook_date_range
             from soclens.tui.rf_formatters import extract_playbook_alerts, normalize_playbook_alert
 
-            pb_range = build_playbook_date_range("last_24h")
-            call_kw: dict[str, Any] = {"limit": 100}
-            if pb_range:
-                call_kw["updated_range"] = pb_range
-            data = search_pb(**call_kw)
-            raw_items, total = extract_playbook_alerts(data)
-            normalized = [normalize_playbook_alert(item) for item in raw_items]
-            if self._stop_event.is_set() or self._shutting_down:
-                return
-
-            existing_entry = self.alert_cache.get(CACHE_SOURCE_RF_PLAYBOOK)
-            existing_details: dict[str, dict[str, Any]] = {}
-            if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict):
-                existing_details = {
-                    str(k): v
-                    for k, v in existing_entry.meta["details"].items()
-                    if isinstance(v, dict)
-                }
-
-            self.alert_cache.put(
-                CACHE_SOURCE_RF_PLAYBOOK,
-                normalized,
-                timeframe="last_24h",
-                meta={"total": total, "details": existing_details},
-            )
-            self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
-
-            if not normalized:
-                return
-
-            get_pb = getattr(self.client, "get_playbook_alert", None)
-            get_pb_preview = getattr(self.client, "get_playbook_alert_preview", None)
-            get_pb_img = getattr(self.client, "get_playbook_alert_image", None)
-            if not callable(get_pb) and not callable(get_pb_preview):
-                return
-
-            details_by_id: dict[str, dict[str, Any]] = {}
-            image_keys_by_alert: dict[str, list[tuple[str, str, str]]] = {}
-
-            def _fetch_pb_full(item: dict[str, Any]) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
+            rf_client, owns_client = self._get_preload_rf_client()
+            try:
+                search_pb = getattr(rf_client, "search_playbook_alerts", None)
+                if not callable(search_pb):
+                    status = "unavailable"
+                    return
+                started = time.perf_counter()
+                pb_range = build_playbook_date_range("last_24h")
+                call_kw: dict[str, Any] = {"limit": 100}
+                if pb_range:
+                    call_kw["updated_range"] = pb_range
+                data = search_pb(**call_kw)
+                raw_items, total = extract_playbook_alerts(data)
+                normalized = [normalize_playbook_alert(item) for item in raw_items]
                 if self._stop_event.is_set() or self._shutting_down:
-                    return "", None, None
-                aid = str(item.get("id") or "").strip()
-                cat = str(item.get("category") or "").strip()
-                if not aid:
-                    return "", None, None
-                detail = existing_details.get(aid)
-                if detail is None:
-                    try:
-                        resp: Any = None
-                        if cat and cat != "-" and callable(get_pb):
-                            try:
-                                resp = get_pb(cat, aid)
-                            except Exception:
-                                if callable(get_pb_preview):
-                                    resp = get_pb_preview(aid)
-                        elif callable(get_pb_preview):
-                            resp = get_pb_preview(aid)
-                        if isinstance(resp, dict):
-                            raw_d = resp.get("data") if isinstance(resp.get("data"), dict) else resp
-                            if isinstance(raw_d, dict):
-                                detail = raw_d
-                    except Exception:
-                        detail = None
-                if not isinstance(detail, dict):
-                    return aid, None, None
-                if not detail.get("category") and cat and cat != "-":
-                    detail = {**detail, "category": cat}
-                norm = normalize_playbook_alert(detail)
-                eff_cat = str(
-                    norm.get("category")
-                    if norm.get("category") and norm.get("category") != "-"
-                    else (cat if cat and cat != "-" else "domain_abuse")
+                    status = "cancelled"
+                    return
+
+                existing_entry = self.alert_cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+                existing_details: dict[str, dict[str, Any]] = {}
+                existing_img_keys: dict[str, Any] = {}
+                if existing_entry is not None:
+                    if isinstance(existing_entry.meta.get("details"), dict):
+                        existing_details = {
+                            str(k): v
+                            for k, v in existing_entry.meta["details"].items()
+                            if isinstance(v, dict)
+                        }
+                    if isinstance(existing_entry.meta.get("image_keys"), dict):
+                        existing_img_keys = dict(existing_entry.meta["image_keys"])
+
+                self.alert_cache.put(
+                    CACHE_SOURCE_RF_PLAYBOOK,
+                    normalized,
+                    timeframe="last_24h",
+                    meta={
+                        "total": total,
+                        "details": existing_details,
+                        "image_keys": existing_img_keys,
+                    },
                 )
-                # Pre-fetch all screenshots for this Playbook Alert into local image cache
-                if callable(get_pb_img):
+                self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
+
+                if not normalized:
+                    return
+
+                get_pb = getattr(rf_client, "get_playbook_alert", None)
+                get_pb_preview = getattr(rf_client, "get_playbook_alert_preview", None)
+                get_pb_img = getattr(rf_client, "get_playbook_alert_image", None)
+                if not callable(get_pb) and not callable(get_pb_preview):
+                    return
+
+                details_by_id: dict[str, dict[str, Any]] = {}
+                image_keys_by_alert: dict[str, list[tuple[str, str, str]]] = {}
+
+                def _fetch_pb_full(
+                    item: dict[str, Any],
+                ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
+                    if self._stop_event.is_set() or self._shutting_down:
+                        return "", None, None
+                    aid = str(item.get("id") or "").strip()
+                    cat = str(item.get("category") or "").strip()
+                    if not aid:
+                        return "", None, None
+                    detail = existing_details.get(aid)
+                    if detail is None:
+                        try:
+                            resp: Any = None
+                            if cat and cat != "-" and callable(get_pb):
+                                try:
+                                    resp = get_pb(cat, aid)
+                                except Exception:
+                                    if callable(get_pb_preview):
+                                        resp = get_pb_preview(aid)
+                            elif callable(get_pb_preview):
+                                resp = get_pb_preview(aid)
+                            if isinstance(resp, dict):
+                                raw_d = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+                                if isinstance(raw_d, dict):
+                                    detail = raw_d
+                        except Exception:
+                            detail = None
+                    if not isinstance(detail, dict):
+                        return aid, None, None
+                    if not detail.get("category") and cat and cat != "-":
+                        detail = {**detail, "category": cat}
+                    norm = normalize_playbook_alert(detail)
+                    eff_cat = str(
+                        norm.get("category")
+                        if norm.get("category") and norm.get("category") != "-"
+                        else (cat if cat and cat != "-" else "domain_abuse")
+                    )
                     sc_ids = [str(s) for s in (norm.get("screenshot_ids") or []) if s][:4]
                     for sid in sc_ids:
                         if self._stop_event.is_set() or self._shutting_down:
                             break
                         img_key = f"{eff_cat}__{aid}__{sid}"
-                        if self.alert_cache.get_image_bytes(img_key) is not None:
+                        if self.alert_cache.is_image_unavailable(img_key):
                             continue
-                        try:
-                            raw_bytes = get_pb_img(eff_cat, aid, sid)
-                            if isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) > 8:
-                                self.alert_cache.put_image_bytes(img_key, bytes(raw_bytes))
-                        except Exception:
-                            pass
-                return aid, detail, norm
+                        raw_bytes = self.alert_cache.get_image_bytes(img_key)
+                        if raw_bytes is None and callable(get_pb_img):
+                            try:
+                                fetched = get_pb_img(eff_cat, aid, sid)
+                                if isinstance(fetched, (bytes, bytearray)) and len(fetched) > 8:
+                                    raw_bytes = bytes(fetched)
+                                    self.alert_cache.put_image_bytes(img_key, raw_bytes)
+                            except RecordedFutureError as img_exc:
+                                if img_exc.status_code == 404:
+                                    self.alert_cache.mark_image_unavailable(img_key)
+                            except Exception:
+                                pass
+                        if raw_bytes:
+                            self._prepare_and_store_playbook_image(img_key, raw_bytes)
+                    return aid, detail, norm
 
-            with ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="soclens-rf-pb"
-            ) as pool:
-                for aid, detail, norm in pool.map(_fetch_pb_full, normalized):
-                    if self._stop_event.is_set() or self._shutting_down:
-                        return
-                    if aid and detail is not None and norm is not None:
-                        details_by_id[aid] = detail
-                        for entry in normalized:
-                            if str(entry.get("id") or "") == aid:
-                                updated_norm = dict(norm)
-                                if updated_norm.get("category") == "-" and entry.get("category"):
-                                    updated_norm["category"] = entry["category"]
-                                if not detail.get("title") and entry.get("title"):
-                                    updated_norm["title"] = entry["title"]
-                                entry.update(updated_norm)
-                                eff_cat = str(entry.get("category") or "domain_abuse")
-                                sc_ids = [str(s) for s in (entry.get("screenshot_ids") or []) if s][:4]
-                                if sc_ids:
-                                    image_keys_by_alert[aid] = [
-                                        (eff_cat, sid, f"{eff_cat}__{aid}__{sid}") for sid in sc_ids
-                                    ]
-                                break
+                with ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="soclens-rf-pb"
+                ) as pool:
+                    for aid, detail, norm in pool.map(_fetch_pb_full, normalized):
+                        if self._stop_event.is_set() or self._shutting_down:
+                            status = "cancelled"
+                            return
+                        if aid and detail is not None and norm is not None:
+                            details_by_id[aid] = detail
+                            for entry in normalized:
+                                if str(entry.get("id") or "") == aid:
+                                    updated_norm = dict(norm)
+                                    if updated_norm.get("category") == "-" and entry.get("category"):
+                                        updated_norm["category"] = entry["category"]
+                                    if not detail.get("title") and entry.get("title"):
+                                        updated_norm["title"] = entry["title"]
+                                    entry.update(updated_norm)
+                                    eff_cat = str(entry.get("category") or "domain_abuse")
+                                    sc_ids = [str(s) for s in (entry.get("screenshot_ids") or []) if s][:4]
+                                    if sc_ids:
+                                        image_keys_by_alert[aid] = [
+                                            (eff_cat, sid, f"{eff_cat}__{aid}__{sid}") for sid in sc_ids
+                                        ]
+                                    break
 
-            if self._stop_event.is_set() or self._shutting_down:
-                return
-            self.alert_cache.put(
-                CACHE_SOURCE_RF_PLAYBOOK,
-                normalized,
-                timeframe="last_24h",
-                meta={
-                    "total": total,
-                    "details": details_by_id,
-                    "image_keys": image_keys_by_alert,
-                },
-            )
-            self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
-        except Exception as exc:
+                if self._stop_event.is_set() or self._shutting_down:
+                    status = "cancelled"
+                    return
+                self.alert_cache.put(
+                    CACHE_SOURCE_RF_PLAYBOOK,
+                    normalized,
+                    timeframe="last_24h",
+                    meta={
+                        "total": total,
+                        "details": details_by_id,
+                        "image_keys": image_keys_by_alert,
+                    },
+                )
+                self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
+                with contextlib.suppress(Exception):
+                    self.record_log(
+                        f"RF playbook_24h preload complete: {len(normalized)} alerts, "
+                        f"{len(details_by_id)} details, {sum(len(v) for v in image_keys_by_alert.values())} images "
+                        f"in {(time.perf_counter() - started):.2f}s.",
+                        level="DEBUG",
+                        source="cache",
+                        logger_name="AlertPreloader",
+                    )
+            finally:
+                if owns_client:
+                    with contextlib.suppress(Exception):
+                        rf_client.session.close()
+        except RecordedFutureAuthError as exc:
+            status = "denied"
+            if is_permanent_access_denial(
+                exc.status_code, permission_type=exc.permission_type, message=str(exc)
+            ):
+                self.api_access.record_denial(
+                    "playbook_alerts",
+                    credential_fp=self._rf_core_credential_fp(),
+                    status_code=exc.status_code,
+                    reason=str(exc),
+                    permission_type=exc.permission_type,
+                )
             self._log_preload_debug("RF Playbook alerts (24h)", exc)
+        except Exception as exc:
+            status = "error"
+            self._log_preload_debug("RF Playbook alerts (24h)", exc)
+        finally:
+            self._release_preload_source(CACHE_SOURCE_RF_PLAYBOOK, status)
 
     def _preload_es_notables_24h(self) -> None:
-        if self._stop_event.is_set() or self._shutting_down:
+        if not self._claim_preload_source(CACHE_SOURCE_ES):
             return
-        custom_es = getattr(self, "splunk_es_client", None)
-        if custom_es is None and not get_splunk_config(required=False).has_auth:
-            return
+        status = "done"
         try:
-            from soclens.splunk_es import SplunkESClient
+            from soclens.splunk_es import SPLUNK_ES_APP, SplunkESClient, SplunkESError
 
+            custom_es = getattr(self, "splunk_es_client", None)
+            if custom_es is None and not get_splunk_config(app=SPLUNK_ES_APP, required=False).has_auth:
+                status = "unconfigured"
+                return
+            es_fp = self._es_credential_fp()
+            denial = self.api_access.get_denial("splunk_es", credential_fp=es_fp)
+            if denial is not None:
+                status = "denied"
+                self._log_preload_debug(
+                    "Splunk ES notables (24h)",
+                    RuntimeError(f"Skipped (no API access cached: {denial.get('reason')})"),
+                )
+                return
+
+            started = time.perf_counter()
             es_client = custom_es
             owns_client = False
             if es_client is None:
-                cfg = get_splunk_config(required=True)
+                cfg = get_splunk_config(app=SPLUNK_ES_APP, required=True)
                 es_client = SplunkESClient(
                     host=cfg.host,
                     token=cfg.token,
                     username=cfg.username,
                     password=cfg.password,
+                    app=cfg.app,
                     verify_ssl=cfg.verify_ssl,
                     stop_event=self._stop_event,
                 )
@@ -2322,12 +2618,23 @@ class SocLensApp(App[None]):
                 if not notables and not callable(hybrid_fn):
                     notables = es_client.list_notables(earliest="-24h", limit=100)
                     backend = "spl_fallback"
+            except SplunkESError as es_exc:
+                if is_permanent_access_denial(es_exc.status_code, message=str(es_exc)):
+                    status = "denied"
+                    self.api_access.record_denial(
+                        "splunk_es",
+                        credential_fp=es_fp,
+                        status_code=es_exc.status_code,
+                        reason=str(es_exc),
+                    )
+                raise
             finally:
                 if owns_client:
                     with contextlib.suppress(Exception):
                         es_client.close()
 
             if self._stop_event.is_set() or self._shutting_down:
+                status = "cancelled"
                 return
             self.alert_cache.put(
                 CACHE_SOURCE_ES,
@@ -2336,17 +2643,42 @@ class SocLensApp(App[None]):
                 meta={"source_backend": backend},
             )
             self._notify_cache_updated(CACHE_SOURCE_ES, len(notables))
+            with contextlib.suppress(Exception):
+                self.record_log(
+                    f"Splunk ES notables_24h preload complete: {len(notables)} record(s) [{backend}] "
+                    f"in {(time.perf_counter() - started):.2f}s.",
+                    level="DEBUG",
+                    source="cache",
+                    logger_name="AlertPreloader",
+                )
         except Exception as exc:
-            self._log_preload_debug("Splunk ES notables (24h)", exc)
+            if status != "denied":
+                status = "error"
+            self._log_preload_debug("Splunk ES notables (24h)", exc, level="WARNING")
+        finally:
+            self._release_preload_source(CACHE_SOURCE_ES, status)
 
     def _preload_s1_threats_24h(self) -> None:
-        if self._stop_event.is_set() or self._shutting_down:
+        if not self._claim_preload_source(CACHE_SOURCE_S1):
             return
-        if self.s1_client is None and not get_sentinelone_config(required=False).has_auth:
-            return
+        status = "done"
         try:
+            if self.s1_client is None and not get_sentinelone_config(required=False).has_auth:
+                status = "unconfigured"
+                return
+            s1_fp = self._s1_credential_fp()
+            denial = self.api_access.get_denial("sentinelone", credential_fp=s1_fp)
+            if denial is not None:
+                status = "denied"
+                self._log_preload_debug(
+                    "SentinelOne alerts (24h)",
+                    RuntimeError(f"Skipped (no API access cached: {denial.get('reason')})"),
+                )
+                return
+
             from soclens.tui.filters import compute_timeframe_bounds
 
+            started = time.perf_counter()
             start_dt, end_dt = compute_timeframe_bounds("last_24h")
             created_after = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if start_dt else None
             created_before = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if end_dt else None
@@ -2374,6 +2706,7 @@ class SocLensApp(App[None]):
                         s1.close()
 
             if self._stop_event.is_set() or self._shutting_down:
+                status = "cancelled"
                 return
             self.alert_cache.put(
                 CACHE_SOURCE_S1,
@@ -2382,16 +2715,37 @@ class SocLensApp(App[None]):
                 meta={"sites": sites},
             )
             self._notify_cache_updated(CACHE_SOURCE_S1, len(records))
+            with contextlib.suppress(Exception):
+                self.record_log(
+                    f"SentinelOne threats_24h preload complete: {len(records)} record(s) "
+                    f"in {(time.perf_counter() - started):.2f}s.",
+                    level="DEBUG",
+                    source="cache",
+                    logger_name="AlertPreloader",
+                )
+        except SentinelOneAuthError as exc:
+            status = "denied"
+            if is_permanent_access_denial(exc.status_code, message=str(exc)):
+                self.api_access.record_denial(
+                    "sentinelone",
+                    credential_fp=self._s1_credential_fp(),
+                    status_code=exc.status_code,
+                    reason=str(exc),
+                )
+            self._log_preload_debug("SentinelOne alerts (24h)", exc, level="WARNING")
         except Exception as exc:
-            self._log_preload_debug("SentinelOne alerts (24h)", exc)
+            status = "error"
+            self._log_preload_debug("SentinelOne alerts (24h)", exc, level="WARNING")
+        finally:
+            self._release_preload_source(CACHE_SOURCE_S1, status)
 
-    def _log_preload_debug(self, label: str, exc: Exception) -> None:
+    def _log_preload_debug(self, label: str, exc: Exception, *, level: str = "DEBUG") -> None:
         if self._stop_event.is_set() or self._shutting_down:
             return
         with contextlib.suppress(Exception):
             self.record_log(
                 f"Background preload skipped/failed for {label}: {exc}",
-                level="DEBUG",
+                level=level,
                 source="cache",
                 logger_name="AlertPreloader",
             )
@@ -2446,6 +2800,8 @@ class SocLensApp(App[None]):
                 )
                 if not self.no_secret_store:
                     self._hydrate_secrets_worker()
+                elif self._should_preload_alerts():
+                    self._start_alert_preloader()
             else:
                 self.record_log(
                     "Continuing with locked settings.json (environment overrides only). "
@@ -2477,7 +2833,12 @@ class SocLensApp(App[None]):
                     f"Startup secret hydration failed: {exc}",
                 )
             return
-        if not hydrated or self._stop_event.is_set() or self.is_shutting_down:
+        if self._stop_event.is_set() or self.is_shutting_down:
+            return
+        if not hydrated:
+            if self._should_preload_alerts() and not self._initial_preload_started:
+                with contextlib.suppress(Exception):
+                    self.call_from_thread(self._start_alert_preloader)
             return
         with contextlib.suppress(Exception):
             self.call_from_thread(self._apply_hydrated_secrets, hydrated)
@@ -2504,8 +2865,6 @@ class SocLensApp(App[None]):
             source="secrets",
             logger_name="SocLensApp",
         )
-        if self._should_preload_alerts():
-            self._preload_alerts_worker()
 
     def on_resize(self) -> None:
         """Update narrow-viewport chrome classes when terminal dimensions change."""

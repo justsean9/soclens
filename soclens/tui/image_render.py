@@ -859,6 +859,26 @@ def blur_image_bytes(
     return encode_png(blurred)
 
 
+def prepare_image_cache_entry(raw_bytes: bytes) -> dict[str, Any]:
+    """Decode, auto-crop, pre-blur, and PNG-encode a screenshot off the UI thread."""
+    payload_bytes = bytes(raw_bytes)
+    decoded = decode_image(payload_bytes)
+    cropped_img, crop_box = auto_crop_margins(decoded)
+    cropped_png = encode_png(cropped_img) if crop_box is not None else payload_bytes
+    blurred_img = blur_decoded_image(cropped_img)
+    blurred_png = encode_png(blurred_img)
+    return {
+        "bytes": payload_bytes,
+        "decoded": decoded,
+        "crop_checked": True,
+        "crop_box": crop_box,
+        "cropped_decoded": cropped_img,
+        "cropped_png": cropped_png,
+        "blurred_decoded": blurred_img,
+        "blurred_png": blurred_png,
+    }
+
+
 def _sixel_rle_sub(match: re.Match[str]) -> str:
     run = match.group(0)
     return f"!{len(run)}{run[0]}"

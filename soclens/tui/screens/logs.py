@@ -82,6 +82,21 @@ class LogsPane(BaseSocPane):
         Binding("escape", "collapse_filter", "Clear Filter", show=False),
     ]
 
+    DEFAULT_CSS: ClassVar[str] = """
+    LogsPane.logs-compact #logs-toolbar {
+        layout: grid;
+        grid-size: 5;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    LogsPane.logs-compact #logs-toolbar Button {
+        width: 1fr;
+        min-width: 5;
+        margin-right: 0;
+    }
+    """
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._source_filter: str = "all"
@@ -129,7 +144,7 @@ class LogsPane(BaseSocPane):
                 compact=True,
             )
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="logs-toolbar", classes="action-row toolbar-row"):
             yield Button(
                 "Scroll: ON",
                 id="logs-autoscroll-btn",
@@ -141,6 +156,8 @@ class LogsPane(BaseSocPane):
             yield Button("Export", id="logs-export-btn", compact=True)
             yield Button("Errors", id="logs-errors-btn", compact=True)
             yield Button("Brand", id="logs-brand-btn", compact=True)
+            yield Button("Cache", id="logs-cache-btn", compact=True)
+            yield Button("Debug", id="logs-debug-btn", compact=True)
             yield Button(f"TZ: {format_timezone_label()}", id="logs-tz-btn", compact=True)
 
         yield SelectableRichLog(
@@ -158,10 +175,21 @@ class LogsPane(BaseSocPane):
             self.query_one("#logs-tz-btn", Button).label = f"TZ: {format_timezone_label()}"
         except Exception:
             pass
+        self._update_responsive_layout()
         self.rebuild_view()
+
+    def on_resize(self) -> None:
+        self._update_responsive_layout()
+
+    def _update_responsive_layout(self) -> None:
+        try:
+            self.set_class(self.size.width < 100, "logs-compact")
+        except Exception:
+            pass
 
     def on_tab_activated(self) -> None:
         if self._ready:
+            self._update_responsive_layout()
             self._update_status_bar()
 
     def _get_store(self) -> AppLogStore | None:
@@ -171,10 +199,14 @@ class LogsPane(BaseSocPane):
     def _entry_matches(self, entry: LogEntry) -> bool:
         if not source_matches_filter(entry.source, self._source_filter):
             return False
-        min_rank = LOG_LEVEL_RANK.get(self._level_filter, 0)
-        entry_rank = LOG_LEVEL_RANK.get(entry.level, 20)
-        if entry_rank < min_rank:
-            return False
+        if self._level_filter == "DEBUG_ONLY":
+            if entry.level != "DEBUG":
+                return False
+        else:
+            min_rank = LOG_LEVEL_RANK.get(self._level_filter, 0)
+            entry_rank = LOG_LEVEL_RANK.get(entry.level, 20)
+            if entry_rank < min_rank:
+                return False
         if self._timeframe_filter != "any":
             if not timestamp_matches_timeframe(entry.created_utc, self._timeframe_filter):
                 return False
@@ -193,6 +225,12 @@ class LogsPane(BaseSocPane):
             err_btn.variant = "warning" if self._level_filter == "ERROR" else "default"
             brand_btn = self.query_one("#logs-brand-btn", Button)
             brand_btn.variant = "primary" if self._source_filter == "brand_sync" else "default"
+            cache_btn = self.query_one("#logs-cache-btn", Button)
+            cache_btn.variant = "primary" if self._source_filter == "cache" else "default"
+            debug_btn = self.query_one("#logs-debug-btn", Button)
+            debug_btn.variant = (
+                "primary" if self._level_filter in ("DEBUG", "DEBUG_ONLY") else "default"
+            )
         except Exception:
             pass
 
@@ -332,6 +370,23 @@ class LogsPane(BaseSocPane):
     def handle_toggle_brand_sync(self) -> None:
         target = "all" if self._source_filter == "brand_sync" else "brand_sync"
         self.set_source_filter(target)
+
+    @on(Button.Pressed, "#logs-cache-btn")
+    def handle_toggle_cache_logs(self) -> None:
+        target = "all" if self._source_filter == "cache" else "cache"
+        self.set_source_filter(target)
+
+    @on(Button.Pressed, "#logs-debug-btn")
+    def handle_toggle_debug_logs(self) -> None:
+        target = "ALL" if self._level_filter == "DEBUG_ONLY" else "DEBUG_ONLY"
+        self._level_filter = target
+        try:
+            sel = self.query_one("#logs-level-select", Select)
+            with sel.prevent(Select.Changed):
+                sel.value = target
+        except Exception:
+            pass
+        self.rebuild_view()
 
     def on_timezone_changed(self, tz_name: str) -> None:
         """Refresh TZ button badge and re-render visible log timestamps cleanly."""

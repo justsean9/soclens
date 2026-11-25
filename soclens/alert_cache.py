@@ -117,15 +117,62 @@ class AlertCacheEntry:
         )
 
 
+def _atomic_write_text(path: Path, text: str, *, prefix: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_bytes(path: Path, data: bytes, *, prefix: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 class AlertCacheStore:
     """Thread-safe local disk + memory cache for last-24h RF, Splunk ES, and S1 alerts."""
 
-    def __init__(self, cache_dir: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        cache_dir: Path | str | None = None,
+        *,
+        load_on_init: bool = True,
+    ) -> None:
+        # _lock protects only fast O(1) in-memory map/set accesses so UI reads never block on disk I/O.
         self._lock = threading.RLock()
+        self._io_lock = threading.Lock()
         self._entries: dict[str, AlertCacheEntry] = {}
         self._images: dict[str, bytes] = {}
+        self._prepared_images: dict[str, dict[str, Any]] = {}
+        self._unavailable_images: set[str] = set()
         self._cache_dir: Path | None = Path(cache_dir) if cache_dir is not None else None
-        if self._cache_dir is not None:
+        if self._cache_dir is not None and load_on_init:
             self.load_from_disk()
 
     @property
@@ -138,11 +185,29 @@ class AlertCacheStore:
         safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in source)
         return self._cache_dir / f"{safe_name}.json"
 
-    def load_from_disk(self) -> int:
-        """Warm in-memory entries from any existing local cache files."""
+    def _unavailable_images_path(self) -> Path | None:
+        if self._cache_dir is None:
+            return None
+        return self._cache_dir / "unavailable_images.json"
+
+    def load_from_disk_sources(self) -> list[str]:
+        """Warm in-memory entries from disk without holding the memory lock during I/O."""
         if self._cache_dir is None or not self._cache_dir.is_dir():
-            return 0
-        loaded = 0
+            return []
+
+        unavail_path = self._unavailable_images_path()
+        if unavail_path is not None and unavail_path.is_file():
+            try:
+                raw_unavail = json.loads(unavail_path.read_text(encoding="utf-8"))
+                if isinstance(raw_unavail, list):
+                    loaded_unavail = {str(x) for x in raw_unavail if str(x).strip()}
+                    if loaded_unavail:
+                        with self._lock:
+                            self._unavailable_images.update(loaded_unavail)
+            except Exception as exc:
+                logger.debug("Skipping unreadable unavailable_images cache %s: %s", unavail_path, exc)
+
+        loaded_sources: list[str] = []
         for source in ALL_CACHE_SOURCES:
             path = self._entry_path(source)
             if path is None or not path.is_file():
@@ -154,11 +219,17 @@ class AlertCacheStore:
                 entry = AlertCacheEntry.from_payload(raw, fallback_source=source)
                 if entry is not None:
                     with self._lock:
-                        self._entries[source] = entry
-                    loaded += 1
+                        existing = self._entries.get(source)
+                        if existing is None or entry.fetched_at > existing.fetched_at:
+                            self._entries[source] = entry
+                            loaded_sources.append(source)
             except Exception as exc:
                 logger.debug("Skipping unreadable alert cache file %s: %s", path, exc)
-        return loaded
+        return loaded_sources
+
+    def load_from_disk(self) -> int:
+        """Warm in-memory entries from any existing local cache files."""
+        return len(self.load_from_disk_sources())
 
     def get(
         self,
@@ -169,17 +240,17 @@ class AlertCacheStore:
         """Return a shallow copy of the cached entry for ``source`` if present and fresh."""
         with self._lock:
             entry = self._entries.get(source)
-            if entry is None:
-                return None
-            if max_age_seconds is not None and entry.age_seconds() > max_age_seconds:
-                return None
-            return AlertCacheEntry(
-                source=entry.source,
-                items=[dict(it) for it in entry.items],
-                fetched_at=entry.fetched_at,
-                timeframe=entry.timeframe,
-                meta=dict(entry.meta),
-            )
+        if entry is None:
+            return None
+        if max_age_seconds is not None and entry.age_seconds() > max_age_seconds:
+            return None
+        return AlertCacheEntry(
+            source=entry.source,
+            items=[dict(it) for it in entry.items],
+            fetched_at=entry.fetched_at,
+            timeframe=entry.timeframe,
+            meta=dict(entry.meta),
+        )
 
     def put(
         self,
@@ -190,7 +261,7 @@ class AlertCacheStore:
         meta: Mapping[str, Any] | None = None,
         fetched_at: float | None = None,
     ) -> AlertCacheEntry:
-        """Store ``items`` in memory and atomically persist them to disk."""
+        """Store ``items`` in memory immediately and persist to disk outside the memory lock."""
         ts = time.time() if fetched_at is None else float(fetched_at)
         entry = AlertCacheEntry(
             source=source,
@@ -201,7 +272,7 @@ class AlertCacheStore:
         )
         with self._lock:
             self._entries[source] = entry
-            self._persist_entry(entry)
+        self._persist_entry(entry)
         return entry
 
     def _persist_entry(self, entry: AlertCacheEntry) -> None:
@@ -209,23 +280,9 @@ class AlertCacheStore:
         if path is None:
             return
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             serialized = json.dumps(entry.to_payload(), ensure_ascii=False, default=str)
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=f".{entry.source}.",
-                suffix=".tmp",
-                dir=str(path.parent),
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(serialized)
-                os.replace(tmp_name, path)
-            except Exception:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
+            with self._io_lock:
+                _atomic_write_text(path, serialized, prefix=f".{entry.source}.")
         except Exception as exc:
             logger.debug("Failed to persist alert cache %s: %s", entry.source, exc)
 
@@ -233,9 +290,9 @@ class AlertCacheStore:
         """Return True if ``source`` is absent or older than ``max_age_seconds``."""
         with self._lock:
             entry = self._entries.get(source)
-            if entry is None:
-                return True
-            return entry.age_seconds() >= max_age_seconds
+        if entry is None:
+            return True
+        return entry.age_seconds() >= max_age_seconds
 
     def _image_path(self, image_key: str) -> Path | None:
         if self._cache_dir is None:
@@ -250,25 +307,21 @@ class AlertCacheStore:
         payload = bytes(data)
         with self._lock:
             self._images[image_key] = payload
-            path = self._image_path(image_key)
-            if path is not None:
-                try:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    fd, tmp_name = tempfile.mkstemp(
-                        prefix=".img.", suffix=".tmp", dir=str(path.parent)
-                    )
-                    try:
-                        with os.fdopen(fd, "wb") as fh:
-                            fh.write(payload)
-                        os.replace(tmp_name, path)
-                    except Exception:
-                        try:
-                            os.unlink(tmp_name)
-                        except OSError:
-                            pass
-                        raise
-                except Exception as exc:
-                    logger.debug("Failed to persist cached image %s: %s", image_key, exc)
+            was_unavail = image_key in self._unavailable_images
+            if was_unavail:
+                self._unavailable_images.discard(image_key)
+                unavail_snapshot = sorted(self._unavailable_images)
+            else:
+                unavail_snapshot = None
+        path = self._image_path(image_key)
+        if path is not None:
+            try:
+                with self._io_lock:
+                    _atomic_write_bytes(path, payload, prefix=".img.")
+            except Exception as exc:
+                logger.debug("Failed to persist cached image %s: %s", image_key, exc)
+        if unavail_snapshot is not None:
+            self._persist_unavailable_images(unavail_snapshot)
 
     def get_image_bytes(self, image_key: str) -> bytes | None:
         """Return cached screenshot bytes from memory or disk if available."""
@@ -276,18 +329,64 @@ class AlertCacheStore:
             return None
         with self._lock:
             mem = self._images.get(image_key)
-            if mem is not None:
-                return mem
-            path = self._image_path(image_key)
-            if path is not None and path.is_file():
-                try:
-                    data = path.read_bytes()
-                    if data:
-                        self._images[image_key] = data
-                        return data
-                except OSError:
-                    pass
+        if mem is not None:
+            return mem
+        path = self._image_path(image_key)
+        if path is not None and path.is_file():
+            try:
+                data = path.read_bytes()
+                if data:
+                    with self._lock:
+                        self._images.setdefault(image_key, data)
+                    return data
+            except OSError:
+                pass
         return None
+
+    def put_prepared_image(self, image_key: str, prepared: Mapping[str, Any]) -> None:
+        """Store pre-decoded/cropped/blurred screenshot data in memory for instant UI hydration."""
+        if not image_key or not prepared:
+            return
+        entry = dict(prepared)
+        with self._lock:
+            self._prepared_images[image_key] = entry
+
+    def get_prepared_image(self, image_key: str) -> dict[str, Any] | None:
+        """Return memory-only prepared screenshot dict (O(1), never touches disk)."""
+        if not image_key:
+            return None
+        with self._lock:
+            entry = self._prepared_images.get(image_key)
+        return dict(entry) if entry is not None else None
+
+    def _persist_unavailable_images(self, keys: list[str]) -> None:
+        path = self._unavailable_images_path()
+        if path is None:
+            return
+        try:
+            serialized = json.dumps(keys, ensure_ascii=False)
+            with self._io_lock:
+                _atomic_write_text(path, serialized, prefix=".unavail_imgs.")
+        except Exception as exc:
+            logger.debug("Failed to persist unavailable images cache: %s", exc)
+
+    def mark_image_unavailable(self, image_key: str) -> None:
+        """Record an image key that returned HTTP 404 so background preload skips retrying it."""
+        if not image_key:
+            return
+        with self._lock:
+            if image_key in self._unavailable_images:
+                return
+            self._unavailable_images.add(image_key)
+            snapshot = sorted(self._unavailable_images)
+        self._persist_unavailable_images(snapshot)
+
+    def is_image_unavailable(self, image_key: str) -> bool:
+        """Return True if ``image_key`` was previously recorded as unavailable (404)."""
+        if not image_key:
+            return False
+        with self._lock:
+            return image_key in self._unavailable_images
 
     def clear(self, source: str | None = None) -> None:
         """Clear one source or all sources from memory and disk."""
@@ -295,9 +394,23 @@ class AlertCacheStore:
             targets = [source] if source is not None else list(self._entries.keys())
             for key in targets:
                 self._entries.pop(key, None)
+            clear_images = source is None or source == CACHE_SOURCE_RF_PLAYBOOK
+            if clear_images:
+                self._prepared_images.clear()
+                self._images.clear()
+                self._unavailable_images.clear()
+        with self._io_lock:
+            for key in targets:
                 path = self._entry_path(key)
                 if path is not None and path.is_file():
                     try:
                         path.unlink()
+                    except OSError:
+                        pass
+            if clear_images:
+                unavail_path = self._unavailable_images_path()
+                if unavail_path is not None and unavail_path.is_file():
+                    try:
+                        unavail_path.unlink()
                     except OSError:
                         pass

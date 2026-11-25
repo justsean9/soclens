@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from soclens.api_access import (
+    ApiAccessRegistry,
+    classify_rf_endpoint_capability,
+    credential_fingerprint,
+    is_permanent_access_denial,
+)
 from soclens.client import (
     ENTITY_ID_PREFIXES,
     V2_EXTENSION_CATALOG,
@@ -1472,6 +1479,45 @@ def compute_unified_verdict(dossier: ResearchDossier) -> dict[str, Any]:
     }
 
 
+_MODULE_CAPABILITY_MAP: dict[str, str] = {
+    "v2_intel": "v2_intel",
+    "soar": "soar_v3",
+    "links": "links",
+    "analyst_notes": "analyst_notes",
+    "threat_actors": "threat_maps",
+    "threat_map": "threat_maps",
+    "detection_rules": "detection_rules",
+    "malware_intel": "malware_intel",
+    "risk_history": "risk_history",
+    "identity": "identity",
+    "alerts": "alerts_v3",
+    "playbook_alerts": "playbook_alerts",
+    "collective_insights": "collective_insights",
+    "sandbox": "sandbox_v0",
+    "extensions": "v2_extensions",
+    "asi": "asi",
+    "riskrecon": "riskrecon",
+}
+
+
+def _client_capability_fp(client: Any, capability: str) -> str:
+    if client is None:
+        return "unconfigured"
+    if capability == "sandbox_v0":
+        tok = getattr(client, "sandbox_token", None) or getattr(client, "api_token", None)
+    elif capability == "asi":
+        tok = getattr(client, "asi_api_key", None)
+    elif capability == "pfi":
+        tok = getattr(client, "pfi_token", None) or getattr(client, "api_token", None)
+    elif capability == "riskrecon":
+        tok = getattr(client, "riskrecon_token", None)
+    else:
+        tok = getattr(client, "api_token", None)
+    if isinstance(tok, str):
+        return credential_fingerprint(tok)
+    return credential_fingerprint("default-client")
+
+
 def research_target(
     client: RecordedFutureClient | None,
     raw_query: str,
@@ -1488,6 +1534,7 @@ def research_target(
     osint_sources: Iterable[str] | None = None,
     osint_client: OSINTClient | None = None,
     workspace_dir: Path | str | None = None,
+    access_registry: ApiAccessRegistry | None = None,
 ) -> ResearchDossier:
     """Execute a unified Recorded Future + Passive OSINT threat research dossier."""
     rf_modules_requested: list[str] = []
@@ -1538,7 +1585,8 @@ def research_target(
 
     clean_val = _strip_prefix(target.canonical_name)
     ext_list = [e.strip() for e in extensions if e and e.strip()] if extensions else []
-    stop_ev = getattr(client, "_stop_event", None) if client is not None else None
+    raw_stop = getattr(client, "_stop_event", None) if client is not None else None
+    stop_ev = raw_stop if isinstance(raw_stop, threading.Event) else None
 
     # Determine whether OSINT should run
     active_osint_client: OSINTClient | None = None
@@ -1581,11 +1629,38 @@ def research_target(
 
             dom = target.extracted_domain
             if dom and target.v2_type in ("domain", "url"):
-                try:
-                    comp = client.v2_company_by_domain(dom)
-                    result_obj["company_by_domain"] = comp
-                except RecordedFutureError as comp_exc:
-                    result_obj["company_by_domain_note"] = str(comp_exc)
+                comp_fp = _client_capability_fp(client, "v2_company")
+                comp_denial = (
+                    access_registry.get_denial("v2_company", credential_fp=comp_fp)
+                    if access_registry is not None
+                    else None
+                )
+                if comp_denial is not None:
+                    result_obj["company_by_domain_note"] = (
+                        f"Skipped (no API access cached: {comp_denial.get('reason') or 'Missing Data permissions'})"
+                    )
+                else:
+                    try:
+                        comp = client.v2_company_by_domain(dom)
+                        result_obj["company_by_domain"] = comp
+                        if access_registry is not None:
+                            access_registry.record_available("v2_company", credential_fp=comp_fp)
+                    except RecordedFutureAuthError as comp_exc:
+                        if access_registry is not None and is_permanent_access_denial(
+                            comp_exc.status_code,
+                            permission_type=comp_exc.permission_type,
+                            message=str(comp_exc),
+                        ):
+                            access_registry.record_denial(
+                                "v2_company",
+                                credential_fp=comp_fp,
+                                status_code=comp_exc.status_code,
+                                reason=str(comp_exc),
+                                permission_type=comp_exc.permission_type,
+                            )
+                        result_obj["company_by_domain_note"] = str(comp_exc)
+                    except RecordedFutureError as comp_exc:
+                        result_obj["company_by_domain_note"] = str(comp_exc)
             count = 1 if data_block else 0
             return result_obj, count, pivots, f"Connect v2 {target.v2_type} lookup retrieved."
 
@@ -1895,6 +1970,25 @@ def research_target(
                     mod_key, "RiskRecon not configured (set RF_RISKRECON_TOKEN to enable)."
                 )
                 continue
+            if access_registry is not None and modules is None:
+                cap = _MODULE_CAPABILITY_MAP.get(mod_key)
+                if cap:
+                    fp = _client_capability_fp(client, cap)
+                    denial = access_registry.get_denial(cap, credential_fp=fp)
+                    if denial is not None:
+                        sections[mod_key] = ResearchSectionResult(
+                            key=mod_key,
+                            title=_SECTION_TITLES.get(mod_key, mod_key),
+                            status="not_entitled",
+                            status_code=denial.get("status_code"),
+                            permission_type=str(denial.get("permission_type") or ""),
+                            message=(
+                                "Skipped (no API access cached: "
+                                f"{denial.get('reason') or 'entitlement required'})"
+                            ),
+                            source_group="rf",
+                        )
+                        continue
             tasks.append((mod_key, handlers[mod_key]))
     elif include_rf:
         sections["v2_intel"] = ResearchSectionResult(
@@ -1929,7 +2023,26 @@ def research_target(
             key = future_map[fut]
             if stop_ev is not None and stop_ev.is_set():
                 break
-            sections[key] = fut.result()
+            res = fut.result()
+            sections[key] = res
+            if access_registry is not None:
+                cap = _MODULE_CAPABILITY_MAP.get(key)
+                if cap:
+                    fp = _client_capability_fp(client, cap)
+                    if res.status == "not_entitled" and is_permanent_access_denial(
+                        res.status_code,
+                        permission_type=res.permission_type or "",
+                        message=res.message,
+                    ):
+                        access_registry.record_denial(
+                            cap,
+                            credential_fp=fp,
+                            status_code=res.status_code,
+                            reason=res.message,
+                            permission_type=res.permission_type or "",
+                        )
+                    elif res.status == "ok":
+                        access_registry.record_available(cap, credential_fp=fp)
 
         if osint_fut is not None and not (stop_ev is not None and stop_ev.is_set()):
             try:
@@ -2022,7 +2135,11 @@ def research_target(
     return dossier
 
 
-def probe_api_capabilities(client: RecordedFutureClient) -> list[dict[str, Any]]:
+def probe_api_capabilities(
+    client: RecordedFutureClient,
+    *,
+    access_registry: ApiAccessRegistry | None = None,
+) -> list[dict[str, Any]]:
     """Safely probe read-only Recorded Future API surfaces to inspect token entitlements."""
     probes: list[tuple[str, str, Callable[[], Any]]] = [
         (
@@ -2205,6 +2322,18 @@ def probe_api_capabilities(client: RecordedFutureClient) -> list[dict[str, Any]]
                 "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
             }
 
+    def _probe_capability(endpoint: str) -> str | None:
+        ep_low = endpoint.lower()
+        if "sandbox.recordedfuture.com" in ep_low:
+            return "sandbox_v0"
+        if "api.securitytrails.com" in ep_low:
+            return "asi"
+        if "pfi.regemini.com" in ep_low:
+            return "pfi"
+        if "api.riskrecon.com" in ep_low:
+            return "riskrecon"
+        return classify_rf_endpoint_capability(endpoint)
+
     results: dict[int, dict[str, Any]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futs = [
@@ -2214,6 +2343,22 @@ def probe_api_capabilities(client: RecordedFutureClient) -> list[dict[str, Any]]
         for fut in concurrent.futures.as_completed(futs):
             idx, rec = fut.result()
             results[idx] = rec
+            if access_registry is not None:
+                cap = _probe_capability(str(rec.get("endpoint") or ""))
+                if cap:
+                    fp = _client_capability_fp(client, cap)
+                    if rec.get("status") == "available":
+                        access_registry.record_available(cap, credential_fp=fp)
+                    elif rec.get("status") == "not_entitled" and is_permanent_access_denial(
+                        rec.get("status_code"),
+                        message=str(rec.get("detail") or ""),
+                    ):
+                        access_registry.record_denial(
+                            cap,
+                            credential_fp=fp,
+                            status_code=rec.get("status_code"),
+                            reason=str(rec.get("detail") or ""),
+                        )
     return [results[i] for i in range(len(probes))]
 
 

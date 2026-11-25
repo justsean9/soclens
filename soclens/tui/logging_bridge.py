@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
 import warnings
@@ -17,18 +18,25 @@ MAX_LOG_ENTRIES = 5000
 
 LOG_SOURCE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("All Sources", "all"),
-    ("Brand Sync", "brand_sync"),
-    ("Research", "research"),
+    ("Cache / Preload", "cache"),
+    ("API Access", "api_access"),
     ("RF API", "api"),
+    ("Splunk & ES", "splunk"),
+    ("SentinelOne", "sentinelone"),
+    ("Research", "research"),
+    ("Brand Sync", "brand_sync"),
     ("Watchlists", "watchlists"),
     ("Sigma", "sigma"),
-    ("Splunk & Bundle", "splunk"),
+    ("Local LLM", "llm"),
+    ("Secrets & Settings", "secrets"),
     ("App / TUI", "tui"),
     ("System / Stdio", "system"),
 )
 
 LOG_LEVEL_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Level: ALL", "ALL"),
+    ("Level: DEBUG+", "DEBUG"),
+    ("Level: DEBUG Only", "DEBUG_ONLY"),
     ("Level: INFO+", "INFO"),
     ("Level: WARN+", "WARNING"),
     ("Level: ERROR", "ERROR"),
@@ -37,10 +45,24 @@ LOG_LEVEL_OPTIONS: tuple[tuple[str, str], ...] = (
 LOG_LEVEL_RANK: dict[str, int] = {
     "ALL": 0,
     "DEBUG": 10,
+    "DEBUG_ONLY": 10,
     "INFO": 20,
     "WARNING": 30,
     "ERROR": 40,
 }
+
+_SECRET_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)(X-RFToken|Authorization|ApiToken|apikey)\s*[:=]\s*([^\s,;'\"]+)"), r"\1: <REDACTED>"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer <REDACTED>"),
+    (re.compile(r"(?i)\b(password|passwd|api_token|api_key|secret)\s*=\s*([^\s,;'\"]+)"), r"\1=<REDACTED>"),
+)
+
+
+def _redact_log_text(text: str) -> str:
+    out = text
+    for pat, repl in _SECRET_REDACT_PATTERNS:
+        out = pat.sub(repl, out)
+    return out
 
 _BRAND_SYNC_MESSAGE_CUES: tuple[str, ...] = (
     "processing ",
@@ -98,6 +120,8 @@ def source_matches_filter(entry_source: str, filter_source: str) -> bool:
         return True
     if filter_source == "tui":
         return entry_source in {"tui", "dashboard", "rf_intel"}
+    if filter_source == "secrets":
+        return entry_source in {"secrets", "settings"}
     return entry_source == filter_source
 
 
@@ -111,6 +135,24 @@ def classify_log_source(
 ) -> str:
     """Classify a logger name or print line into a canonical TUI log source."""
     lname = logger_name.strip().lower()
+    if (
+        lname.startswith("soclens.alert_cache")
+        or "alertpreloader" in lname
+        or "alert_cache" in lname
+    ):
+        return "cache"
+    if lname.startswith("soclens.api_access") or "apiaccess" in lname or "api_access" in lname:
+        return "api_access"
+    if lname.startswith("soclens.sentinelone") or "sentinelone" in lname:
+        return "sentinelone"
+    if (
+        lname.startswith("soclens.secret_stores")
+        or lname.startswith("soclens.settings")
+        or lname in {"secrets", "settings"}
+    ):
+        return "secrets"
+    if lname.startswith("soclens.llm") or "localllm" in lname:
+        return "llm"
     if (
         lname.startswith("soclens.logos")
         or "brand_sync" in lname
@@ -178,10 +220,52 @@ class AppLogStore:
     def __init__(self, maxlen: int = MAX_LOG_ENTRIES) -> None:
         self._entries: deque[LogEntry] = deque(maxlen=maxlen)
         self._lock = threading.RLock()
+        self._file_lock = threading.Lock()
+        self._file_sink_path: Path | None = None
+        self._file_sink_max_bytes: int = 2_000_000
         self._on_entry: Callable[[LogEntry], None] | None = None
         self._total_count = 0
         self._warning_count = 0
         self._error_count = 0
+
+    def set_file_sink(self, path: Path | str | None, *, max_bytes: int = 2_000_000) -> None:
+        """Configure a rotating persistent debug log file sink (with secret redaction)."""
+        with self._file_lock:
+            self._file_sink_path = Path(path) if path is not None else None
+            self._file_sink_max_bytes = max(10_000, int(max_bytes))
+
+    def _write_file_sink(self, entry: LogEntry) -> None:
+        with self._file_lock:
+            path = self._file_sink_path
+            max_bytes = self._file_sink_max_bytes
+            if path is None:
+                return
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_file() and path.stat().st_size >= max_bytes:
+                    backup = path.with_name(f"{path.name}.1")
+                    try:
+                        if backup.is_file():
+                            backup.unlink()
+                    except OSError:
+                        pass
+                    path.replace(backup)
+                ts_utc = (
+                    entry.created_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if entry.created_utc is not None
+                    else entry.timestamp
+                )
+                safe_msg = _redact_log_text(entry.message)
+                tag = (
+                    f"{entry.source}|{entry.logger_name}"
+                    if entry.logger_name and entry.logger_name != entry.source
+                    else entry.source
+                )
+                line = f"{ts_utc} [{entry.level}] [{tag}] {safe_msg}\n"
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            except OSError:
+                pass
 
     def set_on_entry(self, callback: Callable[[LogEntry], None] | None) -> None:
         """Register or clear the callback invoked whenever a new entry is appended."""
@@ -209,6 +293,7 @@ class AppLogStore:
                 self._error_count += 1
             cb = self._on_entry
 
+        self._write_file_sink(normalized)
         if cb is not None:
             try:
                 cb(normalized)
@@ -384,8 +469,8 @@ class TuiLoggingBridge:
             self._suspended_handlers = suspended
 
             self._saved_rf_level = rf_logger.level
-            if rf_logger.level == logging.NOTSET or rf_logger.level > logging.INFO:
-                rf_logger.setLevel(logging.INFO)
+            if rf_logger.level == logging.NOTSET or rf_logger.level > logging.DEBUG:
+                rf_logger.setLevel(logging.DEBUG)
 
             self._rf_handler = TuiLogHandler(
                 self._store,

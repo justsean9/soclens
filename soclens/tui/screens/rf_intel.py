@@ -54,20 +54,19 @@ from soclens.tui.filters import (
     timestamp_matches_timeframe,
 )
 from soclens.tui.image_render import (
-    auto_crop_margins,
     blur_decoded_image,
     blur_image_bytes,
     build_kitty_upload_sequence,
     can_emit_kitty_truecolor,
     clear_kitty_images,
     compute_terminal_cell_grid,
-    decode_image,
     detect_terminal_graphics_protocol,
     encode_png,
     get_terminal_cell_aspect,
     is_tmux_session,
     next_kitty_image_id,
     open_image_in_native_viewer,
+    prepare_image_cache_entry,
     stage_screenshot_file,
     write_terminal_graphics,
 )
@@ -397,6 +396,7 @@ class RFIntelPane(BaseSocPane):
         self._last_detail_width: int = 0
         self._last_error_payload: tuple[str, str] | None = None
         self._inline_kitty_ids: list[int] = []
+        self._preparing_image_keys: set[tuple[str, str, str]] = set()
 
     def _safe_load_presets(self) -> list[FilterPreset]:
         try:
@@ -652,16 +652,19 @@ class RFIntelPane(BaseSocPane):
         self._cache_fetched_at: float = 0.0
         self._pb_cache_fetched_at: float = 0.0
         self._refresh_preset_options(select_id=self._active_preset_id)
-        self._render_view()
+        hydrated = self.hydrate_from_alert_cache(force=False)
+        if not hydrated and self._active_mode == "welcome":
+            self._render_view()
         self._update_responsive_layout()
-        self.call_after_refresh(self.hydrate_from_alert_cache)
 
     def _hydrate_playbook_cache(self, cache: Any, *, force: bool = False) -> bool:
         pb_entry = cache.get(CACHE_SOURCE_RF_PLAYBOOK)
         if pb_entry is None:
             return False
-        if not force and self._datasets.get("playbook") and (
-            pb_entry.fetched_at <= getattr(self, "_pb_cache_fetched_at", 0.0)
+        if (
+            not force
+            and getattr(self, "_pb_cache_fetched_at", 0.0) > 0.0
+            and pb_entry.fetched_at <= getattr(self, "_pb_cache_fetched_at", 0.0)
         ):
             return False
         self._datasets["playbook"] = list(pb_entry.items)
@@ -676,8 +679,11 @@ class RFIntelPane(BaseSocPane):
                     key = ("playbook", str(aid))
                     self._detail_cache[key] = detail
                     self._auto_enriched_keys.add(key)
+        # Only pull already-prepared (memory) images here — never decode/crop/read disk on the UI thread.
         pb_img_keys = pb_entry.meta.get("image_keys")
-        if isinstance(pb_img_keys, dict):
+        get_prepared = getattr(cache, "get_prepared_image", None)
+        prep_hits = 0
+        if isinstance(pb_img_keys, dict) and callable(get_prepared):
             for aid, entries in pb_img_keys.items():
                 if not isinstance(entries, list):
                     continue
@@ -686,34 +692,28 @@ class RFIntelPane(BaseSocPane):
                         continue
                     eff_cat, sid, img_key = str(rec[0]), str(rec[1]), str(rec[2])
                     cache_tuple = (eff_cat, str(aid), sid)
-                    if cache_tuple in self._image_cache and not self._image_cache[cache_tuple].get("error"):
+                    existing_img = self._image_cache.get(cache_tuple)
+                    if existing_img and existing_img.get("decoded") is not None and not existing_img.get("error"):
                         continue
-                    raw_bytes = cache.get_image_bytes(img_key)
-                    if raw_bytes:
-                        try:
-                            decoded = decode_image(raw_bytes)
-                            cropped_img, crop_box = auto_crop_margins(decoded)
-                            cropped_png = (
-                                encode_png(cropped_img) if crop_box is not None else raw_bytes
-                            )
-                            self._image_cache[cache_tuple] = {
-                                "bytes": raw_bytes,
-                                "decoded": decoded,
-                                "crop_checked": True,
-                                "crop_box": crop_box,
-                                "cropped_decoded": cropped_img,
-                                "cropped_png": cropped_png,
-                            }
-                        except Exception:
-                            pass
+                    prepared = get_prepared(img_key)
+                    if isinstance(prepared, dict) and prepared.get("decoded") is not None:
+                        self._image_cache[cache_tuple] = prepared
+                        prep_hits += 1
         self._pb_cache_fetched_at = pb_entry.fetched_at
+        self.record_app_log(
+            f"Hydrated Playbook cache ({len(pb_entry.items)} item(s), {prep_hits} prepared image(s)).",
+            level="DEBUG",
+            source="cache",
+        )
         if self._active_mode == "playbook":
+            sel = self._get_selected_item()
+            preserve = str(sel.get("id") or "") if sel is not None else None
             self._refresh_assignee_options()
-            self._render_view(schedule_auto_enrich=False)
+            self._render_view(preserve_id=preserve, schedule_auto_enrich=False)
         return True
 
     def hydrate_from_alert_cache(self, *, force: bool = False) -> bool:
-        """Populate RF Alerts v3 and Playbook Alerts (with images) from the local 24h cache."""
+        """Populate RF Alerts v3 and Playbook Alerts (with prepared images) from the local 24h cache."""
         if not self._tables_ready:
             return False
         cache = getattr(self.app, "alert_cache", None)
@@ -722,22 +722,41 @@ class RFIntelPane(BaseSocPane):
         pb_hydrated = self._hydrate_playbook_cache(cache, force=force)
         entry = cache.get(CACHE_SOURCE_RF)
         if entry is None:
+            loading_fn = getattr(self.app, "is_cache_source_loading", None)
+            if (
+                self._active_mode == "welcome"
+                and callable(loading_fn)
+                and loading_fn(CACHE_SOURCE_RF)
+            ):
+                self.set_status(
+                    "Background preload in progress for RF Alerts (24h)... Data will populate automatically."
+                )
             return pb_hydrated
+
+        manual_alerts_loaded = bool(self._datasets.get("alerts_v3")) and not getattr(
+            self, "_hydrated_from_cache", False
+        )
+        if not force and manual_alerts_loaded and self._active_mode == "alerts_v3":
+            return pb_hydrated
+
         already_same_cache = (
-            bool(self._datasets.get("alerts_v3"))
-            and self._active_mode == "alerts_v3"
-            and (
-                not getattr(self, "_hydrated_from_cache", False)
-                or entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
-            )
+            getattr(self, "_hydrated_from_cache", False)
+            and getattr(self, "_cache_fetched_at", 0.0) > 0.0
+            and entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
         )
         if not force and already_same_cache:
-            return False
-        if self._active_mode not in ("welcome", "alerts_v3") and not force:
-            return False
+            if self._active_mode == "welcome":
+                self._active_mode = "alerts_v3"
+                self._refresh_assignee_options()
+                self._render_view(schedule_auto_enrich=False)
+                return True
+            return pb_hydrated
+
         self._datasets["alerts_v3"] = list(entry.items)
         raw_total = entry.meta.get("total")
-        self._dataset_totals["alerts_v3"] = raw_total if isinstance(raw_total, int) else len(entry.items)
+        self._dataset_totals["alerts_v3"] = (
+            raw_total if isinstance(raw_total, int) else len(entry.items)
+        )
         cached_details = entry.meta.get("details")
         if isinstance(cached_details, dict):
             for aid, detail in cached_details.items():
@@ -745,17 +764,28 @@ class RFIntelPane(BaseSocPane):
                     key = ("alerts_v3", str(aid))
                     self._detail_cache[key] = detail
                     self._auto_enriched_keys.add(key)
-        self._active_mode = "alerts_v3"
         self._hydrated_from_cache = True
         self._cache_fetched_at = entry.fetched_at
-        self._refresh_assignee_options()
-        self._render_view(schedule_auto_enrich=False)
+
         detail_count = len(cached_details) if isinstance(cached_details, dict) else 0
-        detail_note = f", {detail_count} detail(s) preloaded" if detail_count else ""
-        self.set_status(
-            f"Loaded {len(entry.items)} cached RF alert(s) "
-            f"(Last 24h{detail_note}, updated {entry.age_label()})."
+        self.record_app_log(
+            f"Hydrated RF Alerts cache ({len(entry.items)} item(s), {detail_count} detail(s)).",
+            level="DEBUG",
+            source="cache",
         )
+
+        if self._active_mode == "welcome" or force:
+            self._active_mode = "alerts_v3"
+        if self._active_mode == "alerts_v3":
+            sel = self._get_selected_item()
+            preserve = str(sel.get("id") or "") if sel is not None else None
+            self._refresh_assignee_options()
+            self._render_view(preserve_id=preserve, schedule_auto_enrich=False)
+            detail_note = f", {detail_count} detail(s) preloaded" if detail_count else ""
+            self.set_status(
+                f"Loaded {len(entry.items)} cached RF alert(s) "
+                f"(Last 24h{detail_note}, updated {entry.age_label()})."
+            )
         return True
 
     def on_unmount(self) -> None:
@@ -1207,7 +1237,8 @@ class RFIntelPane(BaseSocPane):
             return
         self._syncing_view_select = True
         try:
-            sel.value = self._active_mode
+            with sel.prevent(Select.Changed):
+                sel.value = self._active_mode
         finally:
             self._syncing_view_select = False
 
@@ -1553,6 +1584,66 @@ class RFIntelPane(BaseSocPane):
         log_widget.write(renderable, width=width, expand=True, scroll_end=False)
         log_widget.scroll_home(animate=False)
 
+    def _schedule_cached_image_prep(
+        self, category: str, alert_id: str, screenshot_ids: list[str]
+    ) -> None:
+        to_prep: list[str] = []
+        for sid in screenshot_ids:
+            key = (category, alert_id, sid)
+            if key not in self._preparing_image_keys:
+                self._preparing_image_keys.add(key)
+                to_prep.append(sid)
+        if to_prep:
+            self._prepare_cached_images_worker(category, alert_id, to_prep)
+
+    @work(thread=True, exit_on_error=False)
+    def _prepare_cached_images_worker(
+        self, category: str, alert_id: str, screenshot_ids: list[str]
+    ) -> None:
+        cache = getattr(self.app, "alert_cache", None)
+        results: dict[str, dict[str, Any] | None] = {}
+        try:
+            for sid in screenshot_ids:
+                if self.is_app_shutting_down():
+                    return
+                img_key = f"{category}__{alert_id}__{sid}"
+                prepared = (
+                    cache.get_prepared_image(img_key)
+                    if cache is not None and hasattr(cache, "get_prepared_image")
+                    else None
+                )
+                if prepared is None and cache is not None:
+                    raw_bytes = cache.get_image_bytes(img_key)
+                    if raw_bytes:
+                        try:
+                            prepared = prepare_image_cache_entry(raw_bytes)
+                            if hasattr(cache, "put_prepared_image"):
+                                cache.put_prepared_image(img_key, prepared)
+                        except Exception as exc:
+                            prepared = {"error": self.format_exception(exc)}
+                results[sid] = prepared
+        finally:
+            def _apply() -> None:
+                for sid in screenshot_ids:
+                    self._preparing_image_keys.discard((category, alert_id, sid))
+                if self.is_app_shutting_down():
+                    return
+                updated = False
+                for sid, prepared in results.items():
+                    img_tuple = (category, alert_id, sid)
+                    if prepared is not None:
+                        self._image_cache[img_tuple] = prepared
+                        updated = True
+                    elif self._image_cache.get(img_tuple, {}).get("loading"):
+                        self._image_cache.pop(img_tuple, None)
+                        updated = True
+                if updated and self._active_mode == "playbook":
+                    sel = self._get_selected_item()
+                    if sel is not None and str(sel.get("id") or "") == alert_id:
+                        self._render_detail_panel()
+
+            self.run_on_ui(_apply)
+
     def _prepare_inline_screenshots(
         self, category: str, alert_id: str, sc_ids: list[Any], avail_width: int
     ) -> dict[str, dict[str, Any]]:
@@ -1570,38 +1661,60 @@ class RFIntelPane(BaseSocPane):
         cell_aspect = get_terminal_cell_aspect() if use_kitty else 0.5
         max_cols = max(4, min(255, avail_width - 6))
 
+        cache = getattr(self.app, "alert_cache", None)
+        get_prepared = getattr(cache, "get_prepared_image", None)
+        loading_fn = getattr(self.app, "is_cache_source_loading", None)
+        pb_loading = callable(loading_fn) and bool(loading_fn(CACHE_SOURCE_RF_PLAYBOOK))
+        pb_has_key_set: set[str] = set()
+        if cache is not None:
+            pb_entry = cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+            if pb_entry is not None and isinstance(pb_entry.meta.get("image_keys"), dict):
+                for rec in pb_entry.meta["image_keys"].get(alert_id) or []:
+                    if isinstance(rec, (list, tuple)) and len(rec) == 3:
+                        pb_has_key_set.add(str(rec[1]))
+
+        missing_for_bg: list[str] = []
         for sc_id in sc_ids[:4]:
             sid = str(sc_id)
-            entry = self._image_cache.get((category, alert_id, sid))
+            img_tuple = (category, alert_id, sid)
+            entry = self._image_cache.get(img_tuple)
+            if entry is None and callable(get_prepared):
+                prepared = get_prepared(f"{category}__{alert_id}__{sid}")
+                if isinstance(prepared, dict):
+                    self._image_cache[img_tuple] = prepared
+                    entry = prepared
             if entry is None:
+                if sid in pb_has_key_set or pb_loading:
+                    sc_map[sid] = {"loading": True}
+                    if sid in pb_has_key_set:
+                        missing_for_bg.append(sid)
                 continue
+
             view_entry = dict(entry)
             view_entry["blurred"] = blurred
             view_entry["pre_blurred"] = False
             decoded = entry.get("decoded")
-            if decoded is not None and not entry.get("crop_checked"):
-                cropped_img, crop_box = auto_crop_margins(decoded)
-                entry["crop_checked"] = True
-                entry["crop_box"] = crop_box
-                entry["cropped_decoded"] = cropped_img
-                view_entry["crop_checked"] = True
-                view_entry["crop_box"] = crop_box
+            if decoded is not None:
+                if blurred and entry.get("blurred_decoded") is not None:
+                    view_entry["decoded"] = entry["blurred_decoded"]
+                    view_entry["pre_blurred"] = True
+                elif not blurred and entry.get("cropped_decoded") is not None:
+                    view_entry["decoded"] = entry["cropped_decoded"]
+
             if decoded is not None and use_kitty:
                 base_img = entry.get("cropped_decoded") or decoded
-                crop_box = entry.get("crop_box")
                 if blurred:
-                    disp_img = entry.get("blurred_decoded")
-                    if disp_img is None:
-                        disp_img = blur_decoded_image(base_img)
-                        entry["blurred_decoded"] = disp_img
                     png_bytes = entry.get("blurred_png")
                     if png_bytes is None:
+                        disp_img = entry.get("blurred_decoded") or blur_decoded_image(base_img)
+                        entry["blurred_decoded"] = disp_img
                         png_bytes = encode_png(disp_img)
                         entry["blurred_png"] = png_bytes
                 else:
                     png_bytes = entry.get("cropped_png")
                     if png_bytes is None:
                         raw_b = entry.get("bytes")
+                        crop_box = entry.get("crop_box")
                         if (
                             crop_box is None
                             and isinstance(raw_b, (bytes, bytearray))
@@ -1633,6 +1746,9 @@ class RFIntelPane(BaseSocPane):
                     self._inline_kitty_ids.append(kid)
                     view_entry["kitty_placeholder"] = (kid, cols, rows)
             sc_map[sid] = view_entry
+
+        if missing_for_bg:
+            self._schedule_cached_image_prep(category, alert_id, missing_for_bg)
         return sc_map
 
     def _render_detail_panel(self) -> None:
@@ -2094,6 +2210,8 @@ class RFIntelPane(BaseSocPane):
     @on(Select.Changed, "#rf-view-select")
     def handle_view_select_changed(self, event: Select.Changed) -> None:
         if self._syncing_view_select:
+            return
+        if str(event.value) != str(event.select.value):
             return
         new_mode = str(event.value or "welcome")
         if new_mode == self._active_mode:
@@ -2841,20 +2959,12 @@ class RFIntelPane(BaseSocPane):
                     payload_bytes = bytes(raw_bytes)
                     cache_entry: dict[str, Any] = {"bytes": payload_bytes}
                     try:
-                        decoded = decode_image(payload_bytes)
-                        cropped_img, crop_box = auto_crop_margins(decoded)
-                        cropped_png = (
-                            encode_png(cropped_img) if crop_box is not None else payload_bytes
-                        )
-                        cache_entry.update(
-                            {
-                                "decoded": decoded,
-                                "crop_checked": True,
-                                "crop_box": crop_box,
-                                "cropped_decoded": cropped_img,
-                                "cropped_png": cropped_png,
-                            }
-                        )
+                        payload_bytes = bytes(raw_bytes)
+                        prepared = prepare_image_cache_entry(payload_bytes)
+                        cache_entry.update(prepared)
+                        cache = getattr(self.app, "alert_cache", None)
+                        if cache is not None and hasattr(cache, "put_prepared_image"):
+                            cache.put_prepared_image(f"{category}__{alert_id}__{image_id}", prepared)
                     except Exception:
                         pass
 
@@ -3252,6 +3362,12 @@ class RFIntelPane(BaseSocPane):
         mode = expected_mode or self._active_mode
         if mode != self._active_mode or mode not in ("alerts_v3", "playbook", "cases"):
             return [], 0
+        loading_fn = getattr(self.app, "is_cache_source_loading", None)
+        if callable(loading_fn):
+            if mode == "alerts_v3" and getattr(self, "_hydrated_from_cache", False) and loading_fn(CACHE_SOURCE_RF):
+                return [], 0
+            if mode == "playbook" and getattr(self, "_pb_cache_fetched_at", 0.0) > 0.0 and loading_fn(CACHE_SOURCE_RF_PLAYBOOK):
+                return [], 0
         on_screen = self._get_on_screen_items(max_items=20)
         targets: list[dict[str, Any]] = []
         for item in on_screen:
@@ -3364,21 +3480,10 @@ class RFIntelPane(BaseSocPane):
                                         if cache is not None:
                                             cache.put_image_bytes(img_key, raw_bytes)
                                 if raw_bytes:
-                                    decoded = decode_image(raw_bytes)
-                                    cropped_img, crop_box = auto_crop_margins(decoded)
-                                    cropped_png = (
-                                        encode_png(cropped_img)
-                                        if crop_box is not None
-                                        else raw_bytes
-                                    )
-                                    self._image_cache[img_tuple] = {
-                                        "bytes": raw_bytes,
-                                        "decoded": decoded,
-                                        "crop_checked": True,
-                                        "crop_box": crop_box,
-                                        "cropped_decoded": cropped_img,
-                                        "cropped_png": cropped_png,
-                                    }
+                                    prepared = prepare_image_cache_entry(bytes(raw_bytes))
+                                    self._image_cache[img_tuple] = prepared
+                                    if cache is not None and hasattr(cache, "put_prepared_image"):
+                                        cache.put_prepared_image(img_key, prepared)
                             except Exception as img_exc:
                                 self._image_cache[img_tuple] = {
                                     "error": self.format_exception(img_exc)
@@ -3636,11 +3741,17 @@ class RFIntelPane(BaseSocPane):
             ):
                 cache = getattr(self.app, "alert_cache", None)
                 if cache is not None:
+                    existing_entry = cache.get(CACHE_SOURCE_RF)
+                    existing_details = (
+                        existing_entry.meta.get("details")
+                        if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict)
+                        else {}
+                    )
                     cache.put(
                         CACHE_SOURCE_RF,
                         normalized,
                         timeframe="last_24h",
-                        meta={"total": total},
+                        meta={"total": total, "details": existing_details},
                     )
 
             def _apply() -> tuple[list[dict[str, Any]], int] | None:
@@ -3905,21 +4016,14 @@ class RFIntelPane(BaseSocPane):
                         }
                     else:
                         payload_bytes = bytes(raw_bytes)
-                        decoded = decode_image(payload_bytes)
-                        cropped_img, crop_box = auto_crop_margins(decoded)
-                        cropped_png = (
-                            encode_png(cropped_img)
-                            if crop_box is not None
-                            else payload_bytes
-                        )
-                        self._image_cache[(effective_cat, alert_id, sid)] = {
-                            "bytes": payload_bytes,
-                            "decoded": decoded,
-                            "crop_checked": True,
-                            "crop_box": crop_box,
-                            "cropped_decoded": cropped_img,
-                            "cropped_png": cropped_png,
-                        }
+                        prepared = prepare_image_cache_entry(payload_bytes)
+                        self._image_cache[(effective_cat, alert_id, sid)] = prepared
+                        cache = getattr(self.app, "alert_cache", None)
+                        if cache is not None:
+                            img_key = f"{effective_cat}__{alert_id}__{sid}"
+                            cache.put_image_bytes(img_key, payload_bytes)
+                            if hasattr(cache, "put_prepared_image"):
+                                cache.put_prepared_image(img_key, prepared)
                         loaded_count += 1
                 except Exception as img_exc:
                     self._image_cache[(effective_cat, alert_id, sid)] = {
