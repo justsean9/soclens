@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
@@ -1469,8 +1470,12 @@ class SentinelOnePane(BaseSocPane):
 
     def accept_pivot(self, payload: PivotPayload) -> None:
         """Accept an incoming cross-workbench ``PivotPayload`` and run a scoped read-only query."""
-        sha1 = str(payload.sha1 or "").strip()
-        sha256 = str(payload.sha256 or "").strip()
+        def _clean_pivot_val(val: Any) -> str:
+            s = str(val or "").strip()
+            return "" if s == "-" else s
+
+        sha1 = _clean_pivot_val(payload.sha1)
+        sha256 = _clean_pivot_val(payload.sha256)
         target_view = (
             "threats"
             if (sha1 or sha256 or payload.s1_threat)
@@ -1483,22 +1488,38 @@ class SentinelOnePane(BaseSocPane):
         self._tier_filter = tier_map.get(raw_tier, "ALL")
         self._sync_tier_pills()
 
-        clean_site_id = str(payload.site_id or "").strip()
+        clean_site_id = _clean_pivot_val(payload.site_id)
         if clean_site_id:
             self._selected_site_ids = {clean_site_id}
         else:
             self._selected_site_ids = set()
         self._refresh_site_multiselect()
 
+        hostname_val = _clean_pivot_val(payload.hostname)
+        host_entity = ""
+        raw_entity = _clean_pivot_val(payload.entity)
+        raw_entity_type = str(payload.entity_type or "").strip().lower()
+        if (
+            not hostname_val
+            and raw_entity
+            and raw_entity_type in {"system", "host", "hostname", "endpoint", "machine", "asset"}
+            and "@" not in raw_entity
+        ):
+            try:
+                ipaddress.ip_address(raw_entity)
+            except ValueError:
+                host_entity = raw_entity
+
         search_term = (
             sha1
             or sha256
-            or str(payload.hostname or "").strip()
-            or str(payload.src_ip or "").strip()
-            or str(payload.dest_ip or "").strip()
-            or str(payload.username or "").strip()
-            or str(payload.entity or "").strip()
-            or str(payload.tenant_id or "").strip()
+            or hostname_val
+            or host_entity
+            or _clean_pivot_val(payload.src_ip)
+            or _clean_pivot_val(payload.dest_ip)
+            or _clean_pivot_val(payload.username)
+            or raw_entity
+            or _clean_pivot_val(payload.tenant_id)
             or ""
         ).strip()
         try:
@@ -2259,7 +2280,8 @@ class SentinelOnePane(BaseSocPane):
                 return
             if self._block_if_dry_run("Add Blocklist SHA-1", result.get("value", "")):
                 return
-            self._add_blocklist_worker(result)
+            site_ids = sorted(self._selected_site_ids) if self._selected_site_ids else None
+            self._add_blocklist_worker(result, site_ids=site_ids)
 
         self.app.push_screen(
             S1AddBlocklistModal(dry_run=self.effective_dry_run),
@@ -2913,15 +2935,32 @@ class SentinelOnePane(BaseSocPane):
             self._report_s1_error("SentinelOne Clone Exclusions", exc)
 
     @work(thread=True, exit_on_error=False)
-    def _add_blocklist_worker(self, payload: dict[str, str]) -> None:
+    def _add_blocklist_worker(
+        self,
+        payload: dict[str, str],
+        site_ids: list[str] | None = None,
+    ) -> None:
         try:
             with self.log_scope("sentinelone"):
                 client = self._get_s1_client()
-                client.add_to_blocklist(
-                    payload["value"],
-                    os_type=payload.get("os_type", "windows"),
-                    description=payload.get("description", ""),
+                resolved_site_ids = (
+                    list(site_ids)
+                    if site_ids is not None
+                    else (sorted(self._selected_site_ids) if self._selected_site_ids else None)
                 )
+                if resolved_site_ids is not None:
+                    client.add_to_blocklist(
+                        payload["value"],
+                        os_type=payload.get("os_type", "windows"),
+                        description=payload.get("description", ""),
+                        site_ids=resolved_site_ids,
+                    )
+                else:
+                    client.add_to_blocklist(
+                        payload["value"],
+                        os_type=payload.get("os_type", "windows"),
+                        description=payload.get("description", ""),
+                    )
             msg = f"Added SHA-1 {payload['value']} to SentinelOne blocklist."
             self.set_status(msg)
             self.append_log(msg)

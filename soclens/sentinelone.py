@@ -440,12 +440,20 @@ def _sanitize_scope_roles(
         role_templates.append(item)
 
     if target_ids and clean_scope in {"site", "account"}:
-        seen_pairs: set[tuple[str, str]] = set()
+        existing_by_id: dict[str, list[dict[str, Any]]] = {}
         for template in role_templates:
-            role_marker = str(
-                template.get("roleId") or template.get("roleName") or template.get("roles") or ""
-            )
-            for target_id in target_ids:
+            tid = str(template.get("id") or "").strip()
+            if tid:
+                existing_by_id.setdefault(tid, []).append(template)
+
+        seen_pairs: set[tuple[str, str]] = set()
+        for target_id in target_ids:
+            matched_templates = existing_by_id.get(target_id)
+            templates_for_target = matched_templates if matched_templates else role_templates
+            for template in templates_for_target:
+                role_marker = str(
+                    template.get("roleId") or template.get("roleName") or template.get("roles") or ""
+                )
                 pair = (target_id, role_marker)
                 if pair in seen_pairs:
                     continue
@@ -780,8 +788,14 @@ class SentinelOneClient:
     ) -> dict[str, Any]:
         """Build default account/site/group query parameters from explicit args or config."""
         params: dict[str, Any] = {}
-        acc = _csv_param(account_ids) or self.account_id
-        site = _csv_param(site_ids) or self.site_id
+        if account_ids is None and site_ids is None and group_ids is None:
+            if self.account_id:
+                params["accountIds"] = self.account_id
+            if self.site_id:
+                params["siteIds"] = self.site_id
+            return params
+        acc = _csv_param(account_ids)
+        site = _csv_param(site_ids)
         grp = _csv_param(group_ids)
         if acc:
             params["accountIds"] = acc
@@ -847,7 +861,7 @@ class SentinelOneClient:
     ) -> list[dict[str, Any]]:
         """List SentinelOne sites (handles both list and ``data.sites`` response shapes)."""
         params: dict[str, Any] = {}
-        acc = _csv_param(account_ids) or self.account_id
+        acc = _csv_param(account_ids) if account_ids is not None else self.account_id
         if acc:
             params["accountIds"] = acc
         if query and query.strip():

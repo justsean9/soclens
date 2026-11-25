@@ -144,6 +144,8 @@ class ConfirmDeleteSiteModal(ModalScreen[bool]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-del-site-cancel-btn", Button).focus()
 
     @on(Button.Pressed, "#s1-del-site-cancel-btn")
@@ -333,6 +335,8 @@ class CloneExclusionsModal(ModalScreen[dict[str, Any] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-clone-preview-btn", Button).focus()
 
     def _site_name_for_id(self, site_id: str) -> str:
@@ -679,6 +683,8 @@ class S1SiteModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Save Site", id="s1-site-save-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-site-name-input", Input).focus()
 
     @on(Select.Changed, "#s1-site-prefix-select")
@@ -878,6 +884,8 @@ class S1SitePolicyModal(ModalScreen[dict[str, Any] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         log = self.query_one("#s1-policy-log", RichLog)
         log.write(Text(json.dumps(self._policy, indent=2, default=str)))
         self.query_one("#s1-policy-cancel-btn", Button).focus()
@@ -1018,7 +1026,12 @@ class S1UserModal(ModalScreen[dict[str, Any] | None]):
         if init_scope not in {"site", "account", "tenant"}:
             init_scope = "site"
 
-        role_options: list[tuple[str, str]] = [("(From Template / Default)", "")]
+        role_default_label = (
+            "(Preserve Existing Multi-Site Roles)"
+            if self._mode == "edit" and len(self._existing_scope_roles) > 1
+            else "(From Template / Default)"
+        )
+        role_options: list[tuple[str, str]] = [(role_default_label, "")]
         for role in self._roles:
             rid = str(role.get("id") or "").strip()
             rname = str(role.get("name") or rid).strip()
@@ -1031,7 +1044,12 @@ class S1UserModal(ModalScreen[dict[str, Any] | None]):
             ulabel = str(u.get("email") or u.get("fullName") or u.get("name") or uid).strip()
             template_options.append((f"{ulabel} ({uid})", uid))
 
-        site_options: list[tuple[str, str]] = [("(Current / Account Scope)", "")]
+        site_default_label = (
+            "(Preserve Existing Sites / Scope Default)"
+            if self._mode == "edit" and len(self._existing_scope_roles) > 1
+            else "(Current / Account Scope)"
+        )
+        site_options: list[tuple[str, str]] = [(site_default_label, "")]
         for s in self._sites:
             site_options.append((_site_option_label(s), str(s.get("id") or "").strip()))
         self._site_options = site_options
@@ -1127,8 +1145,10 @@ class S1UserModal(ModalScreen[dict[str, Any] | None]):
                 yield Button("Save User", id="s1-user-save-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         if self._mode == "edit":
-            if self._init_role_id:
+            if self._init_role_id and len(self._existing_scope_roles) <= 1:
                 role_sel = self.query_one("#s1-user-role-select", Select)
                 known_roles = {val for _lbl, val in self._role_options}
                 with role_sel.prevent(Select.Changed):
@@ -1193,7 +1213,7 @@ class S1UserModal(ModalScreen[dict[str, Any] | None]):
                     target_site_ids.append(sid)
         elif selected_site_id:
             target_site_ids.append(selected_site_id)
-        elif self._mode == "edit" and not template_user_id and len(self._init_site_ids) > 1:
+        elif self._mode == "edit" and not template_user_id and role_id and len(self._init_site_ids) > 1:
             target_site_ids = list(self._init_site_ids)
 
         result: dict[str, Any] = {
@@ -1316,6 +1336,8 @@ class S1MoveAgentModal(ModalScreen[str | None]):
                 yield Button("Move Agent", id="s1-move-apply-btn", variant="warning", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-move-target-site-select", Select).focus()
 
     @on(Button.Pressed, "#s1-move-cancel-btn")
@@ -1455,6 +1477,8 @@ class S1EditExclusionModal(ModalScreen[dict[str, str] | None]):
                 yield Button("Save Changes", id="s1-edit-excl-save-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-edit-excl-value-input", Input).focus()
 
     @on(Button.Pressed, "#s1-edit-excl-cancel-btn")

@@ -1415,4 +1415,185 @@ def test_s1_user_modal_edit_preserves_scope_roles_and_site_modal_rejects_unicode
     asyncio.run(_run())
 
 
+def test_s1_add_blocklist_worker_passes_selected_site_ids_and_pivot_host_entity(
+    tmp_path: Path,
+) -> None:
+    s1 = _make_mock_s1_client()
+    app = create_app(
+        client=MagicMock(),
+        s1_client=s1,
+        dry_run=False,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+        view_mode="admin",
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(SentinelOnePane)
+
+            # 1: Non-empty _selected_site_ids scopes add_to_blocklist with sorted site_ids
+            pane._selected_site_ids = {"100102"}
+            valid_sha1 = "b94a8fe5ccb19ba61c4c0873d391e987982fbbd4"
+            worker = pane._add_blocklist_worker(
+                {
+                    "value": valid_sha1,
+                    "os_type": "windows",
+                    "description": "Site-scoped block",
+                }
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert worker.error is None
+            s1.add_to_blocklist.assert_called_once_with(
+                valid_sha1,
+                os_type="windows",
+                description="Site-scoped block",
+                site_ids=["100102"],
+            )
+
+            # 2: accept_pivot treats non-IP host-typed entity as hostname before src_ip
+            pane.accept_pivot(
+                PivotPayload(
+                    source_tab="tab-splunk-es",
+                    target_tab="tab-sentinelone",
+                    entity="wkstn-1001-01.example.test",
+                    entity_type="system",
+                    src_ip="198.51.100.10",
+                )
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert pane.query_one("#s1-filter-input", Input).value == "wkstn-1001-01.example.test"
+
+            # 3: accept_pivot does NOT treat IP or user email entity as hostname before src_ip
+            pane.accept_pivot(
+                PivotPayload(
+                    source_tab="tab-splunk-es",
+                    target_tab="tab-sentinelone",
+                    entity="203.0.113.45",
+                    entity_type="system",
+                    src_ip="198.51.100.10",
+                )
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert pane.query_one("#s1-filter-input", Input).value == "198.51.100.10"
+
+            pane.accept_pivot(
+                PivotPayload(
+                    source_tab="tab-splunk-es",
+                    target_tab="tab-sentinelone",
+                    entity="jdoe@example.test",
+                    entity_type="user",
+                    src_ip="198.51.100.10",
+                )
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert pane.query_one("#s1-filter-input", Input).value == "198.51.100.10"
+
+            # 4: accept_pivot ignores "-" placeholder values and falls back to src_ip / dest_ip
+            pane.accept_pivot(
+                PivotPayload(
+                    source_tab="tab-splunk-es",
+                    target_tab="tab-sentinelone",
+                    hostname=None,
+                    entity="-",
+                    entity_type="system",
+                    src_ip="10.0.0.5",
+                )
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert pane.query_one("#s1-filter-input", Input).value == "10.0.0.5"
+
+            pane.accept_pivot(
+                PivotPayload(
+                    source_tab="tab-splunk-es",
+                    target_tab="tab-sentinelone",
+                    hostname="-",
+                    entity="-",
+                    entity_type="system",
+                    src_ip="-",
+                    dest_ip="10.0.0.8",
+                )
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert pane.query_one("#s1-filter-input", Input).value == "10.0.0.8"
+
+            # 5: handle_add_blocklist modal flow snapshots selected site_ids on UI thread
+            s1.add_to_blocklist.reset_mock()
+            pane._selected_site_ids = {"100102", "100101"}
+            pane.query_one("#s1-view-select", Select).value = "blocklist"
+            await pilot.pause()
+            await pilot.click("#s1-add-block-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, S1AddBlocklistModal)
+            sha1_ui = "c94a8fe5ccb19ba61c4c0873d391e987982fbbd5"
+            app.screen.query_one("#s1-block-hash-input", Input).value = sha1_ui
+            app.screen.query_one("#s1-block-desc-input", Input).value = "UI scoped block"
+            await pilot.click("#s1-block-add-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            s1.add_to_blocklist.assert_called_once_with(
+                sha1_ui,
+                os_type="windows",
+                description="UI scoped block",
+                site_ids=["100101", "100102"],
+            )
+
+    asyncio.run(_run())
+
+
+def test_s1_modals_on_mount_shutdown_guard_and_normal_focus(tmp_path: Path) -> None:
+    from unittest.mock import PropertyMock, patch
+
+    sites = [{"id": "s1", "name": "MDR-100"}, {"id": "s2", "name": "MSSP-200"}]
+    modals = [
+        ConfirmDeleteSiteModal(site_id="s1", site_name="MDR-100"),
+        CloneExclusionsModal(sites=sites),
+        S1SiteModal(mode="create", sites=sites),
+        S1SitePolicyModal(site_id="s1", site_name="MDR-100", policy={"a": 1}, sites=sites),
+        S1UserModal(mode="edit", kind="console", user={"id": "u1"}, sites=sites),
+        S1MoveAgentModal(agent_summary="ag-1", sites=sites),
+        S1EditExclusionModal(
+            exclusion={"id": "e1", "type": "path", "osType": "windows", "value": r"C:\a"}
+        ),
+    ]
+    for fake_app in (
+        MagicMock(is_running=False, _exit=False),
+        MagicMock(is_running=True, _exit=True),
+    ):
+        for modal in modals:
+            with patch.object(type(modal), "app", new_callable=PropertyMock, return_value=fake_app):
+                modal.on_mount()
+
+    s1 = _make_mock_s1_client()
+    app = create_app(
+        client=MagicMock(),
+        s1_client=s1,
+        dry_run=True,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            del_modal = ConfirmDeleteSiteModal(site_id="s1", site_name="MDR-100", dry_run=True)
+            await app.push_screen(del_modal)
+            await pilot.pause()
+            assert app.screen is del_modal
+            assert app.focused is del_modal.query_one("#s1-del-site-cancel-btn", Button)
+            del_modal.query_one("#s1-del-site-cancel-btn", Button).press()
+            await pilot.pause()
+
+    asyncio.run(_run())
+
+
+
+
 
