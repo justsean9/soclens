@@ -215,6 +215,12 @@ class SocLensApp(App[None]):
         background: #0f131c;
         color: #e6edf7;
     }
+    ModalScreen {
+        background: rgba(15, 19, 28, 0.55);
+    }
+    ContextMenuModal {
+        background: rgba(0, 0, 0, 0);
+    }
     Header {
         background: #141a29;
         color: #f0f6ff;

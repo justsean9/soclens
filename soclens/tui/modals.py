@@ -63,7 +63,7 @@ class ContextMenuModal(ModalScreen[str | None]):
 
     DEFAULT_CSS: ClassVar[str] = """
     ContextMenuModal {
-        background: $background 25%;
+        background: rgba(0, 0, 0, 0);
         align: left top;
     }
     #ctx-menu-box {
