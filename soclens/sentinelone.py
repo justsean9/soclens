@@ -1956,9 +1956,10 @@ class SentinelOneClient:
             or record.get("analystVerdict")
             or "undefined"
         ).strip().lower()
+        raw_top_mit = record.get("mitigationStatus")
         mitigation_status = str(
             threat_info.get("mitigationStatus")
-            or record.get("mitigationStatus")
+            or (raw_top_mit if isinstance(raw_top_mit, str) else "")
             or ("cloud_alert" if kind == "cloud_alert" else "-")
         ).strip()
         computer_name = str(

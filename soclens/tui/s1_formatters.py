@@ -149,6 +149,8 @@ def _kv_table(rows: Sequence[tuple[str, str | Text]]) -> Table:
 
 
 def _badge_text(value: Any, *, kind: str = "generic") -> Text:
+    if isinstance(value, (Mapping, list, tuple)):
+        return Text(format_s1_value(value))
     raw = str(value or "-").strip()
     low = raw.lower()
     display = raw.replace("_", " ").title() if raw != "-" else "-"
@@ -167,6 +169,9 @@ def _badge_text(value: Any, *, kind: str = "generic") -> Text:
             "resolved": "bold green",
             "active": "bold red",
             "mitigated": "bold green",
+            "success": "bold green",
+            "failed": "bold red",
+            "pending": "bold yellow",
             "connected": "bold green",
             "disconnected": "bold red",
         }.get(low, "cyan")
@@ -189,6 +194,33 @@ def _badge_text(value: Any, *, kind: str = "generic") -> Text:
         }.get(low, "dim")
         return Text(raw.upper() if low in {"mdr", "mssp"} else display, style=style)
     return Text(display)
+
+
+def summarize_mitigation_status(rec: Mapping[str, Any], tinfo: Mapping[str, Any] | None = None) -> str:
+    """Return a clean scalar mitigation status string, never a raw Python list repr."""
+    ti = tinfo if isinstance(tinfo, Mapping) else _as_dict(rec.get("threatInfo"))
+    ti_mit = ti.get("mitigationStatus")
+    if isinstance(ti_mit, str) and ti_mit.strip():
+        return ti_mit.strip()
+    top_mit = rec.get("mitigationStatus")
+    if isinstance(top_mit, str) and top_mit.strip():
+        return top_mit.strip()
+    if isinstance(top_mit, list) and top_mit:
+        parts: list[str] = []
+        for entry in top_mit[:3]:
+            if isinstance(entry, Mapping):
+                act = str(entry.get("action") or "").replace("_", " ").strip().title()
+                st = str(entry.get("status") or "").replace("_", " ").strip().title()
+                if act and st:
+                    parts.append(f"{act} ({st})")
+                elif act:
+                    parts.append(act)
+                elif st:
+                    parts.append(st)
+        if parts:
+            suffix = f" +{len(top_mit) - len(parts)}" if len(top_mit) > len(parts) else ""
+            return ", ".join(parts) + suffix
+    return ""
 
 
 def _as_dict(val: Any) -> dict[str, Any]:
@@ -242,7 +274,10 @@ def _render_threat_detail(
     )
     verdict = rec.get("analystVerdict") or tinfo.get("analystVerdict") or ainfo.get("analystVerdict")
     inc_status = rec.get("incidentStatus") or tinfo.get("incidentStatus") or ainfo.get("incidentStatus")
-    mit_status = rec.get("mitigationStatus") or tinfo.get("mitigationStatus")
+    mit_status = summarize_mitigation_status(rec, tinfo)
+    mit_actions = [
+        item for item in _as_list(rec.get("mitigationStatus")) if isinstance(item, Mapping)
+    ]
     confidence = (
         rec.get("severity")
         or rinfo.get("severity")
@@ -357,6 +392,47 @@ def _render_threat_detail(
                 _kv_table(ctx_rows),
                 title=Text("Endpoint & Process Context", style="bold white"),
                 border_style="blue",
+                box=box.ROUNDED,
+            )
+        )
+
+    # Mitigation Actions history (when top-level mitigationStatus is a list of action dicts)
+    if mit_actions:
+        mit_tbl = Table(box=box.SIMPLE_HEAD, expand=True)
+        mit_tbl.add_column("Action", style="bold cyan", ratio=2, overflow="fold")
+        mit_tbl.add_column("Status", ratio=1, overflow="fold")
+        mit_tbl.add_column("Counters", ratio=2, overflow="fold")
+        mit_tbl.add_column("Last Updated", ratio=2, overflow="fold")
+        for entry in mit_actions[:15]:
+            act_name = str(entry.get("action") or "-").replace("_", " ").strip().title()
+            act_status = _badge_text(entry.get("status") or "-", kind="status")
+            counters = _as_dict(entry.get("actionsCounters"))
+            counter_parts: list[str] = []
+            if counters:
+                succ = counters.get("success")
+                tot = counters.get("total")
+                if succ is not None and tot is not None:
+                    counter_parts.append(f"{succ}/{tot} succeeded")
+                elif tot is not None:
+                    counter_parts.append(f"{tot} total")
+                if counters.get("failed"):
+                    counter_parts.append(f"{counters['failed']} failed")
+                if counters.get("pendingReboot"):
+                    counter_parts.append(f"{counters['pendingReboot']} pending reboot")
+                if counters.get("notFound"):
+                    counter_parts.append(f"{counters['notFound']} not found")
+            counter_str = ", ".join(counter_parts) if counter_parts else "-"
+            ts_str = format_s1_value(
+                entry.get("lastUpdate")
+                or entry.get("mitigationEndedAt")
+                or entry.get("mitigationStartedAt")
+            )
+            mit_tbl.add_row(act_name, act_status, counter_str, ts_str)
+        renderables.append(
+            Panel(
+                mit_tbl,
+                title=Text(f"Mitigation Actions ({len(mit_actions)})", style="bold green"),
+                border_style="green",
                 box=box.ROUNDED,
             )
         )
@@ -737,4 +813,5 @@ __all__ = [
     "render_s1_policy_detail",
     "render_s1_record_detail",
     "render_raw_json",
+    "summarize_mitigation_status",
 ]

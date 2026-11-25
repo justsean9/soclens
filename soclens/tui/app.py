@@ -1816,6 +1816,8 @@ class SocLensApp(App[None]):
         if not self._custom_client_injected and not get_rf_token(required=False):
             return
         try:
+            from concurrent.futures import ThreadPoolExecutor
+
             from soclens.tui.filters import build_alerts_v3_triggered_param
             from soclens.tui.rf_formatters import extract_alerts_v3, normalize_alert_v3
 
@@ -1828,11 +1830,100 @@ class SocLensApp(App[None]):
             normalized = [normalize_alert_v3(item) for item in raw_items]
             if self._stop_event.is_set() or self._shutting_down:
                 return
+
+            # Reuse any already-cached alert details while publishing the fresh list immediately
+            existing_entry = self.alert_cache.get(CACHE_SOURCE_RF)
+            existing_details: dict[str, dict[str, Any]] = {}
+            if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict):
+                existing_details = {
+                    str(k): v
+                    for k, v in existing_entry.meta["details"].items()
+                    if isinstance(v, dict)
+                }
+
             self.alert_cache.put(
                 CACHE_SOURCE_RF,
                 normalized,
                 timeframe="last_24h",
-                meta={"total": total},
+                meta={"total": total, "details": existing_details},
+            )
+            self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
+
+            # Preload full Alert v3 details for all 24h alerts so clicking any row is instant
+            get_detail_fn = getattr(self.client, "get_alert_v3", None)
+            if not callable(get_detail_fn) or not normalized:
+                return
+
+            alert_ids = [
+                str(item.get("id") or "").strip()
+                for item in normalized
+                if str(item.get("id") or "").strip()
+            ]
+            if not alert_ids:
+                return
+
+            details_by_id: dict[str, dict[str, Any]] = {
+                aid: existing_details[aid] for aid in alert_ids if aid in existing_details
+            }
+            to_fetch = [aid for aid in alert_ids if aid not in details_by_id]
+
+            def _fetch_one(aid: str) -> tuple[str, dict[str, Any] | None]:
+                if self._stop_event.is_set() or self._shutting_down:
+                    return aid, None
+                try:
+                    resp = get_detail_fn(aid)
+                    if not isinstance(resp, dict):
+                        return aid, None
+                    detail = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+                    return (aid, detail) if isinstance(detail, dict) else (aid, None)
+                except Exception:
+                    return aid, None
+
+            if to_fetch:
+                with ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="soclens-rf-detail"
+                ) as pool:
+                    for aid, detail in pool.map(_fetch_one, to_fetch):
+                        if self._stop_event.is_set() or self._shutting_down:
+                            return
+                        if detail is not None:
+                            details_by_id[aid] = detail
+
+            if not details_by_id or self._stop_event.is_set() or self._shutting_down:
+                return
+
+            detail_fields = (
+                "assignee",
+                "status",
+                "priority",
+                "note",
+                "hits",
+                "hits_count",
+                "ai_insights",
+                "primary_entity",
+                "rule_name",
+                "org_name",
+                "portal_url",
+                "status_date",
+            )
+            for item in normalized:
+                aid = str(item.get("id") or "").strip()
+                detail = details_by_id.get(aid)
+                if detail is None:
+                    continue
+                norm = normalize_alert_v3(detail)
+                for field in detail_fields:
+                    val = norm.get(field)
+                    if val not in ("", None, "-", [], 0) or not item.get(field):
+                        item[field] = val
+                if isinstance(norm.get("raw"), dict):
+                    item["raw"] = norm["raw"]
+
+            self.alert_cache.put(
+                CACHE_SOURCE_RF,
+                normalized,
+                timeframe="last_24h",
+                meta={"total": total, "details": details_by_id},
             )
             self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
         except Exception as exc:

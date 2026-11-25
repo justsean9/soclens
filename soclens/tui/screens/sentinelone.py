@@ -56,6 +56,7 @@ from soclens.tui.pivot import PivotPayload, emit_pivot
 from soclens.tui.s1_formatters import (
     render_raw_json,
     render_s1_record_detail,
+    summarize_mitigation_status,
 )
 from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable, extract_richlog_text
 from soclens.tui.screens.s1_modals import (
@@ -922,8 +923,7 @@ class SentinelOnePane(BaseSocPane):
                 or "-"
             )
             mit = (
-                rec.get("mitigationStatus")
-                or tinfo.get("mitigationStatus")
+                summarize_mitigation_status(rec, tinfo)
                 or ("cloud" if rec.get("recordType") == "cloud_alert" else "-")
             )
             created = (
@@ -1036,11 +1036,7 @@ class SentinelOnePane(BaseSocPane):
                 or alert_info.get("incidentStatus")
                 or ""
             ).strip().lower()
-            mit_status = str(
-                rec.get("mitigationStatus")
-                or tinfo.get("mitigationStatus")
-                or ""
-            ).strip().lower()
+            mit_status = summarize_mitigation_status(rec, tinfo).strip().lower()
             if self._status_filter == "unresolved":
                 if inc_status:
                     return inc_status == "unresolved"
@@ -1154,9 +1150,7 @@ class SentinelOnePane(BaseSocPane):
                 inc = str(
                     item.get("incidentStatus") or tinfo.get("incidentStatus") or ""
                 ).strip().lower()
-                mit = str(
-                    item.get("mitigationStatus") or tinfo.get("mitigationStatus") or ""
-                ).strip().lower()
+                mit = summarize_mitigation_status(item, tinfo).strip().lower()
                 if inc == "unresolved" or mit in {"active", "not_mitigated"}:
                     unmitigated += 1
 

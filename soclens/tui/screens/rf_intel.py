@@ -679,14 +679,23 @@ class RFIntelPane(BaseSocPane):
         self._datasets["alerts_v3"] = list(entry.items)
         raw_total = entry.meta.get("total")
         self._dataset_totals["alerts_v3"] = raw_total if isinstance(raw_total, int) else len(entry.items)
+        cached_details = entry.meta.get("details")
+        if isinstance(cached_details, dict):
+            for aid, detail in cached_details.items():
+                if aid and isinstance(detail, dict):
+                    key = ("alerts_v3", str(aid))
+                    self._detail_cache[key] = detail
+                    self._auto_enriched_keys.add(key)
         self._active_mode = "alerts_v3"
         self._hydrated_from_cache = True
         self._cache_fetched_at = entry.fetched_at
         self._refresh_assignee_options()
         self._render_view(schedule_auto_enrich=False)
+        detail_count = len(cached_details) if isinstance(cached_details, dict) else 0
+        detail_note = f", {detail_count} detail(s) preloaded" if detail_count else ""
         self.set_status(
             f"Loaded {len(entry.items)} cached RF alert(s) "
-            f"(Last 24h, updated {entry.age_label()})."
+            f"(Last 24h{detail_note}, updated {entry.age_label()})."
         )
         return True
 

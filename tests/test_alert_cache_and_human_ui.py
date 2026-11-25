@@ -108,6 +108,23 @@ def test_background_preloader_hydrates_rf_es_and_s1_panes(tmp_path: Path) -> Non
         ],
         "counts": {"total": 1},
     }
+    rf_client.get_alert_v3.return_value = {
+        "data": {
+            "id": "rf-a1",
+            "title": "Preloaded RF Alert",
+            "rule": {"name": "Domain Spoofing"},
+            "review": {"status": "New", "assignee": "analyst@soc.test"},
+            "log": {"triggered": recent},
+            "ai_insights": {"text": "Preloaded AI summary for instant click-in."},
+            "hits": [
+                {
+                    "id": "hit-1",
+                    "fragment": "Suspicious lookalike domain observed.",
+                    "document": {"title": "DNS Telemetry"},
+                }
+            ],
+        }
+    }
 
     s1_client = MagicMock()
     s1_client.console_url = "https://tenant.sentinelone.net"
@@ -180,14 +197,18 @@ def test_background_preloader_hydrates_rf_es_and_s1_panes(tmp_path: Path) -> Non
             assert s1_pane.query_one("#s1-table", DoubleClickDataTable).row_count == 1
             assert s1_client.list_threats.call_count == 1  # No redundant API call
 
-            # Switch to RF Intel -> instantly hydrated from cache
+            # Switch to RF Intel -> instantly hydrated from cache WITH full alert details
             app.activate_tab("tab-rf-intel")
             await pilot.pause()
             await pilot.pause()
             rf_pane = app.query_one(RFIntelPane)
             assert rf_pane._active_mode == "alerts_v3"
             assert rf_pane.query_one("#rf-results-table", DoubleClickDataTable).row_count == 1
+            assert ("alerts_v3", "rf-a1") in rf_pane._detail_cache
+            rf_detail_text = extract_richlog_text(rf_pane.query_one("#rf-log", RichLog))
+            assert "Preloaded AI summary for instant click-in." in rf_detail_text
             assert rf_client.search_alerts_v3.call_count == 1
+            assert rf_client.get_alert_v3.call_count == 1
 
             # Switch to Splunk ES -> instantly hydrated from cache
             app.activate_tab("tab-splunk-es")
@@ -207,6 +228,32 @@ def test_s1_human_readable_overview_and_raw_json_toggle(tmp_path: Path) -> None:
     s1.list_threats.return_value = [
         {
             "id": "th-hr-1",
+            "mitigationStatus": [
+                {
+                    "action": "unquarantine",
+                    "actionsCounters": {
+                        "failed": 0,
+                        "notFound": 0,
+                        "pendingReboot": 0,
+                        "success": 1,
+                        "total": 1,
+                    },
+                    "lastUpdate": recent,
+                    "status": "success",
+                },
+                {
+                    "action": "kill",
+                    "actionsCounters": {
+                        "failed": 0,
+                        "notFound": 0,
+                        "pendingReboot": 0,
+                        "success": 951,
+                        "total": 951,
+                    },
+                    "lastUpdate": recent,
+                    "status": "success",
+                },
+            ],
             "threatInfo": {
                 "threatName": "Mimikatz.CredentialDump",
                 "classification": "Hacktool",
@@ -247,9 +294,14 @@ def test_s1_human_readable_overview_and_raw_json_toggle(tmp_path: Path) -> None:
             assert "Mimikatz.CredentialDump" in detail_text
             assert "DC-01" in detail_text
             assert "MDR-7777" in detail_text
-            # Overview mode must NOT dump raw JSON braces/keys
+            assert "Mitigation Actions (2)" in detail_text
+            assert "Unquarantine" in detail_text
+            assert "951/951 succeeded" in detail_text
+            # Overview mode must NOT dump raw JSON or Python dict/list reprs
             assert '"threatInfo":' not in detail_text
             assert '"agentRealtimeInfo":' not in detail_text
+            assert "Actionscounters" not in detail_text
+            assert "{'action'" not in detail_text.lower()
 
             # Hover tooltip builder returns full line for row 0
             table = pane.query_one("#s1-table", DoubleClickDataTable)
