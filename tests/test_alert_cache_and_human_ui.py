@@ -596,8 +596,9 @@ def test_playbook_alerts_precache_details_and_images_without_enter(tmp_path: Pat
 def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from textual.widgets import Checkbox
+    from textual.widgets import Checkbox, Static
 
+    from soclens.research import ResearchDossier, ResolvedTarget
     from soclens.tui.research_art import (
         ASCII_ART_AUTO_HIDE_SECONDS,
         ResearchMoodBanner,
@@ -619,9 +620,42 @@ def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             banner = app.query_one("#res-mood-strip", ResearchMoodBanner)
-            # Off by default -> banner stays hidden even on mood updates
+            art = banner.query_one("#res-mood-art", Static)
+            caption = banner.query_one("#res-mood-caption", Static)
+
+            # Idle at startup -> banner hidden, ASCII art off
             assert banner.display is False
+            assert art.display is False
+
+            # Searching with default settings -> shows banner WITHOUT ASCII art (0 width), stays visible while searching
             banner.set_mood(determine_research_mood(None, searching=True, query="example.com"))
+            await pilot.pause()
+            assert banner.display is True
+            assert art.display is False
+            assert art.region.width == 0
+            assert banner._hide_timer is None
+            assert "SCANNING..." in str(caption.render())
+
+            # Transition from search -> initial thoughts (dossier verdict), auto-hides after 10s
+            banner.AUTO_HIDE_SECONDS = 0.05
+            dossier = ResearchDossier(
+                target=ResolvedTarget(
+                    raw_query="example.com",
+                    canonical_name="example.com",
+                    detected_kind="domain",
+                    entity_id=None,
+                ),
+                generated_at="2026-11-25T00:00:00Z",
+                risk_score=10,
+            )
+            banner.set_mood(determine_research_mood(dossier))
+            await pilot.pause()
+            assert banner.display is True
+            assert art.display is False
+            assert banner._hide_timer is not None
+            assert "LOW RISK" in str(caption.render())
+            assert "PONY" not in str(caption.render())
+            await asyncio.sleep(0.12)
             await pilot.pause()
             assert banner.display is False
 
@@ -633,12 +667,19 @@ def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
             cb = settings_pane.query_one("#set-ascii-art-enabled", Checkbox)
             assert cb.value is False
 
-            # Unlock via env/setting -> banner appears with a 10s auto-hide timer and re-hides
+            # Unlock via env/setting -> ASCII art renders during search -> initial thoughts and still drops after 10s
             monkeypatch.setenv("SOCLENS_ASCII_ART", "true")
-            banner.AUTO_HIDE_SECONDS = 0.05
             banner.set_mood(determine_research_mood(None, searching=True, query="evil.test"))
             await pilot.pause()
             assert banner.display is True
+            assert art.display is True
+            assert banner._hide_timer is None
+
+            banner.set_mood(determine_research_mood(dossier))
+            await pilot.pause()
+            assert banner.display is True
+            assert art.display is True
+            assert "HAPPY PONY" in str(caption.render())
             assert banner._hide_timer is not None
             await asyncio.sleep(0.12)
             await pilot.pause()

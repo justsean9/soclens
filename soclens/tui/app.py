@@ -794,10 +794,13 @@ class SocLensApp(App[None]):
         width: 12;
     }
     #res-mood-strip {
-        height: 4;
+        height: 3;
         width: 1fr;
         padding: 0 1;
         background: #101726;
+    }
+    #res-mood-strip.-ascii-art {
+        height: 4;
     }
     #res-mood-art {
         width: 24;
@@ -806,9 +809,13 @@ class SocLensApp(App[None]):
     }
     #res-mood-caption {
         width: 1fr;
+        height: 3;
+        padding-left: 0;
+        content-align: left middle;
+    }
+    #res-mood-strip.-ascii-art #res-mood-caption {
         height: 4;
         padding-left: 1;
-        content-align: left middle;
     }
     .-compact-narrow #res-toolbar {
         layout: grid;

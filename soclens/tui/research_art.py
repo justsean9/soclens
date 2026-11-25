@@ -14,6 +14,7 @@ from soclens.research import ResearchDossier, compute_unified_verdict
 from soclens.settings import get_setting_with_source
 
 ASCII_ART_AUTO_HIDE_SECONDS: float = 10.0
+BANNER_AUTO_HIDE_SECONDS: float = ASCII_ART_AUTO_HIDE_SECONDS
 _TRUTHY_STRINGS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 
@@ -45,6 +46,7 @@ class ResearchMood:
     detail: str
     accent_style: str
     score: int | None = None
+    art_title: str | None = None
 
 
 # Each sprite frame is a list of 4 lines; each line is a list of (text, style) tuples.
@@ -233,15 +235,17 @@ def determine_research_mood(
     searching: bool = False,
     query: str = "",
     error: str | None = None,
+    source_desc: str | None = None,
 ) -> ResearchMood:
     """Map current Research state or dossier risk/verdict into a ``ResearchMood``."""
     if searching:
         target = query.strip() or "target"
+        sources_label = (source_desc or "Recorded Future + Passive OSINT").strip()
         return ResearchMood(
             kind="searching",
             title="SCANNING...",
             subtitle=f"Investigating {target}",
-            detail="Querying Recorded Future + Passive OSINT sources",
+            detail=f"Querying {sources_label} sources",
             accent_style="bold bright_cyan",
         )
 
@@ -259,7 +263,7 @@ def determine_research_mood(
             kind="idle",
             title="RESEARCH READY",
             subtitle="Search any IP, domain, hash, URL, CVE, actor, or topic",
-            detail="Mood art reacts to threat score & unified verdict",
+            detail="Initial risk & unified verdict summary appears during search",
             accent_style="bold cyan",
         )
 
@@ -268,13 +272,25 @@ def determine_research_mood(
     score = dossier.risk_score
     target_name = dossier.target.canonical_name
     signals = verdict.get("signals") or []
-    top_signal = ""
-    if signals and isinstance(signals[0], dict):
-        src = signals[0].get("source", "")
-        txt = signals[0].get("text", "")
-        top_signal = f"{src}: {txt}".strip(": ")
+    signal_parts: list[str] = []
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        src = str(sig.get("source") or "").strip()
+        txt = str(sig.get("text") or "").strip()
+        formatted = f"{src}: {txt}".strip(": ")
+        if formatted:
+            signal_parts.append(formatted)
+        if len(signal_parts) >= 2:
+            break
+    if signal_parts:
+        top_signal = "  |  ".join(signal_parts)
+        if len(top_signal) > 120:
+            top_signal = top_signal[:117].rstrip() + "..."
     elif verdict.get("summary"):
         top_signal = str(verdict["summary"])
+    else:
+        top_signal = ""
 
     score_text = f"RF Risk {score}/99" if score is not None else f"Verdict: {verdict.get('label', level.upper())}"
 
@@ -301,7 +317,8 @@ def determine_research_mood(
     if level in ("benign", "low") or (score is not None and score < 25):
         return ResearchMood(
             kind="low_risk",
-            title="HAPPY PONY — LOW RISK!",
+            title="LOW RISK",
+            art_title="HAPPY PONY — LOW RISK!",
             subtitle=f"{target_name}  |  {score_text}",
             detail=top_signal or "No significant malicious indicators found",
             accent_style="bold bright_green",
@@ -331,13 +348,14 @@ def render_mood_frame(kind: MoodKind, frame_index: int) -> Text:
     return out
 
 
-def render_mood_caption(mood: ResearchMood, frame_index: int) -> Text:
-    """Render the companion 4-line status caption next to the animated sprite."""
+def render_mood_caption(mood: ResearchMood, frame_index: int, *, include_art: bool = False) -> Text:
+    """Render the companion status caption (optionally with art-mode title)."""
     pulse_chars = ("●", "◉", "○", "◉")
     pulse = pulse_chars[frame_index % len(pulse_chars)]
+    display_title = mood.art_title if (include_art and mood.art_title) else mood.title
     out = Text()
     out.append(f"{pulse} ", style=mood.accent_style)
-    out.append(mood.title, style=mood.accent_style)
+    out.append(display_title, style=mood.accent_style)
     out.append("\n")
     out.append(mood.subtitle, style="bold white")
     out.append("\n")
@@ -346,10 +364,11 @@ def render_mood_caption(mood: ResearchMood, frame_index: int) -> Text:
 
 
 class ResearchMoodBanner(Horizontal):
-    """Compact 4-line animated art + status banner for the Research pane.
+    """Status/initial-thoughts banner for the Research pane.
 
-    Hidden by default unless ``soclens_ascii_art_enabled`` is unlocked in Settings,
-    and automatically hides itself after ``AUTO_HIDE_SECONDS`` (10s) each time it appears.
+    Shows live search progress transitioning into initial threat thoughts and
+    automatically hides after ``AUTO_HIDE_SECONDS`` (10s). Animated ASCII art
+    is omitted by default unless ``soclens_ascii_art_enabled`` is unlocked in Settings.
     """
 
     AUTO_HIDE_SECONDS: float = ASCII_ART_AUTO_HIDE_SECONDS
@@ -376,7 +395,9 @@ class ResearchMoodBanner(Horizontal):
 
     def on_mount(self) -> None:
         self._render_current()
-        if is_ascii_art_enabled():
+        if self._mood.kind == "searching":
+            self._show_searching()
+        elif self._mood.kind != "idle":
             self._show_temporarily()
         else:
             self._hide_now()
@@ -392,17 +413,30 @@ class ResearchMoodBanner(Horizontal):
             self._hide_timer.stop()
             self._hide_timer = None
 
+    def _start_pulse(self) -> None:
+        if self._timer is None:
+            self._timer = self.set_interval(0.35, self._on_tick)
+
     def _hide_now(self) -> None:
         self._stop_timers()
         self.display = False
+
+    def _show_searching(self) -> None:
+        if not self.is_mounted:
+            return
+        if self._hide_timer is not None:
+            self._hide_timer.stop()
+            self._hide_timer = None
+        self.display = True
+        self._render_current()
+        self._start_pulse()
 
     def _show_temporarily(self) -> None:
         if not self.is_mounted:
             return
         self.display = True
         self._render_current()
-        if self._timer is None:
-            self._timer = self.set_interval(0.35, self._on_tick)
+        self._start_pulse()
         if self._hide_timer is not None:
             self._hide_timer.stop()
         self._hide_timer = self.set_timer(self.AUTO_HIDE_SECONDS, self._hide_now)
@@ -411,22 +445,24 @@ class ResearchMoodBanner(Horizontal):
         """Apply live changes to the Settings ASCII art toggle."""
         if not self.is_mounted:
             return
-        if is_ascii_art_enabled():
+        show_art = is_ascii_art_enabled()
+        self._render_current()
+        if show_art and not self.display and self._mood.kind != "idle":
             self._show_temporarily()
-        else:
-            self._hide_now()
 
     def set_mood(self, mood: ResearchMood) -> None:
-        """Update the displayed mood; show for 10s only when ASCII art is unlocked."""
+        """Update the displayed mood: stay visible while searching, then auto-hide after 10s."""
         if mood.kind != self._mood.kind:
             self._frame_index = 0
         self._mood = mood
         if not self.is_mounted:
             return
-        if is_ascii_art_enabled():
-            self._show_temporarily()
-        else:
+        if mood.kind == "idle":
             self._hide_now()
+        elif mood.kind == "searching":
+            self._show_searching()
+        else:
+            self._show_temporarily()
 
     def _on_tick(self) -> None:
         if not self.is_mounted or not self.display:
@@ -435,7 +471,13 @@ class ResearchMoodBanner(Horizontal):
         self._render_current()
 
     def _render_current(self) -> None:
+        show_art = is_ascii_art_enabled()
+        self.set_class(show_art, "-ascii-art")
         art = self.query_one("#res-mood-art", Static)
         caption = self.query_one("#res-mood-caption", Static)
-        art.update(render_mood_frame(self._mood.kind, self._frame_index))
-        caption.update(render_mood_caption(self._mood, self._frame_index))
+        art.display = show_art
+        if show_art:
+            art.update(render_mood_frame(self._mood.kind, self._frame_index))
+        else:
+            art.update("")
+        caption.update(render_mood_caption(self._mood, self._frame_index, include_art=show_art))

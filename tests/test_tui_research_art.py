@@ -51,7 +51,9 @@ def test_determine_research_mood_states() -> None:
     low_rf = _make_dossier(name="good.example", risk_score=5)
     low_mood = determine_research_mood(low_rf)
     assert low_mood.kind == "low_risk"
-    assert "PONY" in low_mood.title
+    assert low_mood.title == "LOW RISK"
+    assert "PONY" not in low_mood.title
+    assert low_mood.art_title == "HAPPY PONY — LOW RISK!"
 
     benign = _make_dossier(name="clean.example", risk_score=None, verdict_level="benign")
     assert determine_research_mood(benign).kind == "low_risk"
@@ -71,11 +73,20 @@ def test_mood_frames_animate_and_are_four_lines() -> None:
     high_text = render_mood_frame("high_risk", 0)
     assert any("red" in str(span.style) for span in high_text.spans)
 
-    cap = render_mood_caption(determine_research_mood(_make_dossier(risk_score=0)), 0)
-    assert "HAPPY PONY" in cap.plain
+    low_mood = determine_research_mood(_make_dossier(risk_score=0))
+    cap_default = render_mood_caption(low_mood, 0)
+    assert "LOW RISK" in cap_default.plain
+    assert "PONY" not in cap_default.plain
+
+    cap_art = render_mood_caption(low_mood, 0, include_art=True)
+    assert "HAPPY PONY" in cap_art.plain
 
 
 def test_research_pane_mood_banner_reacts_to_dossier(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from textual.widgets import Static
+
+    monkeypatch.delenv("SOCLENS_ASCII_ART", raising=False)
+
     high_dossier = _make_dossier(name="198.51.100.99", kind="ip", risk_score=92, verdict_level="critical")
     low_dossier = _make_dossier(name="1.1.1.1", kind="ip", risk_score=0, verdict_level="benign")
     low_dossier.sections["osint_virustotal"] = ResearchSectionResult(
@@ -99,20 +110,63 @@ def test_research_pane_mood_banner_reacts_to_dossier(monkeypatch: pytest.MonkeyP
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
             banner = app.query_one("#res-mood-strip", ResearchMoodBanner)
+            art = banner.query_one("#res-mood-art", Static)
+            caption = banner.query_one("#res-mood-caption", Static)
+
+            # Idle at startup -> hidden, no ASCII art
             assert banner.mood.kind == "idle"
+            assert banner.display is False
+            assert art.display is False
+
+            # Searching -> visible without ASCII art, stays up until results arrive
+            banner.set_mood(determine_research_mood(None, searching=True, query="198.51.100.99"))
+            await pilot.pause()
+            assert banner.display is True
+            assert art.display is False
+            assert banner._hide_timer is None
+            assert "SCANNING..." in str(caption.render())
+            assert "198.51.100.99" in str(caption.render())
             start_frame = banner.frame_index
             await asyncio.sleep(0.45)
             await pilot.pause()
             assert banner.frame_index > start_frame
 
+            # Search transitions into initial thoughts (high risk) with 10s drop timer
             pane = app.query_one("ResearchPane")
+            banner.AUTO_HIDE_SECONDS = 0.08
             pane._apply_dossier(high_dossier)
             await pilot.pause()
+            assert banner.display is True
+            assert art.display is False
             assert banner.mood.kind == "high_risk"
+            assert banner._hide_timer is not None
+            assert "CRITICAL THREAT!" in str(caption.render())
 
+            # Transition to low risk -> plain text "LOW RISK" (no pony art/title)
             pane._apply_dossier(low_dossier)
             await pilot.pause()
+            assert banner.display is True
+            assert art.display is False
             assert banner.mood.kind == "low_risk"
-            assert "PONY" in banner.mood.title
+            assert banner.mood.title == "LOW RISK"
+            assert "LOW RISK" in str(caption.render())
+            assert "PONY" not in str(caption.render())
+
+            # Auto-hides after timer expires
+            await asyncio.sleep(0.15)
+            await pilot.pause()
+            assert banner.display is False
+
+            # Opt-in ASCII art via setting shows sprite + HAPPY PONY and still auto-hides
+            monkeypatch.setenv("SOCLENS_ASCII_ART", "true")
+            pane._apply_dossier(low_dossier)
+            await pilot.pause()
+            assert banner.display is True
+            assert art.display is True
+            assert banner.has_class("-ascii-art") is True
+            assert "HAPPY PONY" in str(caption.render())
+            await asyncio.sleep(0.15)
+            await pilot.pause()
+            assert banner.display is False
 
     asyncio.run(_run())

@@ -1056,9 +1056,19 @@ class ResearchPane(BaseSocPane):
             "osint": "Free Passive OSINT",
             "rf": "Recorded Future",
         }.get(source_mode, source_mode)
+        banner_source_desc = {
+            "all": "Recorded Future + Passive OSINT",
+            "osint": "Free Passive OSINT",
+            "rf": "Recorded Future",
+        }.get(source_mode, mode_desc)
         self.set_status(f"Searching ({mode_desc}) for '{query}'...")
         self.query_one("#res-mood-strip", ResearchMoodBanner).set_mood(
-            determine_research_mood(None, searching=True, query=query)
+            determine_research_mood(
+                None,
+                searching=True,
+                query=query,
+                source_desc=banner_source_desc,
+            )
         )
         self._investigate_worker(
             seq,
@@ -1304,6 +1314,15 @@ class ResearchPane(BaseSocPane):
         if self.is_app_shutting_down():
             return
         if isinstance(exc, RecordedFutureError) and getattr(exc, "reason", None) == "cancelled":
+            def _reset_cancelled_banner() -> None:
+                try:
+                    self.query_one("#res-mood-strip", ResearchMoodBanner).set_mood(
+                        determine_research_mood(None)
+                    )
+                except Exception:
+                    pass
+
+            self.run_on_ui(_reset_cancelled_banner)
             return
         detail = self.format_exception(exc)
         self.set_status(f"Search failed: {detail}")
