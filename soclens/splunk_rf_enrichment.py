@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from soclens.client import MAX_SOAR_IOCS, RecordedFutureClient
-from soclens.splunk_es import SplunkESClient
+from soclens.splunk_es import SplunkESClient, SplunkESError
 
 DEFAULT_SPLUNK_RF_FIELD_MAP: dict[str, tuple[str, ...]] = {
     "ip": (
@@ -324,6 +324,8 @@ def extract_observables_from_event(
 
     raw_nested = event.get("raw")
     raw_dict = raw_nested if isinstance(raw_nested, dict) else {}
+    custom_nested = event.get("custom_fields")
+    custom_dict = custom_nested if isinstance(custom_nested, dict) else {}
 
     extracted: list[ExtractedObservable] = []
     seen: set[tuple[str, str]] = set()
@@ -335,6 +337,8 @@ def extract_observables_from_event(
             sources: list[Any] = []
             if field_name in event:
                 sources.append(event.get(field_name))
+            if field_name in custom_dict:
+                sources.append(custom_dict.get(field_name))
             if field_name in raw_dict:
                 sources.append(raw_dict.get(field_name))
 
@@ -650,8 +654,10 @@ def write_enrichment_to_notable(
     enriched_event: dict[str, Any],
     *,
     dry_run: bool = False,
+    use_mc_v2: bool = False,
+    finding_time: str | None = None,
 ) -> dict[str, Any]:
-    """Post a formatted Recorded Future enrichment comment to a Splunk ES notable event."""
+    """Post a formatted Recorded Future enrichment comment to a Splunk ES notable/finding."""
     clean_id = str(event_id or "").strip()
     if not clean_id:
         raise ValueError("Notable event_id is required to write enrichment comment.")
@@ -664,11 +670,33 @@ def write_enrichment_to_notable(
             "comment": comment,
         }
 
+    backend = "notable_update"
+    if use_mc_v2 and hasattr(es_client, "create_note"):
+        try:
+            result = es_client.create_note(
+                clean_id,
+                comment,
+                title="Recorded Future Enrichment",
+                finding_time=finding_time,
+            )
+            backend = "mc_v2"
+            return {
+                "dry_run": False,
+                "event_id": clean_id,
+                "comment": comment,
+                "backend": backend,
+                "result": result,
+            }
+        except SplunkESError as exc:
+            if exc.status_code != 404:
+                raise
+
     result = es_client.update_notable([clean_id], comment=comment)
     return {
         "dry_run": False,
         "event_id": clean_id,
         "comment": comment,
+        "backend": backend,
         "result": result,
     }
 
@@ -865,11 +893,15 @@ class SplunkRFEnricher:
         enriched_event: dict[str, Any],
         *,
         dry_run: bool = False,
+        use_mc_v2: bool = False,
+        finding_time: str | None = None,
     ) -> dict[str, Any]:
-        """Post a formatted Recorded Future enrichment comment to a Splunk ES notable event."""
+        """Post a formatted Recorded Future enrichment comment to a Splunk ES notable/finding."""
         return write_enrichment_to_notable(
             es_client,
             event_id,
             enriched_event,
             dry_run=dry_run,
+            use_mc_v2=use_mc_v2,
+            finding_time=finding_time,
         )

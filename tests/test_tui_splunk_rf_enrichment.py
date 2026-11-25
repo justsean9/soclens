@@ -272,3 +272,46 @@ def test_tui_splunk_search_enrich_results_with_rf(tmp_path: Path) -> None:
                 assert "185.220.101.1" in detail_txt
 
     asyncio.run(_run())
+
+
+def test_tui_splunk_es_rf_custom_fields_and_preserved_collapsible(tmp_path: Path) -> None:
+    from textual.widgets import Collapsible
+
+    fake_es = _make_fake_es_client()
+    fake_es.list_notables.return_value = [
+        {
+            "event_id": "notable-cf-1",
+            "rule_name": "Custom Fields IOC",
+            "urgency": "high",
+            "status": 1,
+            "status_label": "New",
+            "owner": "unassigned",
+            "custom_fields": {"src_ip": "185.220.101.1"},
+            "_time": "2026-11-24T12:00:00Z",
+        }
+    ]
+    fake_rf = _make_fake_rf_client()
+    app = create_app(
+        client=fake_rf,
+        dry_run=True,
+        initial_tab="tab-splunk-es",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        with patch.object(SplunkESPane, "_build_es_client", return_value=fake_es):
+            async with app.run_test(size=(150, 42)) as pilot:
+                await pilot.pause()
+                collapsible = app.query_one("#es-rf-map-collapsible", Collapsible)
+                assert collapsible.collapsed is True
+
+                await pilot.click("#es-refresh-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                table = app.query_one("#es-table", DataTable)
+                row_vals = [str(c) for c in table.get_row_at(0)]
+                assert "93" in row_vals
+                assert "src_ip=185.220.101.1" in row_vals
+
+    asyncio.run(_run())

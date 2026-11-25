@@ -269,6 +269,7 @@ class SplunkClient:
         max_retries: int = 3,
         backoff_base: float = 0.5,
         poll_interval: float = 2.0,
+        stop_event: threading.Event | None = None,
     ) -> None:
         config = get_splunk_config(
             host=host,
@@ -290,6 +291,10 @@ class SplunkClient:
         self.max_retries = max(0, max_retries)
         self.backoff_base = max(0.0, backoff_base)
         self.poll_interval = max(0.05, poll_interval)
+        self._custom_stop_event = stop_event is not None
+        self.stop_event: threading.Event = (
+            stop_event if stop_event is not None else threading.Event()
+        )
 
         if self.verify_ssl is False:
             _suppress_insecure_ssl_warnings()
@@ -341,6 +346,16 @@ class SplunkClient:
         base = min(self.backoff_base * (2**attempt), 10.0)
         return base * random.uniform(0.75, 1.25)
 
+    def _sleep_or_cancel(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``; return False if ``stop_event`` is set."""
+        if self.stop_event.is_set():
+            return False
+        delay = max(0.0, float(seconds))
+        if self._custom_stop_event:
+            return not self.stop_event.wait(delay)
+        time.sleep(delay)
+        return not self.stop_event.is_set()
+
     def _request(
         self,
         method: str,
@@ -355,6 +370,8 @@ class SplunkClient:
         last_exc: requests.exceptions.RequestException | None = None
 
         for attempt in range(self.max_retries + 1):
+            if self.stop_event.is_set():
+                raise RuntimeError("Splunk request cancelled (shutdown requested).")
             req_timeout = base_timeout
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -391,7 +408,8 @@ class SplunkClient:
                     attempt + 1,
                     self.max_retries,
                 )
-                time.sleep(delay)
+                if not self._sleep_or_cancel(delay):
+                    raise RuntimeError("Splunk request cancelled (shutdown requested).") from exc
                 continue
 
             if response.status_code not in _RETRYABLE_STATUS_CODES:
@@ -420,7 +438,8 @@ class SplunkClient:
                 attempt + 1,
                 self.max_retries,
             )
-            time.sleep(delay)
+            if not self._sleep_or_cancel(delay):
+                raise RuntimeError("Splunk request cancelled (shutdown requested).")
 
         if last_exc is not None:  # pragma: no cover - defensive fallback
             raise last_exc
@@ -553,6 +572,9 @@ class SplunkClient:
         collected_messages: list[str] = []
 
         while True:
+            if self.stop_event.is_set():
+                self._cancel_search_job(cancel_url)
+                return None, "Search job cancelled (shutdown requested).", collected_messages
             if time.monotonic() >= deadline:
                 self._cancel_search_job(cancel_url)
                 return None, f"Search job timed out after {timeout} seconds.", collected_messages
@@ -627,7 +649,9 @@ class SplunkClient:
             if remaining <= 0:
                 self._cancel_search_job(cancel_url)
                 return None, f"Search job timed out after {timeout} seconds.", collected_messages
-            time.sleep(min(self.poll_interval, remaining))
+            if not self._sleep_or_cancel(min(self.poll_interval, remaining)):
+                self._cancel_search_job(cancel_url)
+                return None, "Search job cancelled (shutdown requested).", collected_messages
 
     def run_search(
         self,
@@ -775,6 +799,63 @@ class SplunkClient:
                     }
                 )
         return indexes
+
+    def list_users(self, *, count: int = 200) -> list[dict[str, Any]]:
+        """List Splunk authentication users via ``/services/authentication/users``."""
+        safe_count = max(0, int(count))
+        url = f"{self.host}/services/authentication/users?output_mode=json&count={safe_count}"
+        response = self._request("GET", url, timeout=self.request_timeout)
+        if response.status_code != 200:
+            try:
+                err_msg = _extract_splunk_messages(response.json()) or response.text
+            except ValueError:
+                err_msg = response.text
+            raise RuntimeError(
+                f"Failed to list Splunk users (HTTP {response.status_code}): {err_msg}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON returned when listing Splunk users: {exc}") from exc
+
+        entries = payload.get("entry", []) if isinstance(payload, dict) else []
+        users: list[dict[str, Any]] = []
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                content = entry.get("content")
+                if not isinstance(content, dict):
+                    content = {}
+                roles_raw = content.get("roles")
+                roles = (
+                    [str(r).strip() for r in roles_raw if str(r).strip()]
+                    if isinstance(roles_raw, list)
+                    else []
+                )
+                users.append(
+                    {
+                        "username": str(entry.get("name") or "").strip(),
+                        "realname": str(content.get("realname") or "").strip(),
+                        "email": str(content.get("email") or "").strip(),
+                        "roles": roles,
+                    }
+                )
+        return [u for u in users if u["username"]]
+
+    def get_current_user(self) -> str:
+        """Return the currently authenticated Splunk username, or configured username."""
+        url = f"{self.host}/services/authentication/currentcontext?output_mode=json"
+        try:
+            response = self._request("GET", url, timeout=self.request_timeout)
+            if response.status_code == 200:
+                content = _extract_first_entry_content(response.json())
+                user = str(content.get("username") or "").strip()
+                if user:
+                    return user
+        except (requests.exceptions.RequestException, ValueError, TypeError):
+            pass
+        return (self.username or "").strip()
 
     def list_saved_searches(
         self,

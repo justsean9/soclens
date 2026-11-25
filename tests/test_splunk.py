@@ -394,3 +394,51 @@ class TestSplunkValidator:
 
         dir_searches = parse_savedsearches_files(tmp_path)
         assert len(dir_searches) == 2
+
+    def test_splunk_client_list_users_and_current_user(self) -> None:
+        session = MagicMock(spec=requests.Session)
+        session.request.side_effect = [
+            _make_response(
+                200,
+                {
+                    "entry": [
+                        {
+                            "name": "alice",
+                            "content": {
+                                "realname": "Alice Analyst",
+                                "email": "alice@example.test",
+                                "roles": ["ess_analyst", "user"],
+                            },
+                        },
+                        {
+                            "name": "bob",
+                            "content": {"realname": "Bob Lead", "roles": ["admin"]},
+                        },
+                    ]
+                },
+            ),
+            _make_response(200, {"entry": [{"content": {"username": "alice"}}]}),
+        ]
+        client = SplunkValidator(host="https://splunk.local:8089", token="tok", session=session)
+        users = client.list_users(count=50)
+        assert len(users) == 2
+        assert users[0]["username"] == "alice"
+        assert users[0]["realname"] == "Alice Analyst"
+        assert users[0]["roles"] == ["ess_analyst", "user"]
+        assert client.get_current_user() == "alice"
+
+    def test_splunk_client_stop_event_cancels_requests(self) -> None:
+        import threading
+
+        stop = threading.Event()
+        stop.set()
+        session = MagicMock(spec=requests.Session)
+        client = SplunkValidator(
+            host="https://splunk.local:8089",
+            token="tok",
+            session=session,
+            stop_event=stop,
+        )
+        with pytest.raises(RuntimeError, match="cancelled"):
+            client._request("GET", "/services/server/info")
+        session.request.assert_not_called()

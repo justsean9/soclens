@@ -435,3 +435,59 @@ class TestSplunkESEnrichCLI:
         assert "Very Malicious" in out
         assert "Posted RF enrichment comment(s) for 1 notable(s)." in out
         fake_es.update_notable.assert_called_once()
+
+
+class TestSplunkRFCustomFieldsAndMCv2:
+    def test_extract_observables_from_custom_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("RF_SPLUNK_FIELD_MAP", raising=False)
+        event = {
+            "event_id": "mc-1",
+            "custom_fields": {
+                "src_ip": "185.220.101.1",
+                "dns_query": "c2.example.org",
+            },
+        }
+        obs = extract_observables_from_event(event)
+        assert obs == [
+            ExtractedObservable("ip", "185.220.101.1", "src_ip"),
+            ExtractedObservable("domain", "c2.example.org", "dns_query"),
+        ]
+
+    def test_write_enrichment_to_notable_mc_v2_and_404_fallback(self) -> None:
+        from soclens.splunk_es import SplunkESError
+
+        enriched_ev = {
+            "event_id": "ev@@notable@@1",
+            "rf_max_risk_score": 91,
+            "rf_criticality_label": "Very Malicious",
+            "rf_top_field": "src=185.220.101.1",
+            "rf_observables": [
+                {
+                    "source_field": "src",
+                    "ioc_type": "ip",
+                    "value": "185.220.101.1",
+                    "risk_score": 91,
+                    "criticality_label": "Very Malicious",
+                    "evidence": [{"rule": "Active C2 Server"}],
+                }
+            ],
+        }
+        es = MagicMock()
+        es.create_note.return_value = {"id": "note-1"}
+        res = write_enrichment_to_notable(
+            es,
+            "ev@@notable@@1",
+            enriched_ev,
+            use_mc_v2=True,
+            finding_time="2026-11-24T12:00:00Z",
+        )
+        assert res["backend"] == "mc_v2"
+        es.create_note.assert_called_once()
+        es.update_notable.assert_not_called()
+
+        # 404 falls back to update_notable
+        es.create_note.side_effect = SplunkESError("Not found", status_code=404)
+        es.update_notable.return_value = {"success": True}
+        fb = write_enrichment_to_notable(es, "ev@@notable@@1", enriched_ev, use_mc_v2=True)
+        assert fb["backend"] == "notable_update"
+        es.update_notable.assert_called_once()
