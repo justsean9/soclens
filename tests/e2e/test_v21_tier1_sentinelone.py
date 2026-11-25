@@ -416,7 +416,7 @@ def test_v21_f10_tui_alerts_enrich_in_rf_pivot(
             assert app.query_one("#main-tabs", TabbedContent).active == "tab-rf-intel"
             assert mock_rf_server.requests_log
             rf_paths = " ".join(r["path"] for r in mock_rf_server.requests_log)
-            assert ("a" * 40) in rf_paths or "srv-1001-db.example.test" in rf_paths
+            assert ("b" * 64) in rf_paths or ("a" * 40) in rf_paths or "srv-1001-db.example.test" in rf_paths
 
     asyncio.run(_run())
 
@@ -1119,3 +1119,97 @@ def test_v21_f12_cli_s1_v21_exclusions_clone_dry_run_and_execute(
         if r["method"] == "POST" and r["path"] == "/web/api/v2.1/exclusions"
     ]
     assert len(posts) == 2
+
+
+@pytest.mark.feature("V21-F9")
+def test_v21_f9_unlimited_pagination_and_newest_first_sorting_e2e(
+    v21_workspace: Path,
+    mock_s1_server: MockSentinelOneServer,
+) -> None:
+    base_threat = dict(mock_s1_server.state["threats"][0])
+    # Seed 260 threats in ascending chronological order (oldest first in server storage)
+    for idx in range(260):
+        item = json.loads(json.dumps(base_threat))
+        item["id"] = f"thr-bulk-{idx:03d}"
+        day = 1 + (idx // 24)
+        hour = idx % 24
+        ts = f"2026-10-{day:02d}T{hour:02d}:00:00Z"
+        item["threatInfo"]["threatId"] = item["id"]
+        item["threatInfo"]["threatName"] = f"bulk_threat_{idx:03d}.exe"
+        item["threatInfo"]["createdAt"] = ts
+        mock_s1_server.state["threats"].append(item)
+
+    base_agent = dict(mock_s1_server.state["agents"][0])
+    for idx in range(220):
+        ag = json.loads(json.dumps(base_agent))
+        ag["id"] = f"ag-bulk-{idx:03d}"
+        ag["computerName"] = f"bulk-host-{idx:03d}.example.test"
+        day = 1 + (idx // 24)
+        hour = idx % 24
+        ag["createdAt"] = f"2026-10-{day:02d}T{hour:02d}:00:00Z"
+        mock_s1_server.state["agents"].append(ag)
+
+    cfg = get_sentinelone_config(required=True)
+    with SentinelOneClient(config=cfg) as s1:
+        all_threats = s1.list_threats()
+        assert len(all_threats) == 266
+        # Fixture threats are 2026-11-25 (newest), bulk threats are 2026-10 (descending)
+        timestamps = [
+            str((t.get("threatInfo") or {}).get("createdAt") or "")
+            for t in all_threats
+        ]
+        assert timestamps == sorted(timestamps, reverse=True)
+        assert all_threats[0]["id"] == "thr-1001-2"
+        assert all_threats[-1]["id"] == "thr-bulk-000"
+
+        threat_gets = [
+            r
+            for r in mock_s1_server.requests_log
+            if r["method"] == "GET" and r["path"] == "/web/api/v2.1/threats"
+        ]
+        assert len(threat_gets) == 3
+        assert all(int(r["query"]["limit"][0]) <= 100 for r in threat_gets)
+        assert all(
+            r["query"].get("sortBy") == ["createdAt"] and r["query"].get("sortOrder") == ["desc"]
+            for r in threat_gets
+        )
+
+        # Capped limit=25 returns the 25 NEWEST threats, not the 25 oldest
+        newest_25 = s1.list_threats(limit=25)
+        assert len(newest_25) == 25
+        assert [t["id"] for t in newest_25[:6]] == [
+            "thr-1001-2",
+            "thr-2001-1",
+            "thr-1002-1",
+            "thr-1001-1",
+            "thr-2001-2",
+            "thr-3001-1",
+        ]
+        assert newest_25[6]["id"] == "thr-bulk-259"
+        assert newest_25[-1]["id"] == "thr-bulk-241"
+
+        # Cloud alerts must send sortBy=alertInfoCreatedAt&sortOrder=desc
+        mock_s1_server.requests_log.clear()
+        cloud = s1.list_cloud_alerts()
+        assert [c["id"] for c in cloud] == ["cld-1001-1", "cld-2001-1"]
+        cloud_get = [
+            r
+            for r in mock_s1_server.requests_log
+            if r["method"] == "GET" and r["path"] == "/web/api/v2.1/cloud-detection/alerts"
+        ][0]
+        assert cloud_get["query"]["sortBy"] == ["alertInfoCreatedAt"]
+        assert cloud_get["query"]["sortOrder"] == ["desc"]
+
+        # Agents default pagination retrieves all 225 across >= 3 cursor pages, newest first
+        mock_s1_server.requests_log.clear()
+        all_agents = s1.list_agents()
+        assert len(all_agents) == 225
+        assert all_agents[0]["id"] == "ag-bulk-219"
+        agent_gets = [
+            r
+            for r in mock_s1_server.requests_log
+            if r["method"] == "GET" and r["path"] == "/web/api/v2.1/agents"
+        ]
+        assert len(agent_gets) == 3
+        assert all(int(r["query"]["limit"][0]) <= 100 for r in agent_gets)
+

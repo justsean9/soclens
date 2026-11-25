@@ -128,7 +128,9 @@ def _make_mock_s1_client() -> MagicMock:
         "tenantId": "1234",
         "computerName": "FIN-WKSTN-01",
         "sha1": "",
-        "createdAt": "2026-11-24T13:00:00Z",
+        "createdAt": (rec.get("alertInfo") or {}).get("createdAt")
+        or rec.get("createdAt")
+        or "2026-11-24T13:00:00Z",
     }
     s1.list_users.return_value = [
         {
@@ -1590,6 +1592,138 @@ def test_s1_modals_on_mount_shutdown_guard_and_normal_focus(tmp_path: Path) -> N
             assert app.focused is del_modal.query_one("#s1-del-site-cancel-btn", Button)
             del_modal.query_one("#s1-del-site-cancel-btn", Button).press()
             await pilot.pause()
+
+    asyncio.run(_run())
+
+
+def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -> None:
+    s1 = _make_mock_s1_client()
+    s1.list_agents.return_value = [
+        {
+            "id": f"ag-{i:03d}",
+            "computerName": f"HOST-{i:03d}",
+            "osName": "Windows 11",
+            "lastIpToMgmt": "10.0.0.1",
+            "networkStatus": "connected",
+            "infected": False,
+            "siteName": "MDR-1001",
+            "createdAt": f"2026-11-25T{i // 60:02d}:{i % 60:02d}:00Z",
+        }
+        for i in [5, 119, 0, *range(1, 5), *range(6, 119)]
+    ]
+    s1.list_threats.return_value = [
+        {
+            "id": "th-old",
+            "threatInfo": {
+                "threatName": "OldThreat",
+                "analystVerdict": "undefined",
+                "incidentStatus": "unresolved",
+                "mitigationStatus": "active",
+                "sha1": "a" * 40,
+                "createdAt": "2026-11-24T01:00:00Z",
+            },
+            "agentRealtimeInfo": {"agentComputerName": "HOST-OLD", "siteName": "MDR-1001"},
+        },
+        {
+            "id": "th-newest",
+            "threatInfo": {
+                "threatName": "NewestThreat",
+                "analystVerdict": "undefined",
+                "incidentStatus": "unresolved",
+                "mitigationStatus": "active",
+                "sha1": "b" * 40,
+                "createdAt": "2026-11-25T12:00:00Z",
+            },
+            "agentRealtimeInfo": {"agentComputerName": "HOST-NEW", "siteName": "MDR-1001"},
+        },
+        {
+            "id": "th-mid",
+            "threatInfo": {
+                "threatName": "MidThreat",
+                "analystVerdict": "undefined",
+                "incidentStatus": "unresolved",
+                "mitigationStatus": "active",
+                "sha1": "c" * 40,
+                "createdAt": "2026-11-25T06:00:00Z",
+            },
+            "agentRealtimeInfo": {"agentComputerName": "HOST-MID", "siteName": "MSSP-2001"},
+        },
+    ]
+    s1.list_cloud_alerts.return_value = [
+        {
+            "id": "ca-old",
+            "alertInfo": {"alertId": "ca-old", "createdAt": "2026-11-24T08:00:00Z"},
+            "ruleInfo": {"name": "OldCloudRule", "severity": "Medium"},
+            "agentDetectionInfo": {"siteName": "MDR-1001", "agentComputerName": "HOST-1"},
+        },
+        {
+            "id": "ca-new",
+            "alertInfo": {"alertId": "ca-new", "createdAt": "2026-11-25T14:00:00Z"},
+            "ruleInfo": {"name": "NewCloudRule", "severity": "High"},
+            "agentDetectionInfo": {"siteName": "MDR-1001", "agentComputerName": "HOST-2"},
+        },
+    ]
+    s1.list_activities.return_value = [
+        {"id": "act-old", "primaryDescription": "Older Activity", "createdAt": "2026-11-24T09:00:00Z"},
+        {"id": "act-new", "primaryDescription": "Newer Activity", "createdAt": "2026-11-25T15:00:00Z"},
+    ]
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=s1,
+        dry_run=True,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(130, 38)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(SentinelOnePane)
+            table = pane.query_one("#s1-table", DoubleClickDataTable)
+
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert table.row_count == 120
+            assert "limit" not in s1.list_agents.call_args.kwargs
+            assert callable(s1.list_agents.call_args.kwargs.get("on_page"))
+            assert str(table.get_row_at(0)[0]) == "HOST-119"
+            assert str(table.get_row_at(119)[0]) == "HOST-000"
+
+            await pilot.click("#s1-wb-alerts-btn")
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [str(table.get_row_at(i)[0]) for i in range(3)] == [
+                "NewestThreat",
+                "MidThreat",
+                "OldThreat",
+            ]
+
+            pane.query_one("#s1-grouping-select", Select).value = "tier"
+            await pilot.pause()
+            assert "MDR" in str(table.get_row_at(0)[0])
+            assert "MSSP" in str(table.get_row_at(1)[0])
+
+            pane.query_one("#s1-grouping-select", Select).value = "flat"
+            pane.query_one("#s1-alert-source-select", Select).value = "cloud"
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [str(table.get_row_at(i)[0]) for i in range(2)] == [
+                "NewCloudRule",
+                "OldCloudRule",
+            ]
+
+            await pilot.click("#s1-wb-sites-btn")
+            await pilot.click("#s1-activities-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [str(table.get_row_at(i)[2]) for i in range(2)] == [
+                "Newer Activity",
+                "Older Activity",
+            ]
 
     asyncio.run(_run())
 

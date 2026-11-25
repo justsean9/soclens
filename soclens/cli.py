@@ -2496,7 +2496,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_agents.add_argument("--account-id", default=None, help="Filter by account ID(s)")
     p_s1_agents.add_argument("--site-id", default=None, help="Filter by site ID(s)")
     p_s1_agents.add_argument("--group-id", default=None, help="Filter by group ID(s)")
-    p_s1_agents.add_argument("--limit", type=int, default=100, help="Maximum agents to return")
+    p_s1_agents.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum agents to return (default: all; 0 for all)",
+    )
     p_s1_agents.add_argument("--move-to-site", dest="move_to_site", default=None, help="Move --ids to target site ID (Admin)")
     p_s1_agents.add_argument("--decommission", action="store_true", default=False, help="Decommission --ids (Admin)")
     p_s1_agents.add_argument("--fetch-logs", action="store_true", default=False, help="Fetch diagnostic logs for --ids")
@@ -2516,7 +2521,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_ag_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Filter by account ID(s)")
     p_s1_ag_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Filter by site ID(s)")
     p_s1_ag_list.add_argument("--group-id", default=argparse.SUPPRESS, help="Filter by group ID(s)")
-    p_s1_ag_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum agents to return")
+    p_s1_ag_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum agents to return (default: all; 0 for all)",
+    )
     p_s1_ag_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_s1_ag_logs = agents_sub.add_parser("fetch-logs", help="Fetch diagnostic logs from endpoints")
@@ -2565,7 +2575,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_threats.add_argument("--verdict", default=None, choices=sorted(ANALYST_VERDICTS), help="Analyst verdict filter")
     p_s1_threats.add_argument("--computer-name", default=None, help="Filter by endpoint hostname")
     p_s1_threats.add_argument("--timeline", default=None, help="Fetch timeline events for a specific threat ID")
-    p_s1_threats.add_argument("--limit", type=int, default=100, help="Maximum threats to return")
+    p_s1_threats.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum threats to return (default: all; 0 for all)",
+    )
     p_s1_threats.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_s1_triage = s1_sub.add_parser("triage", help="Update threat verdict, incident status, and/or add a note")
@@ -2603,7 +2618,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_excl.add_argument("--site-id", default=None, help="Site ID scope(s)")
     p_s1_excl.add_argument("--group-id", default=None, help="Group ID scope(s)")
     p_s1_excl.add_argument("--query", default=None, help="Filter listed exclusions by value substring")
-    p_s1_excl.add_argument("--limit", type=int, default=100, help="Maximum exclusions to return")
+    p_s1_excl.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum exclusions to return (default: all; 0 for all)",
+    )
     p_s1_excl.add_argument("--yes", action="store_true", default=False, help="Approve create/delete mutation")
     p_s1_excl.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without executing")
     p_s1_excl.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
@@ -2620,7 +2640,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_excl_list.add_argument("--include-children", action=argparse.BooleanOptionalAction, default=None, help="Include child exclusions")
     p_excl_list.add_argument("--modes", default=None, help="Comma-separated modes filter")
     p_excl_list.add_argument("--scopes", default=None, help="Comma-separated scopes filter")
-    p_excl_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum exclusions to return")
+    p_excl_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum exclusions to return (default: all; 0 for all)",
+    )
     p_excl_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_excl_create = excl_sub.add_parser("create", help="Create a scoped SentinelOne exclusion (Admin)")
@@ -2671,7 +2696,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_excl_clone.add_argument("--include-source-parents", action="store_true", default=False, help="Include inherited account/global source exclusions")
     p_excl_clone.add_argument("--rate-limit", type=float, default=MAX_EXCLUSION_CLONE_RPS, help="Max create requests/sec (capped at 15.0)")
     p_excl_clone.add_argument("--stop-on-error", action="store_true", default=False, help="Abort immediately on first failed exclusion")
-    p_excl_clone.add_argument("--limit", type=int, default=5000, help="Max exclusions to scan (default: 5000)")
+    p_excl_clone.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max exclusions to scan (default: all; 0 for all)",
+    )
     p_excl_clone.add_argument("--yes", action="store_true", default=False, help="Approve exclusion cloning")
     p_excl_clone.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview diff without POSTing")
     p_excl_clone.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
@@ -2686,7 +2716,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_block.add_argument("--site-id", default=None, help="Site ID scope(s)")
     p_s1_block.add_argument("--group-id", default=None, help="Group ID scope(s)")
     p_s1_block.add_argument("--query", default=None, help="Filter listed entries by hash substring")
-    p_s1_block.add_argument("--limit", type=int, default=100, help="Maximum entries to return")
+    p_s1_block.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum entries to return (default: all; 0 for all)",
+    )
     p_s1_block.add_argument("--yes", action="store_true", default=False, help="Approve add/remove mutation")
     p_s1_block.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without executing")
     p_s1_block.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
@@ -2697,7 +2732,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_blk_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Account ID scope(s)")
     p_blk_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Site ID scope(s)")
     p_blk_list.add_argument("--query", default=argparse.SUPPRESS, help="Filter by hash substring")
-    p_blk_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum entries to return")
+    p_blk_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum entries to return (default: all; 0 for all)",
+    )
     p_blk_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_blk_add = block_sub.add_parser("add", help="Add a SHA-1 hash to the blocklist (Admin)")
@@ -2736,7 +2776,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_sites.add_argument("--groups", action="store_true", default=False, help="List groups instead of sites")
     p_s1_sites.add_argument("--tier", default=None, help="Filter sites by resolved service tier (e.g. MDR, MSSP, Other)")
     p_s1_sites.add_argument("--query", default=None, help="Search query")
-    p_s1_sites.add_argument("--limit", type=int, default=100, help="Maximum items to return")
+    p_s1_sites.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum items to return (default: all; 0 for all)",
+    )
     p_s1_sites.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
     sites_sub = p_s1_sites.add_subparsers(dest="sites_action")
 
@@ -2747,7 +2792,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_site_list.add_argument("--site-id", default=None, help="Filter groups by site ID(s)")
     p_site_list.add_argument("--tier", default=argparse.SUPPRESS, help="Filter sites by tier")
     p_site_list.add_argument("--query", default=argparse.SUPPRESS, help="Search query")
-    p_site_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum items to return")
+    p_site_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum items to return (default: all; 0 for all)",
+    )
     p_site_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_site_create = sites_sub.add_parser("create", help="Create a new SentinelOne site (Admin)")
@@ -2865,7 +2915,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_usr_list.add_argument("--account-id", default=None, help="Filter by account ID(s)")
     p_usr_list.add_argument("--site-id", default=None, help="Filter by site ID(s)")
     p_usr_list.add_argument("--role-id", default=None, help="Filter by role ID(s)")
-    p_usr_list.add_argument("--limit", type=int, default=100, help="Maximum users to return")
+    p_usr_list.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum users to return (default: all; 0 for all)",
+    )
     p_usr_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_usr_create = users_sub.add_parser("create", help="Create a SentinelOne console user (Admin)")
@@ -2946,7 +3001,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_su_list.add_argument("--account-id", default=None, help="Filter by account ID(s)")
     p_su_list.add_argument("--site-id", default=None, help="Filter by site ID(s)")
     p_su_list.add_argument("--role-id", default=None, help="Filter by role ID(s)")
-    p_su_list.add_argument("--limit", type=int, default=100, help="Maximum service users to return")
+    p_su_list.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum service users to return (default: all; 0 for all)",
+    )
     p_su_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_su_create = su_sub.add_parser("create", help="Create a SentinelOne service user (Admin)")
@@ -2999,7 +3059,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_roles.add_argument("--predefined-role", action=argparse.BooleanOptionalAction, default=None, help="Filter predefined roles")
     p_s1_roles.add_argument("--name", default=None, help="Filter by exact role name")
     p_s1_roles.add_argument("--query", default=None, help="Search query")
-    p_s1_roles.add_argument("--limit", type=int, default=100, help="Maximum roles to return")
+    p_s1_roles.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum roles to return (default: all; 0 for all)",
+    )
     p_s1_roles.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
     roles_sub = p_s1_roles.add_subparsers(dest="roles_action")
     p_roles_list = roles_sub.add_parser("list", help="List SentinelOne RBAC roles")
@@ -3011,7 +3076,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_roles_list.add_argument("--predefined-role", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS, help="Filter predefined roles")
     p_roles_list.add_argument("--name", default=argparse.SUPPRESS, help="Filter by role name")
     p_roles_list.add_argument("--query", default=argparse.SUPPRESS, help="Search query")
-    p_roles_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum roles")
+    p_roles_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum roles (default: all; 0 for all)",
+    )
     p_roles_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_s1_ca = s1_sub.add_parser("cloud-alerts", help="List and triage SentinelOne Cloud/STAR detection alerts")
@@ -3027,7 +3097,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_ca.add_argument("--account-id", default=None, help="Account ID(s)")
     p_s1_ca.add_argument("--site-id", default=None, help="Site ID(s)")
     p_s1_ca.add_argument("--group-id", default=None, help="Group ID(s)")
-    p_s1_ca.add_argument("--limit", type=int, default=100, help="Maximum alerts to return")
+    p_s1_ca.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum alerts to return (default: all; 0 for all)",
+    )
     p_s1_ca.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
     ca_sub = p_s1_ca.add_subparsers(dest="cloud_alerts_action")
 
@@ -3044,7 +3119,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_ca_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Account ID(s)")
     p_ca_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Site ID(s)")
     p_ca_list.add_argument("--group-id", default=argparse.SUPPRESS, help="Group ID(s)")
-    p_ca_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum alerts")
+    p_ca_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum alerts (default: all; 0 for all)",
+    )
     p_ca_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_ca_verd = ca_sub.add_parser("verdict", help="Update analyst verdict on Cloud/STAR alert(s)")
@@ -3065,7 +3145,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_act.add_argument("--agent-id", default=None, help="Filter by agent ID")
     p_s1_act.add_argument("--threat-id", default=None, help="Filter by threat ID")
     p_s1_act.add_argument("--query", default=None, help="Filter by description substring")
-    p_s1_act.add_argument("--limit", type=int, default=100, help="Maximum activities to return")
+    p_s1_act.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum activities to return (default: all; 0 for all)",
+    )
     p_s1_act.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     # 7. Local LLM subcommand
@@ -6549,6 +6634,15 @@ def _build_s1_client(args: argparse.Namespace) -> SentinelOneClient:
     return SentinelOneClient(config=cfg)
 
 
+def _normalize_s1_limit(raw_limit: int | None) -> int | None:
+    """Normalize SentinelOne CLI ``--limit`` (``None`` or ``0`` means fetch all pages)."""
+    if raw_limit is None or raw_limit == 0:
+        return None
+    if raw_limit < 0:
+        raise ValueError("--limit must be 0 (all) or a positive integer.")
+    return int(raw_limit)
+
+
 def _check_s1_write_guard(
     args: argparse.Namespace,
     *,
@@ -6928,7 +7022,7 @@ def _handle_s1(
                 "is_active": getattr(args, "active", None),
                 "network_status": getattr(args, "network_status", None),
                 "os_types": getattr(args, "os_type", None),
-                "limit": getattr(args, "limit", 100),
+                "limit": _normalize_s1_limit(getattr(args, "limit", None)),
             }
             if getattr(args, "account_id", None):
                 list_kwargs["account_ids"] = _split_csv_arg(args.account_id)
@@ -7002,7 +7096,7 @@ def _handle_s1(
                 account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
                 site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
                 group_ids=_split_csv_arg(getattr(args, "group_id", None)) or None,
-                limit=getattr(args, "limit", 100),
+                limit=_normalize_s1_limit(getattr(args, "limit", None)),
             )
         if use_json:
             _emit_json(alerts)
@@ -7035,7 +7129,7 @@ def _handle_s1(
                         requests_per_second=rps,
                         include_source_parents=bool(args.include_source_parents),
                         continue_on_error=not bool(args.stop_on_error),
-                        limit=args.limit,
+                        limit=_normalize_s1_limit(getattr(args, "limit", None)),
                     )
                 if use_json:
                     _emit_json(plan)
@@ -7067,7 +7161,7 @@ def _handle_s1(
                     requests_per_second=rps,
                     include_source_parents=bool(args.include_source_parents),
                     continue_on_error=not bool(args.stop_on_error),
-                    limit=args.limit,
+                    limit=_normalize_s1_limit(getattr(args, "limit", None)),
                 )
             if use_json:
                 _emit_json(res)
@@ -7195,7 +7289,7 @@ def _handle_s1(
             excl_kwargs: dict[str, Any] = {
                 "exclusion_type": getattr(args, "exclusion_type", None),
                 "query": getattr(args, "query", None),
-                "limit": getattr(args, "limit", 100),
+                "limit": _normalize_s1_limit(getattr(args, "limit", None)),
             }
             if getattr(args, "filter_os_type", None):
                 excl_kwargs["os_types"] = _split_csv_arg(args.filter_os_type)
@@ -7322,7 +7416,7 @@ def _handle_s1(
         with _build_s1_client(args) as client:
             blk_kwargs: dict[str, Any] = {
                 "query": getattr(args, "query", None),
-                "limit": getattr(args, "limit", 100),
+                "limit": _normalize_s1_limit(getattr(args, "limit", None)),
             }
             if getattr(args, "filter_os_type", None):
                 blk_kwargs["os_types"] = _split_csv_arg(args.filter_os_type)
@@ -7633,12 +7727,13 @@ def _handle_s1(
             return 0
 
         # Read-only list (`s1 sites` or `s1 sites list`)
+        resolved_limit = _normalize_s1_limit(getattr(args, "limit", None))
         with _build_s1_client(args) as client:
             if bool(getattr(args, "accounts", False)):
-                items = client.list_accounts(query=args.query, limit=args.limit)
+                items = client.list_accounts(query=args.query, limit=resolved_limit)
                 kind = "accounts"
             elif bool(getattr(args, "groups", False)):
-                grp_kwargs: dict[str, Any] = {"query": args.query, "limit": args.limit}
+                grp_kwargs: dict[str, Any] = {"query": args.query, "limit": resolved_limit}
                 if getattr(args, "account_id", None):
                     grp_kwargs["account_ids"] = _split_csv_arg(args.account_id)
                 if getattr(args, "site_id", None):
@@ -7646,7 +7741,7 @@ def _handle_s1(
                 items = client.list_groups(**grp_kwargs)
                 kind = "groups"
             else:
-                site_kwargs: dict[str, Any] = {"query": args.query, "limit": args.limit}
+                site_kwargs: dict[str, Any] = {"query": args.query, "limit": resolved_limit}
                 if getattr(args, "account_id", None):
                     site_kwargs["account_ids"] = _split_csv_arg(args.account_id)
                 items = client.list_sites(**site_kwargs)
@@ -7919,7 +8014,7 @@ def _handle_s1(
                 account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
                 site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
                 role_ids=_split_csv_arg(getattr(args, "role_id", None)) or None,
-                limit=getattr(args, "limit", 100),
+                limit=_normalize_s1_limit(getattr(args, "limit", None)),
             )
         if use_json:
             _emit_json(users)
@@ -8065,7 +8160,7 @@ def _handle_s1(
                 account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
                 site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
                 role_ids=_split_csv_arg(getattr(args, "role_id", None)) or None,
-                limit=getattr(args, "limit", 100),
+                limit=_normalize_s1_limit(getattr(args, "limit", None)),
             )
         if use_json:
             _emit_json(sus)
@@ -8098,7 +8193,7 @@ def _handle_s1(
                 predefined_role=getattr(args, "predefined_role", None),
                 name=getattr(args, "name", None),
                 query=getattr(args, "query", None),
-                limit=getattr(args, "limit", 100),
+                limit=_normalize_s1_limit(getattr(args, "limit", None)),
             )
             if use_json:
                 _emit_json(roles)
@@ -8109,8 +8204,9 @@ def _handle_s1(
             return 0
 
         if subcmd == "threats":
+            resolved_limit = _normalize_s1_limit(getattr(args, "limit", None))
             if args.timeline:
-                events = client.get_threat_timeline(args.timeline, limit=args.limit)
+                events = client.get_threat_timeline(args.timeline, limit=resolved_limit)
                 if use_json:
                     _emit_json(events)
                 else:
@@ -8123,7 +8219,7 @@ def _handle_s1(
                 incident_statuses=args.status,
                 analyst_verdicts=args.verdict,
                 computer_name=args.computer_name,
-                limit=args.limit,
+                limit=resolved_limit,
             )
             if use_json:
                 _emit_json(threats)
@@ -8143,7 +8239,7 @@ def _handle_s1(
                 agent_ids=args.agent_id,
                 threat_ids=args.threat_id,
                 query=args.query,
-                limit=args.limit,
+                limit=_normalize_s1_limit(getattr(args, "limit", None)),
             )
             if use_json:
                 _emit_json(acts)

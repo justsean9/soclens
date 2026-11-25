@@ -2805,6 +2805,72 @@ class MockSentinelOneServer(_BaseV21MockServer):
                     offset = int(raw_cursor)
         return limit, offset
 
+    def _sort_items(
+        self,
+        items: Sequence[dict[str, Any]],
+        query: Mapping[str, list[str]],
+    ) -> list[dict[str, Any]]:
+        result = list(items)
+        sort_by = (query.get("sortBy") or [""])[0].strip()
+        if not sort_by:
+            return result
+        sort_order = ((query.get("sortOrder") or ["asc"])[0] or "asc").strip().lower()
+        descending = sort_order == "desc"
+
+        def _extract_field(item: Mapping[str, Any]) -> Any:
+            if sort_by == "alertInfoCreatedAt":
+                ai = item.get("alertInfo")
+                if isinstance(ai, Mapping) and ai.get("createdAt") is not None:
+                    return ai.get("createdAt")
+                return item.get("createdAt")
+            if sort_by == "alertInfoReportedAt":
+                ai = item.get("alertInfo")
+                if isinstance(ai, Mapping) and ai.get("reportedAt") is not None:
+                    return ai.get("reportedAt")
+            if sort_by in item and item.get(sort_by) is not None:
+                return item.get(sort_by)
+            for sub_key in (
+                "threatInfo",
+                "alertInfo",
+                "agentRealtimeInfo",
+                "agentDetectionInfo",
+                "ruleInfo",
+            ):
+                sub = item.get(sub_key)
+                if isinstance(sub, Mapping) and sub.get(sort_by) is not None:
+                    return sub.get(sort_by)
+            return None
+
+        from soclens.timezone import parse_iso_datetime
+
+        ts_fields = {
+            "createdAt",
+            "updatedAt",
+            "alertInfoCreatedAt",
+            "alertInfoReportedAt",
+            "lastActiveDate",
+            "registeredAt",
+            "dateJoined",
+        }
+        present: list[tuple[Any, int, dict[str, Any]]] = []
+        missing: list[dict[str, Any]] = []
+        for idx, item in enumerate(result):
+            val = _extract_field(item)
+            if val is None or str(val).strip() == "":
+                missing.append(item)
+            else:
+                if sort_by in ts_fields:
+                    parsed = parse_iso_datetime(val)
+                    key_val: Any = parsed[0].timestamp() if parsed is not None else str(val).lower()
+                elif isinstance(val, (int, float, bool)):
+                    key_val = val
+                else:
+                    key_val = str(val).lower()
+                present.append((key_val, idx, item))
+
+        present.sort(key=lambda entry: entry[0], reverse=descending)
+        return [entry[2] for entry in present] + missing
+
     def _paginate_items(
         self, items: Sequence[dict[str, Any]], limit: int, offset: int
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -2976,6 +3042,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
             q_str = (query.get("query") or [""])[0].strip().lower()
             if q_str:
                 accs = [a for a in accs if q_str in str(a.get("name", "")).lower()]
+            accs = self._sort_items(accs, query)
             data, pag = self._paginate_items(accs, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -2998,6 +3065,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                 q_str = (query.get("query") or [""])[0].strip().lower()
                 if q_str:
                     sites = [s for s in sites if q_str in str(s.get("name", "")).lower()]
+                sites = self._sort_items(sites, query)
                 sliced, pag = self._paginate_items(sites, limit, offset)
                 if self.state["sites_as_list"]:
                     return 200, {"data": sliced, "pagination": pag, "errors": []}, {}
@@ -3185,6 +3253,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
             q_str = (query.get("query") or [""])[0].strip().lower()
             if q_str:
                 groups = [g for g in groups if q_str in str(g.get("name", "")).lower()]
+            groups = self._sort_items(groups, query)
             data, pag = self._paginate_items(groups, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3225,6 +3294,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                         if q_str in str(u.get("email", "")).lower()
                         or q_str in str(u.get("fullName", "")).lower()
                     ]
+                users = self._sort_items(users, query)
                 data, pag = self._paginate_items(users, limit, offset)
                 return 200, {"data": data, "pagination": pag, "errors": []}, {}
             if method == "POST":
@@ -3298,7 +3368,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
 
         if subpath == "service-users":
             if method == "GET":
-                svc_users = list(self.state["service_users"])
+                svc_users = self._sort_items(self.state["service_users"], query)
                 data, pag = self._paginate_items(svc_users, limit, offset)
                 return 200, {"data": data, "pagination": pag, "errors": []}, {}
             if method == "POST":
@@ -3369,6 +3439,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
             if "name" in query and query["name"][0].strip():
                 nm = query["name"][0].strip().lower()
                 roles = [r for r in roles if r.get("name", "").lower() == nm]
+            roles = self._sort_items(roles, query)
             data, pag = self._paginate_items(roles, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3411,6 +3482,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                 if "value__contains" in query and query["value__contains"][0].strip():
                     sub = query["value__contains"][0].strip().lower()
                     excls = [ex for ex in excls if sub in str(ex.get("value", "")).lower()]
+                excls = self._sort_items(excls, query)
                 data, pag = self._paginate_items(excls, limit, offset)
                 return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3532,6 +3604,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                     for t in threats
                     if needle in json.dumps(t).lower()
                 ]
+            threats = self._sort_items(threats, query)
             data, pag = self._paginate_items(threats, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3540,7 +3613,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
             tid = m_tl.group(1)
             if not any(t["id"] == tid for t in self.state["threats"]):
                 return 404, self._s1_err(404001, "Threat not found", f"Unknown threat {tid}"), {}
-            events = list(self.state.get("timelines", {}).get(tid, []))
+            events = self._sort_items(self.state.get("timelines", {}).get(tid, []), query)
             data, pag = self._paginate_items(events, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3723,6 +3796,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                         )
                     ).lower()
                 ]
+            alerts = self._sort_items(alerts, query)
             data, pag = self._paginate_items(alerts, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3767,6 +3841,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                 agents = [ag for ag in agents if needle in json.dumps(ag).lower()]
             if subpath == "agents/count":
                 return 200, {"data": {"total": len(agents)}, "errors": []}, {}
+            agents = self._sort_items(agents, query)
             data, pag = self._paginate_items(agents, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3813,6 +3888,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
                 if "value__contains" in query and query["value__contains"][0].strip():
                     sub = query["value__contains"][0].strip().lower()
                     items = [r for r in items if sub in str(r.get("value", "")).lower()]
+                items = self._sort_items(items, query)
                 data, pag = self._paginate_items(items, limit, offset)
                 return 200, {"data": data, "pagination": pag, "errors": []}, {}
             if method == "POST":
@@ -3860,6 +3936,7 @@ class MockSentinelOneServer(_BaseV21MockServer):
             acc_f = set(_split_csv_param(query, "accountIds"))
             site_f = set(_split_csv_param(query, "siteIds"))
             acts = [a for a in acts if self._matches_scope(a, account_ids=acc_f, site_ids=site_f)]
+            acts = self._sort_items(acts, query)
             data, pag = self._paginate_items(acts, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
@@ -3905,7 +3982,8 @@ class MockSentinelOneServer(_BaseV21MockServer):
             dq = self.state["dv_queries"].get(qid)
             if dq is None:
                 return 404, self._s1_err(404001, "DV query not found", f"Unknown queryId {qid}"), {}
-            data, pag = self._paginate_items(dq["events"], limit, offset)
+            events = self._sort_items(dq["events"], query)
+            data, pag = self._paginate_items(events, limit, offset)
             return 200, {"data": data, "pagination": pag, "errors": []}, {}
 
         return 404, self._s1_err(404001, "Not found", f"Unknown endpoint: {method} {subpath}"), {}

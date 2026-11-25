@@ -37,6 +37,7 @@ from soclens.sentinelone import (
     SentinelOneError,
     SentinelOneRateLimitError,
     _sanitize_scope_roles,
+    sort_s1_records_newest_first,
 )
 from soclens.tui.filters import (
     S1_PRESETS_BY_VIEW,
@@ -246,6 +247,7 @@ class SentinelOnePane(BaseSocPane):
         self._timeframe_filter: str = "any"
         self._status_filter: str = "any"
         self._syncing_s1_filters: bool = False
+        self._load_seq: int = 0
 
     def _get_s1_client(self) -> SentinelOneClient:
         """Return an injected or freshly configured ``SentinelOneClient``."""
@@ -671,6 +673,7 @@ class SentinelOnePane(BaseSocPane):
         self._update_summary_bar()
 
     def _switch_view(self, val: str, *, sites_submode: str | None = None) -> None:
+        self._load_seq += 1
         self._current_view = val
         if sites_submode is not None:
             self._sites_submode = sites_submode
@@ -951,21 +954,21 @@ class SentinelOnePane(BaseSocPane):
         self._apply_local_filter()
 
     def _record_timestamp(self, rec: dict[str, Any]) -> Any:
-        if self._current_view == "threats":
-            raw_tinfo = rec.get("threatInfo")
-            tinfo: dict[str, Any] = raw_tinfo if isinstance(raw_tinfo, dict) else {}
-            raw_alert = rec.get("alertInfo")
-            alert_info: dict[str, Any] = raw_alert if isinstance(raw_alert, dict) else {}
-            return (
-                rec.get("createdAt")
-                or tinfo.get("createdAt")
-                or alert_info.get("createdAt")
-                or tinfo.get("updatedAt")
-                or rec.get("updatedAt")
-            )
-        if self._current_view == "sites_activities":
-            return rec.get("createdAt") or rec.get("updatedAt")
-        return rec.get("updatedAt") or rec.get("createdAt")
+        raw_tinfo = rec.get("threatInfo")
+        tinfo: dict[str, Any] = raw_tinfo if isinstance(raw_tinfo, dict) else {}
+        raw_alert = rec.get("alertInfo")
+        alert_info: dict[str, Any] = raw_alert if isinstance(raw_alert, dict) else {}
+        return (
+            rec.get("createdAt")
+            or tinfo.get("createdAt")
+            or alert_info.get("createdAt")
+            or alert_info.get("reportedAt")
+            or rec.get("updatedAt")
+            or tinfo.get("updatedAt")
+            or rec.get("lastActiveDate")
+            or rec.get("registeredAt")
+            or rec.get("dateJoined")
+        )
 
     def _record_matches_status(self, rec: dict[str, Any]) -> bool:
         if self._status_filter == "any":
@@ -1153,6 +1156,7 @@ class SentinelOnePane(BaseSocPane):
             if query and query not in json.dumps(rec, default=str).lower():
                 continue
             filtered.append(rec)
+        filtered = sort_s1_records_newest_first(filtered)
         self._filtered_records = filtered
         self._table_rows = self._build_grouped_threat_rows(filtered)
 
@@ -2645,7 +2649,12 @@ class SentinelOnePane(BaseSocPane):
         try:
             with self.log_scope("sentinelone"):
                 client = self._get_s1_client()
-                sites = client.list_sites(limit=100)
+
+                def _on_site_page(loaded: int, total: int | None) -> None:
+                    suffix = f"{loaded}/{total}" if total is not None else f"{loaded}"
+                    self.set_status(f"Loading SentinelOne sites... ({suffix} loaded)")
+
+                sites = client.list_sites(on_page=_on_site_page)
             self.run_on_ui(self._populate_site_selector, sites)
             self.set_status(f"Loaded {len(sites)} site(s) into Multi-Site Scope Selector.")
         except Exception as exc:
@@ -2653,58 +2662,76 @@ class SentinelOnePane(BaseSocPane):
 
     @work(thread=True, exit_on_error=False)
     def _load_view_worker(self, view: str, submode: str = "sites") -> None:
+        self._load_seq += 1
+        my_seq = self._load_seq
         try:
             self.set_status(f"Loading SentinelOne {view}...")
             site_filter = sorted(self._selected_site_ids) if self._selected_site_ids else None
+
+            def _on_page(loaded: int, total: int | None) -> None:
+                if my_seq != self._load_seq:
+                    return
+                suffix = f"{loaded}/{total}" if total is not None else f"{loaded}"
+                self.set_status(f"Loading SentinelOne {view}... ({suffix} loaded)")
+
             with self.log_scope("sentinelone"):
                 client = self._get_s1_client()
                 if view == "endpoints":
-                    records = client.list_agents(site_ids=site_filter, limit=100)
+                    records = client.list_agents(site_ids=site_filter, on_page=_on_page)
                 elif view == "threats":
                     if self._alert_source == "cloud":
-                        raw_cloud = client.list_cloud_alerts(site_ids=site_filter, limit=100)
-                        records = [
-                            client.normalize_alert(c, source_kind="cloud_alert")
-                            for c in raw_cloud
-                        ]
+                        raw_cloud = client.list_cloud_alerts(
+                            site_ids=site_filter,
+                            on_page=_on_page,
+                        )
+                        records = sort_s1_records_newest_first(
+                            [client.normalize_alert(c, source_kind="cloud_alert") for c in raw_cloud]
+                        )
                     elif self._alert_source == "unified":
                         records = client.list_unified_alerts(
                             site_ids=site_filter,
                             sites=self._cached_sites or None,
-                            limit=100,
+                            on_page=_on_page,
                         )
                     else:
-                        records = client.list_threats(site_ids=site_filter, limit=100)
+                        records = client.list_threats(site_ids=site_filter, on_page=_on_page)
                 elif view == "exclusions":
-                    records = client.list_exclusions(site_ids=site_filter, limit=100)
+                    records = client.list_exclusions(site_ids=site_filter, on_page=_on_page)
                 elif view == "blocklist":
-                    records = client.list_blocklist(site_ids=site_filter, limit=100)
+                    records = client.list_blocklist(site_ids=site_filter, on_page=_on_page)
                 elif view == "users_rbac":
                     mode = submode if submode in {"console", "service", "roles"} else self._users_submode
                     if mode == "service":
-                        raw = client.list_service_users(site_ids=site_filter, limit=100)
+                        raw = client.list_service_users(site_ids=site_filter, on_page=_on_page)
                         records = [{**item, "_s1_user_kind": "Service User"} for item in raw]
                     elif mode == "roles":
-                        raw = client.list_rbac_roles(site_ids=site_filter, limit=100)
+                        raw = client.list_rbac_roles(site_ids=site_filter, on_page=_on_page)
+                        if my_seq != self._load_seq:
+                            return
                         self._cached_roles = list(raw)
                         records = [{**item, "_s1_user_kind": "RBAC Role"} for item in raw]
                     else:
-                        raw = client.list_users(site_ids=site_filter, limit=100)
+                        raw = client.list_users(site_ids=site_filter, on_page=_on_page)
                         records = [{**item, "_s1_user_kind": "Console User"} for item in raw]
                 elif submode == "activities":
-                    raw = client.list_activities(site_ids=site_filter, limit=100)
+                    raw = client.list_activities(site_ids=site_filter, on_page=_on_page)
                     records = [{**item, "_s1_kind": "activity"} for item in raw]
                 else:
-                    raw = client.list_sites(limit=100)
+                    raw = client.list_sites(on_page=_on_page)
                     records = [{**item, "_s1_kind": "site"} for item in raw]
+                    if my_seq != self._load_seq:
+                        return
                     self.run_on_ui(self._populate_site_selector, raw)
 
+            if my_seq != self._load_seq:
+                return
             self.run_on_ui(self._populate_table, records)
             msg = f"Loaded {len(records)} SentinelOne {view} record(s)."
             self.set_status(msg)
             self.append_log(msg)
         except Exception as exc:
-            self._report_s1_error(f"SentinelOne Load ({view})", exc)
+            if my_seq == self._load_seq:
+                self._report_s1_error(f"SentinelOne Load ({view})", exc)
 
     @work(thread=True, exit_on_error=False)
     def _endpoint_action_worker(self, action_key: str, agent_id: str, hostname: str) -> None:

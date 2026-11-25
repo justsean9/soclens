@@ -1378,4 +1378,193 @@ def test_mutation_guardrail_collapses_slashes_and_blocks_filterless_exclusions_r
     sess.request.assert_not_called()
 
 
+def test_paginate_unlimited_fetches_all_pages_beyond_1000_with_limit_100() -> None:
+    sess = MagicMock(spec=requests.Session)
+    sess.headers = {}
+    pages = []
+    for p in range(12):
+        start = p * 100
+        end = start + (50 if p == 11 else 100)
+        next_cur = f"cur-{p + 1}" if p < 11 else None
+        pages.append(
+            _mock_response(
+                200,
+                {
+                    "data": [
+                        {
+                            "id": f"ag-{i:04d}",
+                            "createdAt": f"2026-11-25T{i // 60:02d}:{i % 60:02d}:00Z",
+                        }
+                        for i in range(start, end)
+                    ],
+                    "pagination": {"nextCursor": next_cur, "totalItems": 1150},
+                },
+            )
+        )
+    sess.request.side_effect = pages
+    progress_calls: list[tuple[int, int | None]] = []
+
+    client = _make_client(sess)
+    agents = client.list_agents(on_page=lambda loaded, total: progress_calls.append((loaded, total)))
+
+    assert len(agents) == 1150
+    assert sess.request.call_count == 12
+    assert all(call.kwargs["params"]["limit"] == 100 for call in sess.request.call_args_list)
+    assert all(
+        call.kwargs["params"]["sortBy"] == "createdAt"
+        and call.kwargs["params"]["sortOrder"] == "desc"
+        for call in sess.request.call_args_list
+    )
+    assert progress_calls[0] == (100, 1150)
+    assert progress_calls[-1] == (1150, 1150)
+    assert agents[0]["id"] == "ag-1149"
+    assert agents[-1]["id"] == "ag-0000"
+
+
+def test_all_list_methods_default_to_newest_first_sort_params() -> None:
+    sess = MagicMock(spec=requests.Session)
+    sess.headers = {}
+    sess.request.return_value = _mock_response(200, {"data": [], "pagination": {"nextCursor": None}})
+    client = _make_client(sess)
+
+    calls: list[tuple[str, Any, str]] = [
+        ("accounts", lambda: client.list_accounts(), "createdAt"),
+        ("sites", lambda: client.list_sites(), "createdAt"),
+        ("groups", lambda: client.list_groups(), "createdAt"),
+        ("agents", lambda: client.list_agents(), "createdAt"),
+        ("threats", lambda: client.list_threats(), "createdAt"),
+        ("timeline", lambda: client.get_threat_timeline("th-1"), "createdAt"),
+        ("cloud-alerts", lambda: client.list_cloud_alerts(), "alertInfoCreatedAt"),
+        ("exclusions", lambda: client.list_exclusions(), "createdAt"),
+        ("blocklist", lambda: client.list_blocklist(), "createdAt"),
+        ("users", lambda: client.list_users(), "createdAt"),
+        ("service-users", lambda: client.list_service_users(), "createdAt"),
+        ("rbac-roles", lambda: client.list_rbac_roles(), "createdAt"),
+        ("activities", lambda: client.list_activities(), "createdAt"),
+        ("dv-events", lambda: client.get_dv_events("q-1"), "createdAt"),
+    ]
+    for label, fn, expected_sort_by in calls:
+        sess.request.reset_mock()
+        fn()
+        params = sess.request.call_args.kwargs["params"]
+        assert params["sortBy"] == expected_sort_by, label
+        assert params["sortOrder"] == "desc", label
+        assert params["limit"] == 100, label
+
+    with pytest.raises(ValueError, match="Invalid sort_order"):
+        client.list_threats(sort_order="sideways")
+
+    sess.request.reset_mock()
+    client.list_threats(limit=50, sort_order="asc")
+    params_asc = sess.request.call_args.kwargs["params"]
+    assert params_asc["limit"] == 50
+    assert params_asc["sortBy"] == "createdAt"
+    assert params_asc["sortOrder"] == "asc"
+
+
+def test_sort_s1_records_newest_first_handles_mixed_formats_nested_and_missing() -> None:
+    from soclens.sentinelone import sort_s1_records_newest_first
+
+    records = [
+        {"id": "no-ts-1", "name": "alpha"},
+        {"id": "old-utc", "createdAt": "2026-11-24T10:00:00Z"},
+        {
+            "id": "newest-offset",
+            "threatInfo": {"createdAt": "2026-11-25T05:30:00+02:00"},  # 03:30Z
+        },
+        {
+            "id": "middle-cloud",
+            "alertInfo": {"createdAt": "2026-11-25T02:00:00.123456Z"},
+        },
+        {"id": "no-ts-2", "name": "beta"},
+    ]
+    ordered = sort_s1_records_newest_first(records)
+    assert [r["id"] for r in ordered] == [
+        "newest-offset",
+        "middle-cloud",
+        "old-utc",
+        "no-ts-1",
+        "no-ts-2",
+    ]
+    untimestamped = sort_s1_records_newest_first([{"id": "b"}, {"id": "a"}])
+    assert [r["id"] for r in untimestamped] == ["b", "a"]
+
+
+def test_paginate_safety_guards_cycles_null_cursor_and_sparse_empty_pages() -> None:
+    sess = MagicMock(spec=requests.Session)
+    sess.headers = {}
+    sess.request.side_effect = [
+        _mock_response(200, {"data": [{"id": "1"}], "pagination": {"nextCursor": "repeat"}}),
+        _mock_response(200, {"data": [{"id": "2"}], "pagination": {"nextCursor": "repeat"}}),
+    ]
+    client = _make_client(sess)
+    assert [r["id"] for r in client.list_agents()] == ["1", "2"]
+    assert sess.request.call_count == 2
+
+    sess.request.reset_mock()
+    sess.request.side_effect = [
+        _mock_response(200, {"data": [{"id": "1"}], "pagination": {"nextCursor": "null"}}),
+    ]
+    assert [r["id"] for r in client.list_agents()] == ["1"]
+    assert sess.request.call_count == 1
+
+    sess.request.reset_mock()
+    sess.request.side_effect = [
+        _mock_response(200, {"data": [], "pagination": {"nextCursor": "c2"}}),
+        _mock_response(200, {"data": [{"id": "2"}], "pagination": {"nextCursor": None}}),
+    ]
+    assert [r["id"] for r in client.list_agents()] == ["2"]
+    assert sess.request.call_count == 2
+
+    sess.request.reset_mock()
+    sess.request.side_effect = [
+        _mock_response(200, {"data": [], "pagination": {"nextCursor": f"c{i}"}})
+        for i in range(1, 8)
+    ]
+    assert client.list_agents() == []
+    assert sess.request.call_count == 5
+
+
+def test_cli_s1_limit_defaults_to_all_and_accepts_zero_or_positive(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.list_agents.return_value = []
+    mock_client.list_threats.return_value = []
+    mock_client.list_sites.return_value = []
+    mock_client.list_activities.return_value = []
+    mock_client.list_cloud_alerts.return_value = []
+
+    with patch("soclens.cli._build_s1_client", return_value=mock_client):
+        assert _run_cli(["--json", "s1", "agents"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_agents.call_args.kwargs["limit"] is None
+
+        assert _run_cli(["--json", "s1", "agents", "--limit", "0"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_agents.call_args.kwargs["limit"] is None
+
+        assert _run_cli(["--json", "s1", "agents", "--limit", "25"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_agents.call_args.kwargs["limit"] == 25
+
+        assert _run_cli(["--json", "s1", "threats"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_threats.call_args.kwargs["limit"] is None
+
+        assert _run_cli(["--json", "s1", "sites"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_sites.call_args.kwargs["limit"] is None
+
+        assert _run_cli(["--json", "s1", "activities"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_activities.call_args.kwargs["limit"] is None
+
+        assert _run_cli(["--json", "s1", "cloud-alerts"], monkeypatch) == 0
+        capsys.readouterr()
+        assert mock_client.list_cloud_alerts.call_args.kwargs["limit"] is None
+
+
 

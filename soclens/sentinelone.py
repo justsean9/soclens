@@ -8,7 +8,7 @@ import random
 import re
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -26,10 +26,24 @@ from soclens.config import (
     get_sentinelone_config,
     suppress_insecure_ssl_warnings,
 )
+from soclens.timezone import parse_iso_datetime
 
 logger = logging.getLogger("soclens.sentinelone")
 
 API_PREFIX = "/web/api/v2.1"
+MAX_PAGE_SIZE: int = 100
+SORT_ORDERS: frozenset[str] = frozenset({"asc", "desc"})
+_TIMESTAMP_SORT_FIELDS: frozenset[str] = frozenset(
+    {
+        "createdAt",
+        "updatedAt",
+        "alertInfoCreatedAt",
+        "alertInfoReportedAt",
+        "lastActiveDate",
+        "registeredAt",
+        "dateJoined",
+    }
+)
 _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 _SHA1_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -466,6 +480,72 @@ def _sanitize_scope_roles(
     return role_templates
 
 
+def _extract_record_timestamp(rec: Mapping[str, Any]) -> Any:
+    """Extract the most relevant creation/activity timestamp from any SentinelOne record."""
+    raw_tinfo = rec.get("threatInfo")
+    tinfo: Mapping[str, Any] = raw_tinfo if isinstance(raw_tinfo, Mapping) else {}
+    raw_ainfo = rec.get("alertInfo")
+    ainfo: Mapping[str, Any] = raw_ainfo if isinstance(raw_ainfo, Mapping) else {}
+    for candidate in (
+        rec.get("createdAt"),
+        tinfo.get("createdAt"),
+        ainfo.get("createdAt"),
+        ainfo.get("reportedAt"),
+        rec.get("updatedAt"),
+        tinfo.get("updatedAt"),
+        rec.get("lastActiveDate"),
+        rec.get("registeredAt"),
+        rec.get("dateJoined"),
+    ):
+        if candidate is not None and str(candidate).strip():
+            return candidate
+    return None
+
+
+def sort_s1_records_newest_first(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    descending: bool = True,
+) -> list[dict[str, Any]]:
+    """Return copies of SentinelOne records sorted by timestamp (newest-first by default).
+
+    Records without parseable timestamps are placed after timestamped records while
+    preserving their relative order.
+    """
+    copied = [dict(rec) for rec in records]
+    if len(copied) <= 1:
+        return copied
+
+    def _sort_key(rec: dict[str, Any]) -> tuple[int, float]:
+        parsed = parse_iso_datetime(_extract_record_timestamp(rec))
+        if parsed is None:
+            return (1, 0.0)
+        ts = parsed[0].timestamp()
+        return (0, -ts if descending else ts)
+
+    copied.sort(key=_sort_key)
+    return copied
+
+
+def _apply_sort_params(
+    params: dict[str, Any],
+    *,
+    sort_by: str | None,
+    sort_order: str | None,
+) -> tuple[str | None, str]:
+    """Validate and apply SentinelOne ``sortBy`` and ``sortOrder`` query parameters."""
+    clean_order = (sort_order if sort_order is not None else "desc").strip().lower()
+    if clean_order not in SORT_ORDERS:
+        raise ValueError(
+            f"Invalid sort_order {sort_order!r}. Expected one of: {', '.join(sorted(SORT_ORDERS))}."
+        )
+    clean_by = sort_by.strip() if isinstance(sort_by, str) and sort_by.strip() else None
+    if clean_by is not None:
+        params["sortBy"] = clean_by
+    params["sortOrder"] = clean_order
+    return clean_by, clean_order
+
+
 class SentinelOneClient:
     """Thread-safe client for SentinelOne Management API v2.1."""
 
@@ -732,27 +812,38 @@ class SentinelOneClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
-        limit: int = 100,
-        max_pages: int = 20,
+        limit: int | None = None,
+        max_pages: int | None = None,
         nested_data_key: str | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Iterate SentinelOne cursor-paginated endpoints until exhausted or ``limit`` reached."""
         collected: list[dict[str, Any]] = []
         cursor: str | None = None
-        target_limit = max(1, int(limit))
-        pages = max(1, int(max_pages))
+        target_limit: int | None = max(1, int(limit)) if limit is not None else None
+        page_cap: int | None = max(1, int(max_pages)) if max_pages is not None else None
         base_params = dict(params or {})
+        seen_cursors: set[str] = set()
+        consecutive_empty_pages = 0
+        page_count = 0
 
-        for _ in range(pages):
-            remaining = target_limit - len(collected)
-            if remaining <= 0:
-                break
+        while page_cap is None or page_count < page_cap:
+            if target_limit is not None:
+                remaining = target_limit - len(collected)
+                if remaining <= 0:
+                    break
+                page_limit = min(MAX_PAGE_SIZE, remaining)
+            else:
+                page_limit = MAX_PAGE_SIZE
+
             page_params = dict(base_params)
-            page_params["limit"] = min(100, remaining)
+            page_params["limit"] = page_limit
             if cursor:
                 page_params["cursor"] = cursor
 
             payload = self._request("GET", path, params=page_params)
+            page_count += 1
+
             raw_data = payload.get("data")
             items: list[Any]
             if isinstance(raw_data, list):
@@ -763,19 +854,61 @@ class SentinelOneClient:
             else:
                 items = []
 
+            page_added = 0
             for item in items:
                 if isinstance(item, dict):
                     collected.append(item)
-                    if len(collected) >= target_limit:
+                    page_added += 1
+                    if target_limit is not None and len(collected) >= target_limit:
                         break
 
             pagination = payload.get("pagination")
-            next_cursor = (
-                pagination.get("nextCursor") if isinstance(pagination, dict) else None
-            )
-            if not next_cursor or not items or len(collected) >= target_limit:
+            total_items: int | None = None
+            if isinstance(pagination, dict):
+                raw_total = pagination.get("totalItems")
+                if raw_total is not None and not isinstance(raw_total, bool):
+                    try:
+                        total_items = int(raw_total)
+                    except (TypeError, ValueError):
+                        total_items = None
+
+            if on_page is not None:
+                on_page(len(collected), total_items)
+
+            if target_limit is not None and len(collected) >= target_limit:
                 break
-            cursor = str(next_cursor)
+
+            raw_next = pagination.get("nextCursor") if isinstance(pagination, dict) else None
+            next_cursor = str(raw_next).strip() if raw_next is not None else ""
+            if not next_cursor or next_cursor.lower() == "null":
+                break
+            if next_cursor in seen_cursors:
+                logger.warning(
+                    "SentinelOne %s pagination repeated cursor %r; stopping to avoid loop.",
+                    path,
+                    next_cursor,
+                )
+                break
+            seen_cursors.add(next_cursor)
+
+            if page_added == 0:
+                consecutive_empty_pages += 1
+                if consecutive_empty_pages >= 5:
+                    logger.warning(
+                        "SentinelOne %s returned %d consecutive empty pages with nextCursor; stopping.",
+                        path,
+                        consecutive_empty_pages,
+                    )
+                    break
+            else:
+                consecutive_empty_pages = 0
+
+            cursor = next_cursor
+
+        sort_by = str(base_params.get("sortBy") or "").strip()
+        if sort_by in _TIMESTAMP_SORT_FIELDS:
+            descending = str(base_params.get("sortOrder") or "desc").strip().lower() != "asc"
+            collected = sort_s1_records_newest_first(collected, descending=descending)
 
         return collected
 
@@ -842,22 +975,35 @@ class SentinelOneClient:
         self,
         *,
         query: str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne accounts visible to the configured API token."""
         params: dict[str, Any] = {}
         if query and query.strip():
             params["query"] = query.strip()
-        return self._paginate("accounts", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "accounts",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def list_sites(
         self,
         *,
         account_ids: Sequence[str] | str | None = None,
         query: str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne sites (handles both list and ``data.sites`` response shapes)."""
         params: dict[str, Any] = {}
@@ -866,12 +1012,14 @@ class SentinelOneClient:
             params["accountIds"] = acc
         if query and query.strip():
             params["query"] = query.strip()
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
         return self._paginate(
             "sites",
             params=params,
             limit=limit,
             max_pages=max_pages,
             nested_data_key="sites",
+            on_page=on_page,
         )
 
     def get_site(self, site_id: str) -> dict[str, Any]:
@@ -1150,14 +1298,24 @@ class SentinelOneClient:
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
         query: str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne endpoint groups."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
         if query and query.strip():
             params["query"] = query.strip()
-        return self._paginate("groups", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "groups",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     # ------------------------------------------------------------------
     # Agents / Endpoints
@@ -1175,8 +1333,11 @@ class SentinelOneClient:
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
         group_ids: Sequence[str] | str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne agents/endpoints with optional filters."""
         params = self._scope_params(
@@ -1197,7 +1358,14 @@ class SentinelOneClient:
         os_csv = _csv_param(os_types)
         if os_csv:
             params["osTypes"] = os_csv
-        return self._paginate("agents", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "agents",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         """Fetch a single SentinelOne agent by ID."""
@@ -1389,8 +1557,11 @@ class SentinelOneClient:
         computer_name: str | None = None,
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne threats with optional incident/verdict/query filters."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
@@ -1406,23 +1577,37 @@ class SentinelOneClient:
             params["analystVerdicts"] = verdict_csv
         if resolved is not None:
             params["resolved"] = str(bool(resolved)).lower()
-        return self._paginate("threats", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "threats",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def get_threat_timeline(
         self,
         threat_id: str,
         *,
-        limit: int = 100,
-        max_pages: int = 5,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Retrieve timeline events for a specific SentinelOne threat."""
         clean_id = threat_id.strip()
         if not clean_id:
             raise ValueError("threat_id must be non-empty.")
+        params: dict[str, Any] = {}
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
         return self._paginate(
             f"threats/{clean_id}/timeline",
+            params=params,
             limit=limit,
             max_pages=max_pages,
+            on_page=on_page,
         )
 
     def update_threat_verdict(
@@ -1544,8 +1729,11 @@ class SentinelOneClient:
         ids: Sequence[str] | str | None = None,
         created_after: str | None = None,
         created_before: str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "alertInfoCreatedAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne Cloud/STAR detection alerts (``/cloud-detection/alerts``)."""
         params = self._scope_params(
@@ -1625,11 +1813,13 @@ class SentinelOneClient:
         if os_csv:
             params["osType"] = os_csv
 
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
         return self._paginate(
             "cloud-detection/alerts",
             params=params,
             limit=limit,
             max_pages=max_pages,
+            on_page=on_page,
         )
 
     def update_cloud_alert_verdict(
@@ -1845,16 +2035,37 @@ class SentinelOneClient:
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
         sites: Sequence[Mapping[str, Any]] | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch and normalize endpoint threats and/or Cloud/STAR alerts together."""
+        clean_order = sort_order.strip().lower()
+        if clean_order not in SORT_ORDERS:
+            raise ValueError(
+                f"Invalid sort_order {sort_order!r}. Expected one of: {', '.join(sorted(SORT_ORDERS))}."
+            )
+
         site_lookup: dict[str, Mapping[str, Any]] = {}
         if sites:
             for site in sites:
                 sid = str(site.get("id") or "").strip()
                 if sid:
                     site_lookup[sid] = site
+
+        loaded_counts = {"threats": 0, "cloud": 0}
+        total_counts: dict[str, int | None] = {"threats": None, "cloud": None}
+
+        def _emit_unified_progress(source: str, count: int, total: int | None) -> None:
+            loaded_counts[source] = count
+            total_counts[source] = total
+            if on_page is None:
+                return
+            combined_loaded = loaded_counts["threats"] + loaded_counts["cloud"]
+            known_totals = [t for t in total_counts.values() if t is not None]
+            combined_total = sum(known_totals) if known_totals else None
+            on_page(combined_loaded, combined_total)
 
         unified: list[dict[str, Any]] = []
         if include_threats:
@@ -1864,8 +2075,14 @@ class SentinelOneClient:
                 analyst_verdicts=analyst_verdicts,
                 account_ids=account_ids,
                 site_ids=site_ids,
+                sort_order=clean_order,
                 limit=limit,
                 max_pages=max_pages,
+                on_page=(
+                    (lambda cnt, tot: _emit_unified_progress("threats", cnt, tot))
+                    if on_page is not None
+                    else None
+                ),
             )
             for item in threats:
                 unified.append(
@@ -1878,15 +2095,20 @@ class SentinelOneClient:
                 analyst_verdicts=analyst_verdicts,
                 account_ids=account_ids,
                 site_ids=site_ids,
+                sort_order=clean_order,
                 limit=limit,
                 max_pages=max_pages,
+                on_page=(
+                    (lambda cnt, tot: _emit_unified_progress("cloud", cnt, tot))
+                    if on_page is not None
+                    else None
+                ),
             )
             for item in cloud:
                 unified.append(
                     self.normalize_alert(item, source_kind="cloud_alert", site_lookup=site_lookup)
                 )
-        unified.sort(key=lambda r: str(r.get("createdAt") or ""), reverse=True)
-        return unified
+        return sort_s1_records_newest_first(unified, descending=(clean_order == "desc"))
 
     def group_alerts(
         self,
@@ -1943,8 +2165,11 @@ class SentinelOneClient:
         include_children: bool | None = None,
         modes: Sequence[str] | str | None = None,
         scopes: Sequence[str] | str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne exclusions with optional hierarchy/mode/scope filters."""
         params = self._scope_params(
@@ -1969,7 +2194,14 @@ class SentinelOneClient:
         scopes_csv = _csv_param(scopes)
         if scopes_csv:
             params["scopes"] = scopes_csv
-        return self._paginate("exclusions", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "exclusions",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def create_exclusion(
         self,
@@ -2161,8 +2393,8 @@ class SentinelOneClient:
         *,
         source_site_name: str | None = None,
         include_source_parents: bool = False,
-        limit: int = 5000,
-        max_pages: int = 50,
+        limit: int | None = None,
+        max_pages: int | None = None,
     ) -> dict[str, Any]:
         """Compute a dry-run diff plan for cloning exclusions from source to target site."""
         src_id = source_site_id.strip()
@@ -2290,8 +2522,8 @@ class SentinelOneClient:
         requests_per_second: float = MAX_EXCLUSION_CLONE_RPS,
         include_source_parents: bool = False,
         continue_on_error: bool = True,
-        limit: int = 5000,
-        max_pages: int = 50,
+        limit: int | None = None,
+        max_pages: int | None = None,
     ) -> dict[str, Any]:
         """Clone site exclusions from ``source_site_id`` to ``target_site_id`` at ``<= 15`` req/s."""
         rps = float(requests_per_second)
@@ -2373,8 +2605,11 @@ class SentinelOneClient:
         os_types: Sequence[str] | str | None = None,
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne SHA-1 blocklist (``black_hash``) entries."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
@@ -2384,7 +2619,14 @@ class SentinelOneClient:
             params["osTypes"] = os_csv
         if query and query.strip():
             params["value__contains"] = query.strip()
-        return self._paginate("restrictions", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "restrictions",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def add_to_blocklist(
         self,
@@ -2503,8 +2745,11 @@ class SentinelOneClient:
         site_ids: Sequence[str] | str | None = None,
         role_ids: Sequence[str] | str | None = None,
         two_fa_enabled: bool | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne console users."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
@@ -2519,7 +2764,14 @@ class SentinelOneClient:
             params["roleIds"] = roles_csv
         if two_fa_enabled is not None:
             params["twoFaEnabled"] = str(bool(two_fa_enabled)).lower()
-        return self._paginate("users", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "users",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def get_user(self, user_id: str) -> dict[str, Any]:
         """Fetch a single SentinelOne console user by ID."""
@@ -2667,8 +2919,11 @@ class SentinelOneClient:
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
         role_ids: Sequence[str] | str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne service users."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
@@ -2677,7 +2932,14 @@ class SentinelOneClient:
         roles_csv = _csv_param(role_ids)
         if roles_csv:
             params["roleIds"] = roles_csv
-        return self._paginate("service-users", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "service-users",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def get_service_user(self, service_user_id: str) -> dict[str, Any]:
         """Fetch a single SentinelOne service user by ID."""
@@ -2801,8 +3063,11 @@ class SentinelOneClient:
         predefined_role: bool | None = None,
         name: str | None = None,
         query: str | None = None,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne RBAC roles."""
         params = self._scope_params(
@@ -2820,7 +3085,14 @@ class SentinelOneClient:
             params["name"] = name.strip()
         if query and query.strip():
             params["query"] = query.strip()
-        return self._paginate("rbac/roles", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "rbac/roles",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def clone_user_permissions(
         self,
@@ -2866,8 +3138,11 @@ class SentinelOneClient:
         query: str | None = None,
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
-        limit: int = 100,
-        max_pages: int = 5,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """List SentinelOne audit/activity log entries."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
@@ -2882,7 +3157,14 @@ class SentinelOneClient:
             params["threatIds"] = th_csv
         if query and query.strip():
             params["primaryDescription__contains"] = query.strip()
-        return self._paginate("activities", params=params, limit=limit, max_pages=max_pages)
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
+        return self._paginate(
+            "activities",
+            params=params,
+            limit=limit,
+            max_pages=max_pages,
+            on_page=on_page,
+        )
 
     def create_dv_query(
         self,
@@ -2929,18 +3211,24 @@ class SentinelOneClient:
         self,
         query_id: str,
         *,
-        limit: int = 100,
-        max_pages: int = 10,
+        sort_by: str | None = "createdAt",
+        sort_order: str = "desc",
+        limit: int | None = None,
+        max_pages: int | None = None,
+        on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Retrieve events returned by a completed Deep Visibility query."""
         clean_id = query_id.strip()
         if not clean_id:
             raise ValueError("query_id must be non-empty.")
+        params: dict[str, Any] = {"queryId": clean_id}
+        _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
         return self._paginate(
             "dv/events",
-            params={"queryId": clean_id},
+            params=params,
             limit=limit,
             max_pages=max_pages,
+            on_page=on_page,
         )
 
 
