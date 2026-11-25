@@ -642,6 +642,14 @@ class TestRecordedFutureClient(unittest.TestCase):
             )
         )
 
+        # cyber_vulnerability maps to /playbook-alert/vulnerability/{id}
+        self.client.get_playbook_alert("cyber_vulnerability", "pb-vuln")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/playbook-alert/vulnerability/pb-vuln"
+            )
+        )
+
         # Error status_code inside HTTP 200 raises RecordedFutureAPIError
         self.mock_session.request.return_value = _make_response(
             200, {"status": {"status_code": "Error", "status_message": "Not found"}}
@@ -649,10 +657,20 @@ class TestRecordedFutureClient(unittest.TestCase):
         with self.assertRaises(RecordedFutureAPIError):
             self.client.get_playbook_alert("malicious_sites", "pb-missing")
 
-        # Image bytes
+        # Image bytes (domain_abuse uses category image endpoint; dark_web uses /alert/v3/image)
         self.mock_session.request.return_value = _make_response(200, content=b"\x89PNG\r\n\x1a\n")
         img_bytes = self.client.get_playbook_alert_image("domain_abuse", "pb-1", "img-9")
         self.assertTrue(img_bytes.startswith(b"\x89PNG"))
+
+        dw_img = self.client.get_playbook_alert_image("dark_web", "pb-dw", "img:abc-123")
+        self.assertTrue(dw_img.startswith(b"\x89PNG"))
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith("/alert/v3/image")
+        )
+        self.assertEqual(
+            self.mock_session.request.call_args.kwargs["params"],
+            {"id": "img:abc-123"},
+        )
 
     def test_alerts_v3_and_cases_and_sandbox(self) -> None:
         with self.assertRaises(ValueError):

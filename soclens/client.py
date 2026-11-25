@@ -109,7 +109,8 @@ AUTO_RESOLVED_ENTITY_TYPES: dict[str, str] = {
 PLAYBOOK_CATEGORY_PATH_MAP: dict[str, str] = {
     "domain_abuse": "domain_abuse",
     "malicious_sites": "malicious_sites",
-    "cyber_vulnerability": "cyber_vulnerability",
+    "cyber_vulnerability": "vulnerability",
+    "vulnerability": "vulnerability",
     "code_repo_leakage": "code_repo_leakage",
     "third_party_risk": "third_party_risk",
     "identity_novel_exposures": "identity_novel_exposures",
@@ -2068,6 +2069,8 @@ class RecordedFutureClient:
             raise ValueError(f"Unsupported Playbook Alert category: {category!r}")
         clean_alert_id = _require_non_empty(alert_id, "alert_id")
         clean_image_id = _require_non_empty(image_id, "image_id")
+        if mapped_cat == "dark_web_brand":
+            return self.get_alert_v3_image(clean_image_id)
 
         endpoint = (
             f"/playbook-alert/{mapped_cat}/{quote(clean_alert_id, safe='')}"
