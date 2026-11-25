@@ -6,13 +6,15 @@ import argparse
 import concurrent.futures
 import contextlib
 import csv
+import inspect
 import io
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,12 +37,16 @@ from soclens.config import (
     IMAGE_VIEWER_MODES,
     UI_VIEW_MODES,
     ConfigurationError,
+    SecretStoreConfig,
     configure_logging,
     ensure_utf8_console,
     get_auto_approve,
+    get_secret_store_config,
     get_sentinelone_config,
     get_splunk_config,
+    get_splunk_es_tenant_settings,
     get_workspace_dir,
+    hydrate_secrets_from_store,
 )
 from soclens.llm import SOC_PROMPT_TEMPLATES, LocalLLMClient, LocalLLMError
 from soclens.logos.brand_sync import (
@@ -68,30 +74,55 @@ from soclens.research import (
     render_dossier_markdown,
     research_target,
 )
+from soclens.secret_stores import (
+    SecretStoreError,
+    build_secret_store_provider,
+    parse_secret_ref,
+)
 from soclens.sentinelone import (
     ANALYST_VERDICTS,
+    CLOUD_ALERT_SCOPES,
+    CLOUD_ALERT_SEVERITIES,
+    EXCLUSION_ACTIONS,
+    EXCLUSION_MODES,
     EXCLUSION_TYPES,
     INCIDENT_STATUSES,
+    MAX_EXCLUSION_CLONE_RPS,
     MITIGATION_ACTIONS,
     OS_TYPES,
+    PATH_EXCLUSION_TYPES,
+    SITE_POLICY_SOURCES,
+    SITE_SKUS,
+    SITE_TYPES,
+    SITE_USAGE_TYPES,
+    USER_SCOPES,
     SentinelOneAuthError,
     SentinelOneClient,
     SentinelOneError,
     SentinelOneRateLimitError,
 )
 from soclens.settings import (
+    SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS_BY_KEY,
+    SUPPORTED_SECRET_PROVIDERS,
     clear_profile_settings,
     collect_env_importable_settings,
     delete_profile,
     describe_all_settings,
     format_setting_display,
     get_active_profile_name,
+    get_env_override_for_setting,
+    get_saved_setting,
+    get_session_override,
     get_settings_storage_info,
     list_profiles,
+    mask_secret,
+    parse_vault_secret_map,
     resolve_setting_key,
     save_profile_settings,
+    serialize_vault_secret_map,
     set_active_profile,
+    set_session_overrides,
     validate_profile_name,
     validate_settings_values,
 )
@@ -118,12 +149,14 @@ from soclens.splunk import (
     parse_savedsearches_files,
 )
 from soclens.splunk_es import (
+    MC_FINDING_STATUSES,
     NOTABLE_STATUS_MAP,
     NOTABLE_URGENCIES,
     SPLUNK_ES_APP,
     THREAT_INTEL_COLLECTIONS,
     SplunkESClient,
     SplunkESError,
+    extract_finding_tenant,
 )
 from soclens.splunk_rf_enrichment import (
     SplunkRFEnricher,
@@ -588,6 +621,17 @@ def execute_delta_sync(
     return True
 
 
+def _callable_accepts_kwarg(fn: Callable[..., Any], kwarg: str) -> bool:
+    """Return True if ``fn`` accepts keyword argument ``kwarg`` or ``**kwargs``."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return kwarg in sig.parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
 def run_unified_tui(
     client: RecordedFutureClient | None = None,
     dry_run: bool = False,
@@ -596,6 +640,7 @@ def run_unified_tui(
     workspace_dir: Path | str | None = None,
     image_viewer: str | None = None,
     view_mode: str | None = None,
+    no_secret_store: bool = False,
 ) -> None:
     """Launch the cross-platform Textual Terminal User Interface."""
     from soclens.tui import create_app
@@ -616,6 +661,8 @@ def run_unified_tui(
         create_kwargs["image_viewer"] = image_viewer
     if view_mode is not None:
         create_kwargs["view_mode"] = view_mode
+    if no_secret_store and _callable_accepts_kwarg(create_app, "no_secret_store"):
+        create_kwargs["no_secret_store"] = True
     app = create_app(**create_kwargs)
     app.run()
 
@@ -714,6 +761,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ca_bundle",
         default=None,
         help="Path to custom CA certificate bundle PEM file for HTTPS requests (overrides RF_CA_BUNDLE)",
+    )
+    parser.add_argument(
+        "--no-secret-store",
+        dest="no_secret_store",
+        action="store_true",
+        default=False,
+        help="Skip external secret manager / PAM hydration (use env vars or manual settings only)",
     )
     subparsers = parser.add_subparsers(dest="command", required=False, help="Subcommand to execute")
 
@@ -1543,21 +1597,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     splunk_subparsers = splunk_parser.add_subparsers(dest="subcommand", required=True)
 
-    def _add_splunk_conn_args(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--host", type=str, default=None, help="Splunk Host URL")
-        sub.add_argument("--token", type=str, default=None, help="Splunk Bearer Token")
-        sub.add_argument("--username", type=str, default=None, help="Splunk Basic Auth Username")
-        sub.add_argument("--password", type=str, default=None, help="Splunk Basic Auth Password")
+    def _add_splunk_conn_args(
+        sub: argparse.ArgumentParser,
+        *,
+        suppress_defaults: bool = False,
+    ) -> None:
+        opt_default: Any = argparse.SUPPRESS if suppress_defaults else None
+        verify_default: Any = argparse.SUPPRESS if suppress_defaults else False
+        sub.add_argument("--host", type=str, default=opt_default, help="Splunk Host URL")
+        sub.add_argument("--token", type=str, default=opt_default, help="Splunk Bearer Token")
+        sub.add_argument(
+            "--username", type=str, default=opt_default, help="Splunk Basic Auth Username"
+        )
+        sub.add_argument(
+            "--password", type=str, default=opt_default, help="Splunk Basic Auth Password"
+        )
         sub.add_argument(
             "--app",
             type=str,
-            default=None,
+            default=opt_default,
             help="Splunk app namespace (default: SPLUNK_APP or SplunkEnterpriseSecuritySuite)",
         )
         sub.add_argument(
             "--verify-ssl",
             action="store_true",
-            default=False,
+            default=verify_default,
             help="Verify SSL certificates (default: False)",
         )
         sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
@@ -1669,6 +1733,56 @@ def build_parser() -> argparse.ArgumentParser:
         "--search-text", type=str, default=None, help="Free-text filter across notable fields"
     )
     es_notables.add_argument(
+        "--tenant", type=str, default=None, help="Filter by resolved tenant ID"
+    )
+    es_notables.add_argument(
+        "--use-v2",
+        action="store_true",
+        default=False,
+        help="Use ES 8.6 Mission Control v2 hybrid backend",
+    )
+    es_notables.add_argument(
+        "--disposition", type=str, default=None, help="Filter by notable/finding disposition"
+    )
+    es_notables.add_argument(
+        "--item-type",
+        choices=("all", "findings", "finding_groups", "investigations"),
+        default="all",
+        help="MC v2 queue item type filter (default: all)",
+    )
+    es_notables.add_argument(
+        "--security-domain", type=str, default=None, help="Filter by security domain"
+    )
+    es_notables.add_argument("--severity", type=str, default=None, help="Filter by severity")
+    es_notables.add_argument("--entity", type=str, default=None, help="Filter by entity/risk_object")
+    es_notables.add_argument("--src", type=str, default=None, help="Filter by source IP/host")
+    es_notables.add_argument("--dest", type=str, default=None, help="Filter by destination IP/host")
+    es_notables.add_argument("--user", type=str, default=None, help="Filter by user")
+    es_notables.add_argument("--file-hash", type=str, default=None, help="Filter by file hash")
+    es_notables.add_argument(
+        "--min-risk-score", type=float, default=None, help="Filter by minimum risk score"
+    )
+    es_notables.add_argument("--orig-sid", type=str, default=None, help="Filter by orig_sid (SPL)")
+    es_notables.add_argument(
+        "--raw-query", type=str, default=None, help="Raw text / _raw SPL filter"
+    )
+    es_notables.add_argument(
+        "--include-investigations",
+        action="store_true",
+        default=False,
+        help="Include MC v2 investigations alongside findings",
+    )
+    es_notables.add_argument(
+        "--offset", type=int, default=0, help="Pagination offset (default: 0)"
+    )
+    es_notables.add_argument("--sort", type=str, default=None, help="Sort specification")
+    es_notables.add_argument(
+        "--use-spl",
+        action="store_true",
+        default=False,
+        help="Force SPL `notable` fallback backend",
+    )
+    es_notables.add_argument(
         "--limit", type=int, default=100, help="Max notable events to return (default: 100)"
     )
     es_notables.add_argument(
@@ -1698,6 +1812,16 @@ def build_parser() -> argparse.ArgumentParser:
     es_update.add_argument("--owner", type=str, default=None, help="New notable owner")
     es_update.add_argument("--disposition", type=str, default=None, help="New notable disposition")
     es_update.add_argument("--comment", type=str, default=None, help="Triage audit comment")
+    es_update.add_argument(
+        "--use-v2",
+        action="store_true",
+        default=False,
+        help="Use MC v2 bulk_update hybrid endpoint (with 404 fallback)",
+    )
+    es_update.add_argument("--sensitivity", type=str, default=None, help="MC v2 sensitivity level")
+    es_update.add_argument("--queue-id", type=str, default=None, help="MC v2 queue ID")
+    es_update.add_argument("--earliest", type=str, default=None, help="MC v2 earliest time hint")
+    es_update.add_argument("--latest", type=str, default=None, help="MC v2 latest time hint")
     es_update.add_argument(
         "--dry-run",
         action="store_true",
@@ -1875,6 +1999,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preview notable comment write-backs without mutating Splunk ES",
     )
     es_enrich.add_argument(
+        "--tenant",
+        type=str,
+        default=None,
+        help="Filter notables by resolved tenant ID before enrichment",
+    )
+    es_enrich.add_argument(
+        "--use-v2",
+        action="store_true",
+        default=False,
+        help="Use ES 8.6 Mission Control v2 hybrid backend when fetching notables",
+    )
+    es_enrich.add_argument(
         "--limit", type=int, default=100, help="Max events/notables to fetch (default: 100)"
     )
     es_enrich.add_argument(
@@ -1891,6 +2027,345 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional file path to export enriched results (JSON or CSV)",
     )
     _add_splunk_conn_args(es_enrich)
+
+    # 5c. Splunk ES 8.6 Mission Control v2 & Adaptive Response subcommands
+    es_inv = es_subparsers.add_parser(
+        "investigations",
+        help="List, create, update, or attach findings to Splunk ES Mission Control v2 investigations",
+    )
+    es_inv.add_argument("--tenant", type=str, default=None, help="Filter investigations by tenant ID")
+    es_inv.add_argument("--status", type=str, default=None, help="Filter by status")
+    es_inv.add_argument(
+        "--urgency", choices=NOTABLE_URGENCIES, default=None, help="Filter by urgency"
+    )
+    es_inv.add_argument("--owner", type=str, default=None, help="Filter by owner")
+    es_inv.add_argument("--disposition", type=str, default=None, help="Filter by disposition")
+    es_inv.add_argument("--ids", type=str, default=None, help="Comma-separated investigation IDs")
+    es_inv.add_argument("--limit", type=int, default=100, help="Max investigations (default: 100)")
+    es_inv.add_argument("--offset", type=int, default=0, help="Pagination offset (default: 0)")
+    es_inv.add_argument("--sort", type=str, default=None, help="Sort specification")
+    es_inv.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Output format (default: table)"
+    )
+    _add_splunk_conn_args(es_inv)
+    es_inv_sub = es_inv.add_subparsers(dest="inv_action")
+
+    es_inv_list = es_inv_sub.add_parser("list", help="List Mission Control v2 investigations")
+    es_inv_list.add_argument(
+        "--tenant", type=str, default=argparse.SUPPRESS, help="Filter by tenant ID"
+    )
+    es_inv_list.add_argument(
+        "--status", type=str, default=argparse.SUPPRESS, help="Filter by status"
+    )
+    es_inv_list.add_argument(
+        "--urgency",
+        choices=NOTABLE_URGENCIES,
+        default=argparse.SUPPRESS,
+        help="Filter by urgency",
+    )
+    es_inv_list.add_argument(
+        "--owner", type=str, default=argparse.SUPPRESS, help="Filter by owner"
+    )
+    es_inv_list.add_argument(
+        "--disposition", type=str, default=argparse.SUPPRESS, help="Filter by disposition"
+    )
+    es_inv_list.add_argument(
+        "--ids", type=str, default=argparse.SUPPRESS, help="Comma-separated investigation IDs"
+    )
+    es_inv_list.add_argument(
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Max investigations (default: 100)",
+    )
+    es_inv_list.add_argument(
+        "--offset",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Pagination offset (default: 0)",
+    )
+    es_inv_list.add_argument(
+        "--sort", type=str, default=argparse.SUPPRESS, help="Sort specification"
+    )
+    es_inv_list.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_inv_list, suppress_defaults=True)
+
+    es_inv_create = es_inv_sub.add_parser("create", help="Create a Mission Control v2 investigation")
+    es_inv_create.add_argument("--name", required=True, help="Investigation name/title")
+    es_inv_create.add_argument("--description", default=None, help="Investigation description")
+    es_inv_create.add_argument(
+        "--type", dest="investigation_type", default=None, help="Investigation type"
+    )
+    es_inv_create.add_argument(
+        "--status",
+        default=argparse.SUPPRESS,
+        help=f"Status ({', '.join(MC_FINDING_STATUSES)})",
+    )
+    es_inv_create.add_argument("--disposition", default=argparse.SUPPRESS, help="Disposition")
+    es_inv_create.add_argument("--owner", default=argparse.SUPPRESS, help="Assigned owner")
+    es_inv_create.add_argument(
+        "--urgency",
+        choices=NOTABLE_URGENCIES,
+        default=argparse.SUPPRESS,
+        help="Urgency level",
+    )
+    es_inv_create.add_argument("--sensitivity", default=None, help="Sensitivity level")
+    es_inv_create.add_argument(
+        "--finding-ids", action="append", default=None, help="Finding IDs to attach (comma/repeatable)"
+    )
+    es_inv_create.add_argument(
+        "--finding-times", action="append", default=None, help="Matching finding_times"
+    )
+    es_inv_create.add_argument("--queue-id", default=None, help="Queue ID")
+    es_inv_create.add_argument(
+        "--ensure-enriched",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Ensure findings are enriched",
+    )
+    es_inv_create.add_argument("--yes", action="store_true", default=False, help="Approve creation")
+    es_inv_create.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_inv_create.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_inv_create, suppress_defaults=True)
+
+    es_inv_update = es_inv_sub.add_parser("update", help="Update a Mission Control v2 investigation")
+    es_inv_update.add_argument("investigation_id", help="Investigation GUID/ID")
+    es_inv_update.add_argument("--finding-time", default=None, help="Optional finding_time query param")
+    es_inv_update.add_argument("--name", default=None, help="Updated name")
+    es_inv_update.add_argument("--description", default=None, help="Updated description")
+    es_inv_update.add_argument("--status", default=argparse.SUPPRESS, help="Updated status")
+    es_inv_update.add_argument("--owner", default=argparse.SUPPRESS, help="Updated owner")
+    es_inv_update.add_argument(
+        "--urgency",
+        choices=NOTABLE_URGENCIES,
+        default=argparse.SUPPRESS,
+        help="Updated urgency",
+    )
+    es_inv_update.add_argument("--sensitivity", default=None, help="Updated sensitivity")
+    es_inv_update.add_argument(
+        "--type", dest="investigation_type", default=None, help="Updated investigation type"
+    )
+    es_inv_update.add_argument("--queue-id", default=None, help="Updated queue ID")
+    es_inv_update.add_argument("--note", default=None, help="Investigation note text")
+    es_inv_update.add_argument("--yes", action="store_true", default=False, help="Approve update")
+    es_inv_update.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_inv_update.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_inv_update, suppress_defaults=True)
+
+    es_inv_attach = es_inv_sub.add_parser(
+        "add-findings",
+        aliases=["attach"],
+        help="Attach findings to an existing investigation",
+    )
+    es_inv_attach.add_argument("investigation_id", help="Target investigation GUID/ID")
+    es_inv_attach.add_argument("finding_ids", nargs="+", help="One or more finding IDs to attach")
+    es_inv_attach.add_argument(
+        "--finding-times", action="append", default=None, help="Optional matching finding_times"
+    )
+    es_inv_attach.add_argument(
+        "--ensure-enriched",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Ensure findings are enriched",
+    )
+    es_inv_attach.add_argument("--yes", action="store_true", default=False, help="Approve mutation")
+    es_inv_attach.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_inv_attach.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_inv_attach, suppress_defaults=True)
+
+    es_notes = es_subparsers.add_parser(
+        "notes", help="List, create, update, or delete Mission Control v2 notes"
+    )
+    es_notes.add_argument("--record-id", default=None, help="Finding or investigation ID")
+    es_notes.add_argument("--finding-time", default=None, help="Optional finding_time")
+    es_notes.add_argument("--search", default=None, help="Filter notes by search text")
+    es_notes.add_argument("--type", dest="note_type", default=None, help="Filter by note type")
+    es_notes.add_argument("--limit", type=int, default=50, help="Max notes (default: 50)")
+    es_notes.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    es_notes.add_argument("--sort", default=None, help="Sort specification")
+    es_notes.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Output format (default: table)"
+    )
+    _add_splunk_conn_args(es_notes)
+    es_notes_sub = es_notes.add_subparsers(dest="notes_action")
+
+    es_notes_list = es_notes_sub.add_parser("list", help="List notes on a finding or investigation")
+    es_notes_list.add_argument("record_id", help="Finding or investigation ID")
+    es_notes_list.add_argument(
+        "--finding-time", default=argparse.SUPPRESS, help="Optional finding_time"
+    )
+    es_notes_list.add_argument(
+        "--search", default=argparse.SUPPRESS, help="Filter notes by search text"
+    )
+    es_notes_list.add_argument(
+        "--type", dest="note_type", default=argparse.SUPPRESS, help="Filter by note type"
+    )
+    es_notes_list.add_argument(
+        "--limit", type=int, default=argparse.SUPPRESS, help="Max notes (default: 50)"
+    )
+    es_notes_list.add_argument(
+        "--offset", type=int, default=argparse.SUPPRESS, help="Pagination offset"
+    )
+    es_notes_list.add_argument("--sort", default=argparse.SUPPRESS, help="Sort specification")
+    es_notes_list.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_notes_list, suppress_defaults=True)
+
+    es_notes_create = es_notes_sub.add_parser("create", help="Create a Markdown note")
+    es_notes_create.add_argument("record_id", help="Finding or investigation ID")
+    es_notes_create.add_argument("--content", required=True, help="Markdown note content")
+    es_notes_create.add_argument("--title", default=None, help="Optional note title")
+    es_notes_create.add_argument(
+        "--finding-time", default=argparse.SUPPRESS, help="Optional finding_time"
+    )
+    es_notes_create.add_argument("--yes", action="store_true", default=False, help="Approve creation")
+    es_notes_create.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_notes_create.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_notes_create, suppress_defaults=True)
+
+    es_notes_update = es_notes_sub.add_parser("update", help="Update an existing note")
+    es_notes_update.add_argument("record_id", help="Finding or investigation ID")
+    es_notes_update.add_argument("note_id", help="Note ID")
+    es_notes_update.add_argument("--title", default=None, help="Updated note title")
+    es_notes_update.add_argument("--content", default=None, help="Updated note content")
+    es_notes_update.add_argument(
+        "--finding-time", default=argparse.SUPPRESS, help="Optional finding_time"
+    )
+    es_notes_update.add_argument("--yes", action="store_true", default=False, help="Approve update")
+    es_notes_update.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_notes_update.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_notes_update, suppress_defaults=True)
+
+    es_notes_del = es_notes_sub.add_parser("delete", help="Delete a note")
+    es_notes_del.add_argument("record_id", help="Finding or investigation ID")
+    es_notes_del.add_argument("note_id", help="Note ID")
+    es_notes_del.add_argument(
+        "--finding-time", default=argparse.SUPPRESS, help="Optional finding_time"
+    )
+    es_notes_del.add_argument("--yes", action="store_true", default=False, help="Approve deletion")
+    es_notes_del.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_notes_del.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    _add_splunk_conn_args(es_notes_del, suppress_defaults=True)
+
+    es_history = es_subparsers.add_parser(
+        "history", help="Fetch Mission Control v2 audit history for a finding or investigation"
+    )
+    es_history.add_argument("record_id", help="Finding or investigation ID")
+    es_history.add_argument("--finding-time", default=None, help="Optional finding_time")
+    es_history.add_argument("--limit", type=int, default=100, help="Max entries (default: 100)")
+    es_history.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    es_history.add_argument(
+        "--exclude-sources", default=None, help="Comma-separated source exclusions"
+    )
+    es_history.add_argument(
+        "--include-findings",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include linked findings history",
+    )
+    es_history.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Output format (default: table)"
+    )
+    _add_splunk_conn_args(es_history)
+
+    es_ar_inv = es_subparsers.add_parser(
+        "ar-invocations", help="List Adaptive Response modular action invocations"
+    )
+    es_ar_inv.add_argument("--sid", required=True, help="Originating Splunk search ID (orig_sid)")
+    es_ar_inv.add_argument("--rid", required=True, help="Originating result ID (orig_rid)")
+    es_ar_inv.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Output format (default: table)"
+    )
+    _add_splunk_conn_args(es_ar_inv)
+
+    es_ar_disp = es_subparsers.add_parser(
+        "ar-dispatch", help="List available or dispatch ad-hoc Adaptive Response actions"
+    )
+    es_ar_disp.add_argument(
+        "--list", action="store_true", default=False, help="List available Adaptive Response actions"
+    )
+    es_ar_disp.add_argument(
+        "--all-actions",
+        action="store_true",
+        default=False,
+        help="Include non-adhoc alert actions when using --list",
+    )
+    es_ar_disp.add_argument("--action", default=None, help="Adaptive Response action name")
+    es_ar_disp.add_argument("--sid", default=None, help="Notable orig_sid")
+    es_ar_disp.add_argument("--rid", default=None, help="Notable orig_rid")
+    es_ar_disp.add_argument(
+        "--param",
+        action="append",
+        default=None,
+        help="Action parameter as key=value (repeatable)",
+    )
+    es_ar_disp.add_argument(
+        "--params-json", default=None, help="JSON object of action parameters"
+    )
+    es_ar_disp.add_argument("--index", default=None, help="Optional target index")
+    es_ar_disp.add_argument("--yes", action="store_true", default=False, help="Approve dispatch")
+    es_ar_disp.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    es_ar_disp.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Output format (default: table)"
+    )
+    _add_splunk_conn_args(es_ar_disp)
+
+    es_cf = es_subparsers.add_parser(
+        "custom-fields",
+        help="Inspect tenant settings and auto-discovered Splunk ES custom event_attributes",
+    )
+    es_cf.add_argument(
+        "--refresh", action="store_true", default=False, help="Force refresh from Splunk ES"
+    )
+    es_cf.add_argument(
+        "--offline",
+        action="store_true",
+        default=False,
+        help="Show local tenant/pinned custom field settings without querying Splunk ES",
+    )
+    es_cf.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Output format (default: table)"
+    )
+    _add_splunk_conn_args(es_cf)
 
     # 6. Bundle subcommand
     bundle_parser = subparsers.add_parser("bundle", help="Build an air-gapped deployment ZIP bundle")
@@ -1956,15 +2431,60 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_status = s1_sub.add_parser("status", help="Check SentinelOne API connectivity and console info")
     p_s1_status.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
-    p_s1_agents = s1_sub.add_parser("agents", help="List and filter SentinelOne agents/endpoints")
+    p_s1_agents = s1_sub.add_parser("agents", help="List or manage SentinelOne agents/endpoints")
     p_s1_agents.add_argument("--query", default=None, help="Free-text search query")
     p_s1_agents.add_argument("--computer-name", default=None, help="Filter by hostname substring")
     p_s1_agents.add_argument("--infected", action="store_true", default=None, help="Only infected endpoints")
     p_s1_agents.add_argument("--active", action="store_true", default=None, help="Only active endpoints")
     p_s1_agents.add_argument("--network-status", default=None, help="Filter by network status")
     p_s1_agents.add_argument("--os-type", default=None, choices=sorted(OS_TYPES), help="Filter by OS type")
+    p_s1_agents.add_argument("--account-id", default=None, help="Filter by account ID(s)")
+    p_s1_agents.add_argument("--site-id", default=None, help="Filter by site ID(s)")
+    p_s1_agents.add_argument("--group-id", default=None, help="Filter by group ID(s)")
     p_s1_agents.add_argument("--limit", type=int, default=100, help="Maximum agents to return")
+    p_s1_agents.add_argument("--move-to-site", dest="move_to_site", default=None, help="Move --ids to target site ID (Admin)")
+    p_s1_agents.add_argument("--decommission", action="store_true", default=False, help="Decommission --ids (Admin)")
+    p_s1_agents.add_argument("--fetch-logs", action="store_true", default=False, help="Fetch diagnostic logs for --ids")
+    p_s1_agents.add_argument("--ids", nargs="+", default=None, help="Agent ID(s) for flag-mode actions")
+    p_s1_agents.add_argument("--yes", action="store_true", default=False, help="Approve agent action")
+    p_s1_agents.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without executing")
     p_s1_agents.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    agents_sub = p_s1_agents.add_subparsers(dest="agents_action")
+
+    p_s1_ag_list = agents_sub.add_parser("list", help="List and filter SentinelOne agents")
+    p_s1_ag_list.add_argument("--query", default=argparse.SUPPRESS, help="Free-text search query")
+    p_s1_ag_list.add_argument("--computer-name", default=argparse.SUPPRESS, help="Filter by hostname substring")
+    p_s1_ag_list.add_argument("--infected", action="store_true", default=argparse.SUPPRESS, help="Only infected endpoints")
+    p_s1_ag_list.add_argument("--active", action="store_true", default=argparse.SUPPRESS, help="Only active endpoints")
+    p_s1_ag_list.add_argument("--network-status", default=argparse.SUPPRESS, help="Filter by network status")
+    p_s1_ag_list.add_argument("--os-type", default=argparse.SUPPRESS, choices=sorted(OS_TYPES), help="Filter by OS type")
+    p_s1_ag_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Filter by account ID(s)")
+    p_s1_ag_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Filter by site ID(s)")
+    p_s1_ag_list.add_argument("--group-id", default=argparse.SUPPRESS, help="Filter by group ID(s)")
+    p_s1_ag_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum agents to return")
+    p_s1_ag_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_ag_logs = agents_sub.add_parser("fetch-logs", help="Fetch diagnostic logs from endpoints")
+    p_s1_ag_logs.add_argument("agent_ids", nargs="+", help="One or more SentinelOne agent IDs")
+    p_s1_ag_logs.add_argument("--no-agent-logs", action="store_true", default=False, help="Exclude agent logs")
+    p_s1_ag_logs.add_argument("--no-customer-logs", action="store_true", default=False, help="Exclude customer-facing logs")
+    p_s1_ag_logs.add_argument("--platform-logs", action="store_true", default=False, help="Include platform logs")
+    p_s1_ag_logs.add_argument("--yes", action="store_true", default=False, help="Approve log fetch")
+    p_s1_ag_logs.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_s1_ag_logs.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_ag_decomm = agents_sub.add_parser("decommission", help="Decommission offline/retired endpoints (Admin)")
+    p_s1_ag_decomm.add_argument("agent_ids", nargs="+", help="One or more SentinelOne agent IDs")
+    p_s1_ag_decomm.add_argument("--yes", action="store_true", default=False, help="Approve decommission")
+    p_s1_ag_decomm.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_s1_ag_decomm.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_ag_move = agents_sub.add_parser("move-to-site", help="Move endpoints to another site (Admin)")
+    p_s1_ag_move.add_argument("agent_ids", nargs="+", help="One or more SentinelOne agent IDs")
+    p_s1_ag_move.add_argument("--to-site", "--target-site", dest="target_site", required=True, help="Target site ID")
+    p_s1_ag_move.add_argument("--yes", action="store_true", default=False, help="Approve move")
+    p_s1_ag_move.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_s1_ag_move.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     for cmd_name, cmd_help in (
         ("isolate", "Network-isolate (disconnect) one or more SentinelOne endpoints"),
@@ -2014,37 +2534,477 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1_mitigate.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without executing")
     p_s1_mitigate.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
-    p_s1_excl = s1_sub.add_parser("exclusions", help="List, create, or delete SentinelOne exclusions")
-    p_s1_excl.add_argument("--create", action="store_true", default=False, help="Create a new exclusion")
-    p_s1_excl.add_argument("--delete", nargs="+", default=None, help="Delete one or more exclusion IDs")
+    p_s1_excl = s1_sub.add_parser("exclusions", help="List, manage, validate, or clone SentinelOne exclusions")
+    p_s1_excl.add_argument("--create", action="store_true", default=False, help="Create a new exclusion (Admin)")
+    p_s1_excl.add_argument("--delete", nargs="+", default=None, help="Delete one or more exclusion IDs (Admin)")
     p_s1_excl.add_argument("--type", dest="exclusion_type", default=None, choices=sorted(EXCLUSION_TYPES), help="Exclusion type")
     p_s1_excl.add_argument("--os-type", default="windows", choices=sorted(OS_TYPES), help="OS type")
     p_s1_excl.add_argument("--value", default=None, help="Exclusion value (path, hash, signer, etc.)")
     p_s1_excl.add_argument("--description", default="", help="Exclusion description")
-    p_s1_excl.add_argument("--mode", default="suppress", help="Exclusion mode (default: suppress)")
+    p_s1_excl.add_argument("--mode", default="suppress", choices=sorted(EXCLUSION_MODES), help="Exclusion mode (default: suppress)")
+    p_s1_excl.add_argument("--path-exclusion-type", default=None, choices=sorted(PATH_EXCLUSION_TYPES), help="Path exclusion scope")
+    p_s1_excl.add_argument("--actions", default=None, help=f"Comma-separated actions ({', '.join(sorted(EXCLUSION_ACTIONS))})")
+    p_s1_excl.add_argument("--account-id", default=None, help="Account ID scope(s)")
+    p_s1_excl.add_argument("--site-id", default=None, help="Site ID scope(s)")
+    p_s1_excl.add_argument("--group-id", default=None, help="Group ID scope(s)")
     p_s1_excl.add_argument("--query", default=None, help="Filter listed exclusions by value substring")
     p_s1_excl.add_argument("--limit", type=int, default=100, help="Maximum exclusions to return")
     p_s1_excl.add_argument("--yes", action="store_true", default=False, help="Approve create/delete mutation")
     p_s1_excl.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without executing")
     p_s1_excl.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    excl_sub = p_s1_excl.add_subparsers(dest="exclusions_action")
 
-    p_s1_block = s1_sub.add_parser("blocklist", help="List, add, or remove SentinelOne SHA-1 blocklist entries")
-    p_s1_block.add_argument("--add", dest="add_hash", default=None, help="SHA-1 hash to add to blocklist")
-    p_s1_block.add_argument("--remove", nargs="+", default=None, help="Blocklist entry ID(s) to remove")
+    p_excl_list = excl_sub.add_parser("list", help="List SentinelOne exclusions")
+    p_excl_list.add_argument("--type", dest="exclusion_type", default=argparse.SUPPRESS, choices=sorted(EXCLUSION_TYPES), help="Exclusion type")
+    p_excl_list.add_argument("--os-type", dest="filter_os_type", default=None, help="Filter OS type(s)")
+    p_excl_list.add_argument("--query", default=argparse.SUPPRESS, help="Filter by value substring")
+    p_excl_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Account ID scope(s)")
+    p_excl_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Site ID scope(s)")
+    p_excl_list.add_argument("--group-id", default=argparse.SUPPRESS, help="Group ID scope(s)")
+    p_excl_list.add_argument("--include-parents", action=argparse.BooleanOptionalAction, default=None, help="Include parent exclusions")
+    p_excl_list.add_argument("--include-children", action=argparse.BooleanOptionalAction, default=None, help="Include child exclusions")
+    p_excl_list.add_argument("--modes", default=None, help="Comma-separated modes filter")
+    p_excl_list.add_argument("--scopes", default=None, help="Comma-separated scopes filter")
+    p_excl_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum exclusions to return")
+    p_excl_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_excl_create = excl_sub.add_parser("create", help="Create a scoped SentinelOne exclusion (Admin)")
+    p_excl_create.add_argument("--type", dest="exclusion_type", required=True, choices=sorted(EXCLUSION_TYPES), help="Exclusion type")
+    p_excl_create.add_argument("--os-type", default="windows", choices=sorted(OS_TYPES), help="OS type")
+    p_excl_create.add_argument("--value", required=True, help="Exclusion value")
+    p_excl_create.add_argument("--description", default="", help="Exclusion description")
+    p_excl_create.add_argument("--mode", default="suppress", choices=sorted(EXCLUSION_MODES), help="Exclusion mode")
+    p_excl_create.add_argument("--path-exclusion-type", default=None, choices=sorted(PATH_EXCLUSION_TYPES), help="Path exclusion type")
+    p_excl_create.add_argument("--actions", default=None, help="Comma-separated exclusion actions")
+    p_excl_create.add_argument("--account-id", default=None, help="Account ID scope(s)")
+    p_excl_create.add_argument("--site-id", default=None, help="Site ID scope(s)")
+    p_excl_create.add_argument("--group-id", default=None, help="Group ID scope(s)")
+    p_excl_create.add_argument("--yes", action="store_true", default=False, help="Approve creation")
+    p_excl_create.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_excl_create.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_excl_update = excl_sub.add_parser("update", help="Update an existing SentinelOne exclusion (Admin)")
+    p_excl_update.add_argument("exclusion_id", help="Exclusion ID")
+    p_excl_update.add_argument("--type", dest="exclusion_type", required=True, choices=sorted(EXCLUSION_TYPES), help="Exclusion type")
+    p_excl_update.add_argument("--os-type", required=True, choices=sorted(OS_TYPES), help="OS type")
+    p_excl_update.add_argument("--value", default=None, help="Updated value")
+    p_excl_update.add_argument("--description", default=None, help="Updated description")
+    p_excl_update.add_argument("--mode", default=None, choices=sorted(EXCLUSION_MODES), help="Updated mode")
+    p_excl_update.add_argument("--path-exclusion-type", default=None, choices=sorted(PATH_EXCLUSION_TYPES), help="Updated path exclusion type")
+    p_excl_update.add_argument("--actions", default=None, help="Updated comma-separated actions")
+    p_excl_update.add_argument("--yes", action="store_true", default=False, help="Approve update")
+    p_excl_update.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_excl_update.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_excl_delete = excl_sub.add_parser("delete", help="Delete one or more SentinelOne exclusions (Admin)")
+    p_excl_delete.add_argument("ids", nargs="+", help="Exclusion ID(s) to delete")
+    p_excl_delete.add_argument("--type", dest="exclusion_type", default=None, choices=sorted(EXCLUSION_TYPES), help="Exclusion type")
+    p_excl_delete.add_argument("--yes", action="store_true", default=False, help="Approve deletion")
+    p_excl_delete.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_excl_delete.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_excl_validate = excl_sub.add_parser("validate", help="Validate a SentinelOne exclusion before creation")
+    p_excl_validate.add_argument("--type", dest="exclusion_type", required=True, choices=sorted(EXCLUSION_TYPES | {"hash"}), help="Exclusion type")
+    p_excl_validate.add_argument("--os-type", default="windows", choices=sorted(OS_TYPES), help="OS type")
+    p_excl_validate.add_argument("--value", required=True, help="Exclusion value")
+    p_excl_validate.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_excl_clone = excl_sub.add_parser("clone", help="Clone site exclusions between sites with rate-limit pacing (Admin)")
+    p_excl_clone.add_argument("--from-site", required=True, help="Source site ID")
+    p_excl_clone.add_argument("--to-site", required=True, help="Target site ID")
+    p_excl_clone.add_argument("--source-site-name", default=None, help="Source site label for provenance note")
+    p_excl_clone.add_argument("--include-source-parents", action="store_true", default=False, help="Include inherited account/global source exclusions")
+    p_excl_clone.add_argument("--rate-limit", type=float, default=MAX_EXCLUSION_CLONE_RPS, help="Max create requests/sec (capped at 15.0)")
+    p_excl_clone.add_argument("--stop-on-error", action="store_true", default=False, help="Abort immediately on first failed exclusion")
+    p_excl_clone.add_argument("--limit", type=int, default=5000, help="Max exclusions to scan (default: 5000)")
+    p_excl_clone.add_argument("--yes", action="store_true", default=False, help="Approve exclusion cloning")
+    p_excl_clone.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview diff without POSTing")
+    p_excl_clone.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_block = s1_sub.add_parser("blocklist", help="List, add, update, or remove SentinelOne SHA-1 blocklist entries")
+    p_s1_block.add_argument("--add", dest="add_hash", default=None, help="SHA-1 hash to add to blocklist (Admin)")
+    p_s1_block.add_argument("--remove", nargs="+", default=None, help="Blocklist entry ID(s) to remove (Admin)")
     p_s1_block.add_argument("--os-type", default="windows", choices=sorted(OS_TYPES), help="OS type")
     p_s1_block.add_argument("--description", default="", help="Blocklist entry description")
+    p_s1_block.add_argument("--source", default="soclens", help="Blocklist entry source")
+    p_s1_block.add_argument("--account-id", default=None, help="Account ID scope(s)")
+    p_s1_block.add_argument("--site-id", default=None, help="Site ID scope(s)")
+    p_s1_block.add_argument("--group-id", default=None, help="Group ID scope(s)")
     p_s1_block.add_argument("--query", default=None, help="Filter listed entries by hash substring")
     p_s1_block.add_argument("--limit", type=int, default=100, help="Maximum entries to return")
     p_s1_block.add_argument("--yes", action="store_true", default=False, help="Approve add/remove mutation")
     p_s1_block.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without executing")
     p_s1_block.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    block_sub = p_s1_block.add_subparsers(dest="blocklist_action")
 
-    p_s1_sites = s1_sub.add_parser("sites", help="List SentinelOne sites, accounts, or groups")
+    p_blk_list = block_sub.add_parser("list", help="List SHA-1 blocklist entries")
+    p_blk_list.add_argument("--os-type", dest="filter_os_type", default=None, help="Filter OS type(s)")
+    p_blk_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Account ID scope(s)")
+    p_blk_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Site ID scope(s)")
+    p_blk_list.add_argument("--query", default=argparse.SUPPRESS, help="Filter by hash substring")
+    p_blk_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum entries to return")
+    p_blk_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_blk_add = block_sub.add_parser("add", help="Add a SHA-1 hash to the blocklist (Admin)")
+    p_blk_add.add_argument("sha1_hash", help="40-char SHA-1 hash")
+    p_blk_add.add_argument("--os-type", default="windows", choices=sorted(OS_TYPES), help="OS type")
+    p_blk_add.add_argument("--description", default="", help="Description")
+    p_blk_add.add_argument("--source", default="soclens", help="Source")
+    p_blk_add.add_argument("--account-id", default=None, help="Account ID scope(s)")
+    p_blk_add.add_argument("--site-id", default=None, help="Site ID scope(s)")
+    p_blk_add.add_argument("--group-id", default=None, help="Group ID scope(s)")
+    p_blk_add.add_argument("--yes", action="store_true", default=False, help="Approve mutation")
+    p_blk_add.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_blk_add.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_blk_upd = block_sub.add_parser("update", help="Update a blocklist entry (Admin)")
+    p_blk_upd.add_argument("entry_id", help="Blocklist entry ID")
+    p_blk_upd.add_argument("--sha1", required=True, help="40-char SHA-1 hash")
+    p_blk_upd.add_argument("--os-type", default="windows", choices=sorted(OS_TYPES), help="OS type")
+    p_blk_upd.add_argument("--description", default="", help="Description")
+    p_blk_upd.add_argument("--source", default="soclens", help="Source")
+    p_blk_upd.add_argument("--account-id", default=None, help="Account ID scope(s)")
+    p_blk_upd.add_argument("--site-id", default=None, help="Site ID scope(s)")
+    p_blk_upd.add_argument("--group-id", default=None, help="Group ID scope(s)")
+    p_blk_upd.add_argument("--yes", action="store_true", default=False, help="Approve mutation")
+    p_blk_upd.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_blk_upd.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_blk_rem = block_sub.add_parser("remove", help="Remove blocklist entry ID(s) (Admin)")
+    p_blk_rem.add_argument("ids", nargs="+", help="Blocklist entry ID(s)")
+    p_blk_rem.add_argument("--yes", action="store_true", default=False, help="Approve mutation")
+    p_blk_rem.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_blk_rem.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_sites = s1_sub.add_parser("sites", help="List or administer SentinelOne sites, accounts, and groups")
     p_s1_sites.add_argument("--accounts", action="store_true", default=False, help="List accounts instead of sites")
     p_s1_sites.add_argument("--groups", action="store_true", default=False, help="List groups instead of sites")
+    p_s1_sites.add_argument("--tier", default=None, help="Filter sites by resolved service tier (e.g. MDR, MSSP, Other)")
     p_s1_sites.add_argument("--query", default=None, help="Search query")
     p_s1_sites.add_argument("--limit", type=int, default=100, help="Maximum items to return")
     p_s1_sites.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    sites_sub = p_s1_sites.add_subparsers(dest="sites_action")
+
+    p_site_list = sites_sub.add_parser("list", help="List SentinelOne sites, accounts, or groups")
+    p_site_list.add_argument("--accounts", action="store_true", default=argparse.SUPPRESS, help="List accounts")
+    p_site_list.add_argument("--groups", action="store_true", default=argparse.SUPPRESS, help="List groups")
+    p_site_list.add_argument("--account-id", default=None, help="Filter sites/groups by account ID(s)")
+    p_site_list.add_argument("--site-id", default=None, help="Filter groups by site ID(s)")
+    p_site_list.add_argument("--tier", default=argparse.SUPPRESS, help="Filter sites by tier")
+    p_site_list.add_argument("--query", default=argparse.SUPPRESS, help="Search query")
+    p_site_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum items to return")
+    p_site_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_create = sites_sub.add_parser("create", help="Create a new SentinelOne site (Admin)")
+    p_site_create.add_argument("--name", required=True, help="Site name")
+    p_site_create.add_argument("--account-id", default=None, help="Parent account ID")
+    p_site_create.add_argument("--site-type", default="Paid", choices=sorted(SITE_TYPES), help="Site type")
+    p_site_create.add_argument("--licenses", "--total-licenses", dest="total_licenses", type=int, default=None, help="Total licenses")
+    p_site_create.add_argument("--unlimited-licenses", action="store_true", default=None, help="Unlimited licenses")
+    p_site_create.add_argument("--no-unlimited-expiration", action="store_true", default=False, help="Require explicit expiration date")
+    p_site_create.add_argument("--expiration", default=None, help="Expiration timestamp (ISO 8601)")
+    p_site_create.add_argument("--inherit-account-expiration", action=argparse.BooleanOptionalAction, default=None, help="Inherit account expiration")
+    p_site_create.add_argument("--sku", default=None, choices=sorted(SITE_SKUS), help="Site SKU")
+    p_site_create.add_argument("--suite", default=None, choices=sorted(SITE_SKUS), help="Site suite")
+    p_site_create.add_argument("--description", default="", help="Site description")
+    p_site_create.add_argument("--no-inherits", action="store_true", default=False, help="Do not inherit parent policy")
+    p_site_create.add_argument("--usage-type", default=None, choices=sorted(SITE_USAGE_TYPES), help="Usage type")
+    p_site_create.add_argument("--external-id", default=None, help="External/CRM tenant ID")
+    p_site_create.add_argument("--policy-json", default=None, help="Custom policy JSON or file path")
+    p_site_create.add_argument("--copy-policy-from", default=None, help="Source site ID to copy policy from")
+    p_site_create.add_argument("--clone-exclusions-from", default=None, help="Source site ID to clone exclusions from")
+    p_site_create.add_argument("--yes", action="store_true", default=False, help="Approve site creation")
+    p_site_create.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_create.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_edit = sites_sub.add_parser("edit", help="Edit an existing SentinelOne site (Admin)")
+    p_site_edit.add_argument("site_id", help="Target site ID")
+    p_site_edit.add_argument("--name", default=None, help="New site name")
+    p_site_edit.add_argument("--site-type", default=None, choices=sorted(SITE_TYPES), help="Site type")
+    p_site_edit.add_argument("--licenses", "--total-licenses", dest="total_licenses", type=int, default=None, help="Total licenses")
+    p_site_edit.add_argument("--unlimited-licenses", action=argparse.BooleanOptionalAction, default=None, help="Unlimited licenses")
+    p_site_edit.add_argument("--unlimited-expiration", action=argparse.BooleanOptionalAction, default=None, help="Unlimited expiration")
+    p_site_edit.add_argument("--expiration", default=None, help="Expiration timestamp")
+    p_site_edit.add_argument("--inherit-account-expiration", action=argparse.BooleanOptionalAction, default=None, help="Inherit account expiration")
+    p_site_edit.add_argument("--sku", default=None, choices=sorted(SITE_SKUS), help="Site SKU")
+    p_site_edit.add_argument("--description", default=None, help="Description")
+    p_site_edit.add_argument("--usage-type", default=None, choices=sorted(SITE_USAGE_TYPES), help="Usage type")
+    p_site_edit.add_argument("--external-id", default=None, help="External ID")
+    p_site_edit.add_argument("--policy-json", default=None, help="Policy JSON or file path")
+    p_site_edit.add_argument("--yes", action="store_true", default=False, help="Approve site update")
+    p_site_edit.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_edit.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_dup = sites_sub.add_parser("duplicate", help="Duplicate an existing SentinelOne site (Admin)")
+    p_site_dup.add_argument("source_site_id", help="Numeric source site ID")
+    p_site_dup.add_argument("--name", required=True, help="New site name")
+    p_site_dup.add_argument("--policy-source", default="copy_source_site", choices=sorted(SITE_POLICY_SOURCES), help="Policy source")
+    p_site_dup.add_argument("--copy-users", action="store_true", default=False, help="Copy site users")
+    p_site_dup.add_argument("--licenses", "--total-licenses", dest="total_licenses", type=int, default=None, help="Total licenses")
+    p_site_dup.add_argument("--unlimited-licenses", action=argparse.BooleanOptionalAction, default=None, help="Unlimited licenses")
+    p_site_dup.add_argument("--policy-json", default=None, help="Custom policy JSON or file path")
+    p_site_dup.add_argument("--yes", action="store_true", default=False, help="Approve site duplication")
+    p_site_dup.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_dup.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_expire = sites_sub.add_parser("expire", help="Expire a SentinelOne site immediately (Admin)")
+    p_site_expire.add_argument("site_id", help="Target site ID")
+    p_site_expire.add_argument("--yes", action="store_true", default=False, help="Approve expiration")
+    p_site_expire.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_expire.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_react = sites_sub.add_parser("reactivate", help="Reactivate an expired SentinelOne site (Admin)")
+    p_site_react.add_argument("site_id", help="Target site ID")
+    p_site_react.add_argument("--unlimited", action=argparse.BooleanOptionalAction, default=True, help="Set unlimited expiration")
+    p_site_react.add_argument("--expiration", default=None, help="Optional expiration timestamp")
+    p_site_react.add_argument("--yes", action="store_true", default=False, help="Approve reactivation")
+    p_site_react.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_react.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_rot = sites_sub.add_parser("rotate-token", help="Rotate a site registration token (Admin)")
+    p_site_rot.add_argument("site_id", help="Target site ID")
+    p_site_rot.add_argument("--yes", action="store_true", default=False, help="Approve token rotation")
+    p_site_rot.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_rot.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_regen = sites_sub.add_parser("regenerate-key", help="Regenerate a site registration key (Admin)")
+    p_site_regen.add_argument("site_id", help="Target site ID")
+    p_site_regen.add_argument("--yes", action="store_true", default=False, help="Approve key regeneration")
+    p_site_regen.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_regen.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_pol = sites_sub.add_parser("policy", help="Inspect, update, or revert a site policy")
+    site_pol_sub = p_site_pol.add_subparsers(dest="policy_action")
+    p_site_pol_get = site_pol_sub.add_parser("get", help="Fetch site policy")
+    p_site_pol_get.add_argument("site_id", help="Site ID")
+    p_site_pol_get.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_pol_upd = site_pol_sub.add_parser("update", help="Update site policy (Admin)")
+    p_site_pol_upd.add_argument("site_id", help="Site ID")
+    p_site_pol_upd.add_argument("--policy-json", required=True, help="Policy JSON string or file path")
+    p_site_pol_upd.add_argument("--yes", action="store_true", default=False, help="Approve policy update")
+    p_site_pol_upd.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_pol_upd.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_pol_rev = site_pol_sub.add_parser("revert", help="Revert site policy to parent account (Admin)")
+    p_site_pol_rev.add_argument("site_id", help="Site ID")
+    p_site_pol_rev.add_argument("--yes", action="store_true", default=False, help="Approve policy revert")
+    p_site_pol_rev.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_pol_rev.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_site_del = sites_sub.add_parser("delete", help="Delete a SentinelOne site (Admin + exact --confirm-name)")
+    p_site_del.add_argument("site_id", help="Target site ID")
+    p_site_del.add_argument("--confirm-name", default=None, help="Exact site name required for confirmation")
+    p_site_del.add_argument("--yes", action="store_true", default=False, help="Approve site deletion")
+    p_site_del.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_site_del.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_users = s1_sub.add_parser("users", help="List and administer SentinelOne console users")
+    p_s1_users.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    users_sub = p_s1_users.add_subparsers(dest="users_action")
+
+    p_usr_list = users_sub.add_parser("list", help="List SentinelOne console users")
+    p_usr_list.add_argument("--query", default=None, help="Search query")
+    p_usr_list.add_argument("--email", default=None, help="Filter by email")
+    p_usr_list.add_argument("--name", "--full-name", dest="full_name", default=None, help="Filter by full name")
+    p_usr_list.add_argument("--account-id", default=None, help="Filter by account ID(s)")
+    p_usr_list.add_argument("--site-id", default=None, help="Filter by site ID(s)")
+    p_usr_list.add_argument("--role-id", default=None, help="Filter by role ID(s)")
+    p_usr_list.add_argument("--limit", type=int, default=100, help="Maximum users to return")
+    p_usr_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_create = users_sub.add_parser("create", help="Create a SentinelOne console user (Admin)")
+    p_usr_create.add_argument("--email", required=True, help="User email address")
+    p_usr_create.add_argument("--name", "--full-name", dest="full_name", required=True, help="User full name")
+    p_usr_create.add_argument("--scope", default=None, choices=sorted(USER_SCOPES), help="RBAC scope (tenant, account, site)")
+    p_usr_create.add_argument("--site-id", default=None, help="Target site ID(s)")
+    p_usr_create.add_argument("--account-id", default=None, help="Target account ID(s)")
+    p_usr_create.add_argument("--role-id", default=None, help="RBAC role ID")
+    p_usr_create.add_argument("--role-name", default=None, help="RBAC role name")
+    p_usr_create.add_argument("--scope-roles-json", default=None, help="Raw scopeRoles JSON array")
+    p_usr_create.add_argument("--clone-from", default=None, help="Source user ID to clone RBAC permissions from")
+    p_usr_create.add_argument("--password", default=None, help="Optional initial password")
+    p_usr_create.add_argument("--two-fa", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable 2FA")
+    p_usr_create.add_argument("--allow-remote-shell", action=argparse.BooleanOptionalAction, default=None, help="Allow remote shell")
+    p_usr_create.add_argument("--yes", action="store_true", default=False, help="Approve user creation")
+    p_usr_create.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_create.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_edit = users_sub.add_parser("edit", help="Edit an existing SentinelOne console user (Admin)")
+    p_usr_edit.add_argument("user_id", help="Target user ID")
+    p_usr_edit.add_argument("--scope", default=None, choices=sorted(USER_SCOPES), help="RBAC scope")
+    p_usr_edit.add_argument("--site-id", default=None, help="Target site ID(s)")
+    p_usr_edit.add_argument("--account-id", default=None, help="Target account ID(s)")
+    p_usr_edit.add_argument("--role-id", default=None, help="RBAC role ID")
+    p_usr_edit.add_argument("--role-name", default=None, help="RBAC role name")
+    p_usr_edit.add_argument("--scope-roles-json", default=None, help="Raw scopeRoles JSON array")
+    p_usr_edit.add_argument("--name", "--full-name", dest="full_name", default=None, help="Updated full name")
+    p_usr_edit.add_argument("--email", default=None, help="Updated email")
+    p_usr_edit.add_argument("--two-fa", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable 2FA")
+    p_usr_edit.add_argument("--can-generate-token", action=argparse.BooleanOptionalAction, default=None, help="Allow API token generation")
+    p_usr_edit.add_argument("--yes", action="store_true", default=False, help="Approve user update")
+    p_usr_edit.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_edit.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_clone = users_sub.add_parser("clone", help="Clone RBAC permissions from an existing user (Admin)")
+    p_usr_clone.add_argument("source_user_id", help="Source user ID")
+    p_usr_clone.add_argument("--target-user", default=None, help="Existing target user ID to update")
+    p_usr_clone.add_argument("--email", default=None, help="Email for newly created user")
+    p_usr_clone.add_argument("--name", "--full-name", dest="full_name", default=None, help="Full name for newly created user")
+    p_usr_clone.add_argument("--to-site", action="append", default=None, help="Target site ID(s) to re-scope cloned roles")
+    p_usr_clone.add_argument("--service-user", action="store_true", default=False, help="Source ID is a service user")
+    p_usr_clone.add_argument("--yes", action="store_true", default=False, help="Approve cloning mutation")
+    p_usr_clone.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_clone.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_rpw = users_sub.add_parser("reset-password", help="Send password reset email(s) (Admin)")
+    p_usr_rpw.add_argument("user_ids", nargs="+", help="User ID(s)")
+    p_usr_rpw.add_argument("--yes", action="store_true", default=False, help="Approve action")
+    p_usr_rpw.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_rpw.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_r2fa = users_sub.add_parser("reset-2fa", help="Reset or delete 2FA for user(s) (Admin)")
+    p_usr_r2fa.add_argument("user_ids", nargs="+", help="User ID(s)")
+    p_usr_r2fa.add_argument("--enroll", action="store_true", default=False, help="Trigger 2FA re-enrollment")
+    p_usr_r2fa.add_argument("--delete-2fa", action="store_true", default=False, help="Delete 2FA configuration")
+    p_usr_r2fa.add_argument("--yes", action="store_true", default=False, help="Approve action")
+    p_usr_r2fa.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_r2fa.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_logout = users_sub.add_parser("logout", help="Log out current SentinelOne API user session (Admin)")
+    p_usr_logout.add_argument("--yes", action="store_true", default=False, help="Approve logout")
+    p_usr_logout.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_logout.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_usr_del = users_sub.add_parser("delete", help="Delete one or more SentinelOne console users (Admin)")
+    p_usr_del.add_argument("user_ids", nargs="+", help="User ID(s)")
+    p_usr_del.add_argument("--yes", action="store_true", default=False, help="Approve deletion")
+    p_usr_del.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_usr_del.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_su = s1_sub.add_parser("service-users", help="List and administer SentinelOne service users")
+    p_s1_su.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    su_sub = p_s1_su.add_subparsers(dest="service_users_action")
+
+    p_su_list = su_sub.add_parser("list", help="List SentinelOne service users")
+    p_su_list.add_argument("--query", default=None, help="Search query")
+    p_su_list.add_argument("--account-id", default=None, help="Filter by account ID(s)")
+    p_su_list.add_argument("--site-id", default=None, help="Filter by site ID(s)")
+    p_su_list.add_argument("--role-id", default=None, help="Filter by role ID(s)")
+    p_su_list.add_argument("--limit", type=int, default=100, help="Maximum service users to return")
+    p_su_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_su_create = su_sub.add_parser("create", help="Create a SentinelOne service user (Admin)")
+    p_su_create.add_argument("--name", required=True, help="Service user name")
+    p_su_create.add_argument("--expiration-date", required=True, help="Token expiration date (YYYY-MM-DD or ISO 8601)")
+    p_su_create.add_argument("--scope", default=None, choices=sorted(USER_SCOPES), help="RBAC scope")
+    p_su_create.add_argument("--site-id", default=None, help="Target site ID(s)")
+    p_su_create.add_argument("--account-id", default=None, help="Target account ID(s)")
+    p_su_create.add_argument("--role-id", default=None, help="RBAC role ID")
+    p_su_create.add_argument("--role-name", default=None, help="RBAC role name")
+    p_su_create.add_argument("--scope-roles-json", default=None, help="Raw scopeRoles JSON array")
+    p_su_create.add_argument("--description", default=None, help="Optional description")
+    p_su_create.add_argument("--force-legacy", action=argparse.BooleanOptionalAction, default=None, help="Use legacy token format")
+    p_su_create.add_argument("--yes", action="store_true", default=False, help="Approve creation")
+    p_su_create.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_su_create.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_su_edit = su_sub.add_parser("edit", help="Update a SentinelOne service user (Admin)")
+    p_su_edit.add_argument("service_user_id", help="Service user ID")
+    p_su_edit.add_argument("--description", default=None, help="Updated description")
+    p_su_edit.add_argument("--scope", default=None, choices=sorted(USER_SCOPES), help="Updated scope")
+    p_su_edit.add_argument("--site-id", default=None, help="Target site ID(s)")
+    p_su_edit.add_argument("--account-id", default=None, help="Target account ID(s)")
+    p_su_edit.add_argument("--role-id", default=None, help="RBAC role ID")
+    p_su_edit.add_argument("--role-name", default=None, help="RBAC role name")
+    p_su_edit.add_argument("--scope-roles-json", default=None, help="Raw scopeRoles JSON array")
+    p_su_edit.add_argument("--yes", action="store_true", default=False, help="Approve update")
+    p_su_edit.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_su_edit.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_su_del = su_sub.add_parser("delete", help="Delete one or more SentinelOne service users (Admin)")
+    p_su_del.add_argument("service_user_ids", nargs="+", help="Service user ID(s)")
+    p_su_del.add_argument("--yes", action="store_true", default=False, help="Approve deletion")
+    p_su_del.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_su_del.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_su_tok = su_sub.add_parser("token", help="Generate a new API token for a service user (Admin)")
+    p_su_tok.add_argument("service_user_id", help="Service user ID")
+    p_su_tok.add_argument("--expiration-date", required=True, help="Expiration date (YYYY-MM-DD or ISO 8601)")
+    p_su_tok.add_argument("--yes", action="store_true", default=False, help="Approve token generation")
+    p_su_tok.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_su_tok.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_roles = s1_sub.add_parser("roles", help="List SentinelOne RBAC roles")
+    p_s1_roles.add_argument("--account-id", default=None, help="Filter by account ID(s)")
+    p_s1_roles.add_argument("--site-id", default=None, help="Filter by site ID(s)")
+    p_s1_roles.add_argument("--group-id", default=None, help="Filter by group ID(s)")
+    p_s1_roles.add_argument("--include-parents", action=argparse.BooleanOptionalAction, default=None, help="Include parent roles")
+    p_s1_roles.add_argument("--include-children", action=argparse.BooleanOptionalAction, default=None, help="Include child roles")
+    p_s1_roles.add_argument("--predefined-role", action=argparse.BooleanOptionalAction, default=None, help="Filter predefined roles")
+    p_s1_roles.add_argument("--name", default=None, help="Filter by exact role name")
+    p_s1_roles.add_argument("--query", default=None, help="Search query")
+    p_s1_roles.add_argument("--limit", type=int, default=100, help="Maximum roles to return")
+    p_s1_roles.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    roles_sub = p_s1_roles.add_subparsers(dest="roles_action")
+    p_roles_list = roles_sub.add_parser("list", help="List SentinelOne RBAC roles")
+    p_roles_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Filter by account ID(s)")
+    p_roles_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Filter by site ID(s)")
+    p_roles_list.add_argument("--group-id", default=argparse.SUPPRESS, help="Filter by group ID(s)")
+    p_roles_list.add_argument("--include-parents", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS, help="Include parent roles")
+    p_roles_list.add_argument("--include-children", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS, help="Include child roles")
+    p_roles_list.add_argument("--predefined-role", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS, help="Filter predefined roles")
+    p_roles_list.add_argument("--name", default=argparse.SUPPRESS, help="Filter by role name")
+    p_roles_list.add_argument("--query", default=argparse.SUPPRESS, help="Search query")
+    p_roles_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum roles")
+    p_roles_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_s1_ca = s1_sub.add_parser("cloud-alerts", help="List and triage SentinelOne Cloud/STAR detection alerts")
+    p_s1_ca.add_argument("--query", default=None, help="Search query")
+    p_s1_ca.add_argument("--status", default=None, help=f"Incident status ({', '.join(sorted(INCIDENT_STATUSES))})")
+    p_s1_ca.add_argument("--verdict", default=None, help=f"Analyst verdict ({', '.join(sorted(ANALYST_VERDICTS))})")
+    p_s1_ca.add_argument("--severity", default=None, help=f"Severity ({', '.join(sorted(CLOUD_ALERT_SEVERITIES))})")
+    p_s1_ca.add_argument("--scope", default=None, help=f"Scope ({', '.join(sorted(CLOUD_ALERT_SCOPES))})")
+    p_s1_ca.add_argument("--os-type", default=None, help="Filter OS type(s)")
+    p_s1_ca.add_argument("--rule-name", default=None, help="Filter by rule name substring")
+    p_s1_ca.add_argument("--computer-name", default=None, help="Filter by agent hostname")
+    p_s1_ca.add_argument("--sha1", default=None, help="Filter by process SHA-1")
+    p_s1_ca.add_argument("--account-id", default=None, help="Account ID(s)")
+    p_s1_ca.add_argument("--site-id", default=None, help="Site ID(s)")
+    p_s1_ca.add_argument("--group-id", default=None, help="Group ID(s)")
+    p_s1_ca.add_argument("--limit", type=int, default=100, help="Maximum alerts to return")
+    p_s1_ca.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    ca_sub = p_s1_ca.add_subparsers(dest="cloud_alerts_action")
+
+    p_ca_list = ca_sub.add_parser("list", help="List SentinelOne Cloud/STAR alerts")
+    p_ca_list.add_argument("--query", default=argparse.SUPPRESS, help="Search query")
+    p_ca_list.add_argument("--status", default=argparse.SUPPRESS, help="Incident status filter")
+    p_ca_list.add_argument("--verdict", default=argparse.SUPPRESS, help="Analyst verdict filter")
+    p_ca_list.add_argument("--severity", default=argparse.SUPPRESS, help="Severity filter")
+    p_ca_list.add_argument("--scope", default=argparse.SUPPRESS, help="Scope filter")
+    p_ca_list.add_argument("--os-type", default=argparse.SUPPRESS, help="OS type filter")
+    p_ca_list.add_argument("--rule-name", default=argparse.SUPPRESS, help="Rule name substring")
+    p_ca_list.add_argument("--computer-name", default=argparse.SUPPRESS, help="Agent hostname")
+    p_ca_list.add_argument("--sha1", default=argparse.SUPPRESS, help="Process SHA-1")
+    p_ca_list.add_argument("--account-id", default=argparse.SUPPRESS, help="Account ID(s)")
+    p_ca_list.add_argument("--site-id", default=argparse.SUPPRESS, help="Site ID(s)")
+    p_ca_list.add_argument("--group-id", default=argparse.SUPPRESS, help="Group ID(s)")
+    p_ca_list.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Maximum alerts")
+    p_ca_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_ca_verd = ca_sub.add_parser("verdict", help="Update analyst verdict on Cloud/STAR alert(s)")
+    p_ca_verd.add_argument("alert_ids", nargs="+", help="Alert ID(s)")
+    p_ca_verd.add_argument("--verdict", required=True, choices=sorted(ANALYST_VERDICTS), help="Analyst verdict")
+    p_ca_verd.add_argument("--yes", action="store_true", default=False, help="Approve update")
+    p_ca_verd.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_ca_verd.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_ca_stat = ca_sub.add_parser("incident-status", help="Update incident status on Cloud/STAR alert(s)")
+    p_ca_stat.add_argument("alert_ids", nargs="+", help="Alert ID(s)")
+    p_ca_stat.add_argument("--status", required=True, choices=sorted(INCIDENT_STATUSES), help="Incident status")
+    p_ca_stat.add_argument("--yes", action="store_true", default=False, help="Approve update")
+    p_ca_stat.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Dry run")
+    p_ca_stat.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     p_s1_act = s1_sub.add_parser("activities", help="List SentinelOne audit/activity logs")
     p_s1_act.add_argument("--agent-id", default=None, help="Filter by agent ID")
@@ -2171,6 +3131,91 @@ def build_parser() -> argparse.ArgumentParser:
     p_set_reset.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without modifying")
     p_set_reset.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
+    # 9. Secret manager / PAM integration subcommands
+    secrets_parser = subparsers.add_parser(
+        "secrets",
+        help="Test, browse, map, and hydrate credentials from an external secret manager / PAM",
+    )
+    secrets_parser.add_argument(
+        "--provider",
+        choices=[p for p in SUPPORTED_SECRET_PROVIDERS if p != "none"],
+        default=None,
+        help="Override configured secret store provider",
+    )
+    secrets_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="JSON output",
+    )
+    secrets_sub = secrets_parser.add_subparsers(dest="secrets_command")
+
+    p_sec_test = secrets_sub.add_parser("test", help="Verify secret store connectivity and auth")
+    p_sec_test.add_argument(
+        "--provider",
+        choices=[p for p in SUPPORTED_SECRET_PROVIDERS if p != "none"],
+        default=argparse.SUPPRESS,
+        help="Override configured secret store provider",
+    )
+    p_sec_test.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_sec_list = secrets_sub.add_parser("list", help="Search/list selectable secret entries")
+    p_sec_list.add_argument("--search", default="", help="Optional substring filter")
+    p_sec_list.add_argument("--limit", type=int, default=100, help="Maximum entries (default: 100)")
+    p_sec_list.add_argument(
+        "--provider",
+        choices=[p for p in SUPPORTED_SECRET_PROVIDERS if p != "none"],
+        default=argparse.SUPPRESS,
+        help="Override configured secret store provider",
+    )
+    p_sec_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_sec_fields = secrets_sub.add_parser("fields", help="Inspect available fields for a secret/item ID")
+    p_sec_fields.add_argument("secret_id", help="Secret ID, Vault path, or canonical vault reference")
+    p_sec_fields.add_argument(
+        "--reveal",
+        action="store_true",
+        default=False,
+        help="Fetch and display plaintext field values (masked by default)",
+    )
+    p_sec_fields.add_argument(
+        "--provider",
+        choices=[p for p in SUPPORTED_SECRET_PROVIDERS if p != "none"],
+        default=argparse.SUPPRESS,
+        help="Override configured secret store provider",
+    )
+    p_sec_fields.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_sec_map = secrets_sub.add_parser("map", help="Bind a SOCLens secret setting key to a vault reference")
+    p_sec_map.add_argument("setting_key", help="Secret-managed setting key or env alias (e.g. rf_api_token)")
+    p_sec_map.add_argument("vault_ref", help="Canonical vault reference (<provider>:<item_id>:<field_key>)")
+    p_sec_map.add_argument("--profile", default=None, help="Target settings profile (default: active)")
+    p_sec_map.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without saving")
+    p_sec_map.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_sec_unmap = secrets_sub.add_parser("unmap", help="Remove a vault reference mapping for a setting key")
+    p_sec_unmap.add_argument("setting_key", help="Secret-managed setting key or env alias")
+    p_sec_unmap.add_argument("--profile", default=None, help="Target settings profile (default: active)")
+    p_sec_unmap.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without saving")
+    p_sec_unmap.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_sec_pull = secrets_sub.add_parser("pull", help="Hydrate mapped secrets into process-local memory")
+    p_sec_pull.add_argument("--force", action="store_true", default=False, help="Re-hydrate session overrides")
+    p_sec_pull.add_argument(
+        "--overwrite-existing",
+        action="store_true",
+        default=False,
+        help="Hydrate even when shell environment variables are set",
+    )
+    p_sec_pull.add_argument(
+        "--provider",
+        choices=[p for p in SUPPORTED_SECRET_PROVIDERS if p != "none"],
+        default=argparse.SUPPRESS,
+        help="Override configured secret store provider",
+    )
+    p_sec_pull.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without fetching")
+    p_sec_pull.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
     _attach_ssl_flags_recursive(parser)
     return parser
 
@@ -2179,7 +3224,7 @@ def _attach_ssl_flags_recursive(
     parser: argparse.ArgumentParser,
     _seen: set[int] | None = None,
 ) -> None:
-    """Attach SSL proxy flags to all subparsers so flags work before or after subcommands."""
+    """Attach global flags to all subparsers so flags work before or after subcommands."""
     if _seen is None:
         _seen = {id(parser)}
     for action in getattr(parser, "_actions", ()):
@@ -2193,21 +3238,56 @@ def _attach_ssl_flags_recursive(
             if sub_id in _seen:
                 continue
             _seen.add(sub_id)
-            subparser.add_argument(
-                "-k",
-                "--insecure",
-                "--no-verify-ssl",
-                dest="insecure",
-                action="store_true",
-                default=argparse.SUPPRESS,
-                help=argparse.SUPPRESS,
-            )
-            subparser.add_argument(
-                "--ca-bundle",
-                dest="ca_bundle",
-                default=argparse.SUPPRESS,
-                help=argparse.SUPPRESS,
-            )
+            opt_actions = getattr(subparser, "_option_string_actions", {})
+            if "--insecure" not in opt_actions and "-k" not in opt_actions:
+                subparser.add_argument(
+                    "-k",
+                    "--insecure",
+                    "--no-verify-ssl",
+                    dest="insecure",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS,
+                )
+            if "--ca-bundle" not in opt_actions:
+                subparser.add_argument(
+                    "--ca-bundle",
+                    dest="ca_bundle",
+                    default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS,
+                )
+            if "--no-secret-store" not in opt_actions:
+                subparser.add_argument(
+                    "--no-secret-store",
+                    dest="no_secret_store",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS,
+                )
+            if "--admin" not in opt_actions:
+                subparser.add_argument(
+                    "--admin",
+                    dest="admin",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS,
+                )
+            if "--json" not in opt_actions:
+                subparser.add_argument(
+                    "--json",
+                    dest="json",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS,
+                )
+            if "--dry-run" not in opt_actions:
+                subparser.add_argument(
+                    "--dry-run",
+                    dest="dry_run",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS,
+                )
             _attach_ssl_flags_recursive(subparser, _seen)
 
 
@@ -2220,7 +3300,15 @@ def _handle_watchlist(
 ) -> int:
     sub = args.subcommand or "interactive"
     if sub == "interactive":
-        run_unified_tui(client, dry_run=global_dry_run, initial_tab="tab-watchlists")
+        if bool(getattr(args, "no_secret_store", False)):
+            run_unified_tui(
+                client,
+                dry_run=global_dry_run,
+                initial_tab="tab-watchlists",
+                no_secret_store=True,
+            )
+        else:
+            run_unified_tui(client, dry_run=global_dry_run, initial_tab="tab-watchlists")
         return 0
 
     if sub == "list":
@@ -4279,6 +5367,95 @@ def _print_cli_table(rows: list[dict[str, Any]], cols: list[str]) -> None:
         )
 
 
+def _parse_json_mapping_arg(raw: str | None, *, flag_name: str) -> dict[str, Any] | None:
+    """Parse a CLI JSON object string or file path into a ``dict``."""
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    text = cleaned
+    if not cleaned.startswith("{"):
+        path = Path(cleaned[1:] if cleaned.startswith("@") else cleaned).expanduser()
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+    try:
+        loaded: Any = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid JSON for {flag_name}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{flag_name} must decode to a JSON object.")
+    return loaded
+
+
+def _parse_json_list_arg(raw: str | None, *, flag_name: str) -> list[dict[str, Any]] | None:
+    """Parse a CLI JSON array of objects into ``list[dict[str, Any]]``."""
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    try:
+        loaded: Any = json.loads(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid JSON for {flag_name}: {exc}") from exc
+    if not isinstance(loaded, list) or not all(isinstance(item, dict) for item in loaded):
+        raise ValueError(f"{flag_name} must decode to a JSON array of objects.")
+    return loaded
+
+
+def _parse_kv_params(
+    param_items: list[str] | None,
+    params_json: str | None,
+) -> dict[str, Any]:
+    """Combine ``--params-json`` and repeatable ``--param key=value`` options."""
+    merged: dict[str, Any] = {}
+    parsed_json = _parse_json_mapping_arg(params_json, flag_name="--params-json")
+    if parsed_json:
+        merged.update(parsed_json)
+    for item in param_items or ():
+        if "=" not in item:
+            raise ValueError(f"Invalid --param {item!r}. Expected 'key=value' format.")
+        key, val = item.split("=", 1)
+        clean_k = key.strip()
+        if not clean_k:
+            raise ValueError(f"Invalid --param {item!r}. Key must be non-empty.")
+        merged[clean_k] = val
+    return merged
+
+
+def _check_es_write_guard(
+    args: argparse.Namespace,
+    *,
+    global_dry_run: bool,
+    emit_json: bool,
+    action: str,
+    target: dict[str, Any],
+) -> tuple[bool, int]:
+    """Enforce ``--dry-run`` and ``--yes`` / ``SOCLENS_AUTO_APPROVE`` for ES v2.1 writes."""
+    is_dry = bool(global_dry_run or getattr(args, "dry_run", False))
+    if is_dry:
+        payload = {"dry_run": True, "action": action, **target}
+        if emit_json:
+            _emit_json(payload)
+        else:
+            print(f"[DRY-RUN] Would execute Splunk ES action '{action}': {json.dumps(target, default=str)}")
+        return False, 0
+
+    if not (bool(getattr(args, "yes", False)) or is_auto_approved()):
+        msg = (
+            f"Approval required for Splunk ES write action '{action}'. "
+            "Pass --yes or set SOCLENS_AUTO_APPROVE=true (or use --dry-run to preview)."
+        )
+        if emit_json:
+            print(json.dumps({"error": msg, "action": action, "approval_required": True}, indent=2), file=sys.stderr)
+        else:
+            print(f"[-] {msg}", file=sys.stderr)
+        return False, 1
+
+    return True, 0
+
+
 def _handle_splunk_es(
     args: argparse.Namespace,
     *,
@@ -4290,7 +5467,7 @@ def _handle_splunk_es(
     emit_json = bool(use_json or getattr(args, "format", None) == "json")
 
     if es_sub == "update-notable" and effective_dry_run:
-        preview = {
+        preview: dict[str, Any] = {
             "dry_run": True,
             "event_id": args.event_id,
             "status": args.status,
@@ -4299,6 +5476,12 @@ def _handle_splunk_es(
             "disposition": args.disposition,
             "comment": args.comment,
         }
+        if bool(getattr(args, "use_v2", False)):
+            preview["use_v2"] = True
+        if getattr(args, "sensitivity", None) is not None:
+            preview["sensitivity"] = args.sensitivity
+        if getattr(args, "queue_id", None) is not None:
+            preview["queue_id"] = args.queue_id
         if emit_json:
             _emit_json(preview)
         else:
@@ -4336,8 +5519,306 @@ def _handle_splunk_es(
                 )
                 return 1
 
+    if es_sub == "custom-fields" and bool(getattr(args, "offline", False)):
+        tenant_cfg = get_splunk_es_tenant_settings()
+        payload_cf: dict[str, Any] = {
+            "tenant_field": tenant_cfg.tenant_field,
+            "tenant_aliases": list(tenant_cfg.tenant_aliases),
+            "pinned_custom_fields": list(tenant_cfg.custom_fields),
+            "discovered_fields": [],
+            "offline": True,
+        }
+        if emit_json:
+            _emit_json(payload_cf)
+        else:
+            print(f"Tenant Field  : {tenant_cfg.tenant_field}")
+            print(f"Tenant Aliases: {', '.join(tenant_cfg.tenant_aliases)}")
+            print(f"Pinned Fields : {', '.join(tenant_cfg.custom_fields) or '(none)'}")
+        return 0
+
+    if es_sub == "investigations":
+        inv_act = getattr(args, "inv_action", None) or "list"
+        if inv_act == "create":
+            fids = _split_csv_arg(getattr(args, "finding_ids", None))
+            ftimes = _split_csv_arg(getattr(args, "finding_times", None))
+            proceed, rc = _check_es_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                emit_json=emit_json,
+                action="create-investigation",
+                target={"name": args.name, "finding_ids": fids},
+            )
+            if not proceed:
+                return rc
+            with _build_splunk_es_client_from_args(args) as es:
+                created_inv = es.create_investigation(
+                    args.name,
+                    description=args.description,
+                    investigation_type=args.investigation_type,
+                    status=args.status,
+                    disposition=args.disposition,
+                    owner=args.owner,
+                    urgency=args.urgency,
+                    sensitivity=args.sensitivity,
+                    finding_ids=fids or None,
+                    finding_times=ftimes or None,
+                    queue_id=args.queue_id,
+                    ensure_enriched=args.ensure_enriched,
+                )
+            if emit_json:
+                _emit_json(created_inv)
+            else:
+                print(
+                    f"[+] Created Splunk ES investigation '{created_inv.get('name', args.name)}' "
+                    f"(id={created_inv.get('investigation_guid') or created_inv.get('id', '-')})."
+                )
+            return 0
+
+        if inv_act == "update":
+            proceed, rc = _check_es_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                emit_json=emit_json,
+                action="update-investigation",
+                target={"investigation_id": args.investigation_id},
+            )
+            if not proceed:
+                return rc
+            with _build_splunk_es_client_from_args(args) as es:
+                updated_inv = es.update_investigation(
+                    args.investigation_id,
+                    finding_time=args.finding_time,
+                    name=args.name,
+                    description=args.description,
+                    status=args.status,
+                    owner=args.owner,
+                    urgency=args.urgency,
+                    sensitivity=args.sensitivity,
+                    investigation_type=args.investigation_type,
+                    queue_id=args.queue_id,
+                    investigation_note=args.note,
+                )
+            if emit_json:
+                _emit_json(updated_inv)
+            else:
+                print(f"[+] Updated Splunk ES investigation '{args.investigation_id}'.")
+            return 0
+
+        if inv_act in ("add-findings", "attach"):
+            fids = _split_csv_arg(args.finding_ids)
+            ftimes = _split_csv_arg(getattr(args, "finding_times", None))
+            proceed, rc = _check_es_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                emit_json=emit_json,
+                action="add-findings-to-investigation",
+                target={"investigation_id": args.investigation_id, "finding_ids": fids},
+            )
+            if not proceed:
+                return rc
+            with _build_splunk_es_client_from_args(args) as es:
+                attached = es.add_findings_to_investigation(
+                    args.investigation_id,
+                    fids,
+                    finding_times=ftimes or None,
+                    ensure_enriched=args.ensure_enriched,
+                )
+            if emit_json:
+                _emit_json(attached)
+            else:
+                print(f"[+] Attached {len(fids)} finding(s) to investigation '{args.investigation_id}'.")
+            return 0
+
+    if es_sub == "notes":
+        notes_act = getattr(args, "notes_action", None) or "list"
+        if notes_act == "create":
+            proceed, rc = _check_es_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                emit_json=emit_json,
+                action="create-note",
+                target={"record_id": args.record_id, "title": args.title},
+            )
+            if not proceed:
+                return rc
+            with _build_splunk_es_client_from_args(args) as es:
+                note_res = es.create_note(
+                    args.record_id,
+                    args.content,
+                    title=args.title,
+                    finding_time=args.finding_time,
+                )
+            if emit_json:
+                _emit_json(note_res)
+            else:
+                print(f"[+] Created note on '{args.record_id}'.")
+            return 0
+
+        if notes_act == "update":
+            proceed, rc = _check_es_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                emit_json=emit_json,
+                action="update-note",
+                target={"record_id": args.record_id, "note_id": args.note_id},
+            )
+            if not proceed:
+                return rc
+            with _build_splunk_es_client_from_args(args) as es:
+                note_res = es.update_note(
+                    args.record_id,
+                    args.note_id,
+                    title=args.title,
+                    content=args.content,
+                    finding_time=args.finding_time,
+                )
+            if emit_json:
+                _emit_json(note_res)
+            else:
+                print(f"[+] Updated note '{args.note_id}' on '{args.record_id}'.")
+            return 0
+
+        if notes_act == "delete":
+            proceed, rc = _check_es_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                emit_json=emit_json,
+                action="delete-note",
+                target={"record_id": args.record_id, "note_id": args.note_id},
+            )
+            if not proceed:
+                return rc
+            with _build_splunk_es_client_from_args(args) as es:
+                del_res = es.delete_note(
+                    args.record_id,
+                    args.note_id,
+                    finding_time=args.finding_time,
+                )
+            if emit_json:
+                _emit_json(del_res)
+            else:
+                print(f"[+] Deleted note '{args.note_id}' from '{args.record_id}'.")
+            return 0
+
+    if es_sub == "ar-dispatch" and not bool(getattr(args, "list", False)):
+        action_name = str(getattr(args, "action", None) or "").strip()
+        sid_val = str(getattr(args, "sid", None) or "").strip()
+        rid_val = str(getattr(args, "rid", None) or "").strip()
+        if not action_name or not sid_val or not rid_val:
+            raise ValueError(
+                "Specify --list to browse actions, or provide --action, --sid, and --rid to dispatch."
+            )
+        ar_params = _parse_kv_params(getattr(args, "param", None), getattr(args, "params_json", None))
+        proceed, rc = _check_es_write_guard(
+            args,
+            global_dry_run=global_dry_run,
+            emit_json=emit_json,
+            action="ar-dispatch",
+            target={
+                "action_name": action_name,
+                "sid": sid_val,
+                "rid": rid_val,
+                "params": ar_params,
+                "index": getattr(args, "index", None),
+            },
+        )
+        if not proceed:
+            return rc
+        with _build_splunk_es_client_from_args(args) as es:
+            disp_res = es.dispatch_adaptive_response(
+                action_name,
+                sid=sid_val,
+                rid=rid_val,
+                params=ar_params or None,
+                index=getattr(args, "index", None),
+            )
+        if emit_json:
+            _emit_json(disp_res)
+        else:
+            print(f"[+] Dispatched Adaptive Response action '{action_name}' (sid={sid_val}, rid={rid_val}).")
+        return 0
+
     with _build_splunk_es_client_from_args(args) as es:
         if es_sub == "notables":
+            use_hybrid = any(
+                [
+                    bool(getattr(args, "use_v2", False)),
+                    bool(getattr(args, "tenant", None)),
+                    bool(getattr(args, "disposition", None)),
+                    getattr(args, "item_type", "all") != "all",
+                    bool(getattr(args, "security_domain", None)),
+                    bool(getattr(args, "severity", None)),
+                    bool(getattr(args, "entity", None)),
+                    bool(getattr(args, "src", None)),
+                    bool(getattr(args, "dest", None)),
+                    bool(getattr(args, "user", None)),
+                    bool(getattr(args, "file_hash", None)),
+                    getattr(args, "min_risk_score", None) is not None,
+                    bool(getattr(args, "orig_sid", None)),
+                    bool(getattr(args, "raw_query", None)),
+                    bool(getattr(args, "include_investigations", False)),
+                    int(getattr(args, "offset", 0) or 0) != 0,
+                    bool(getattr(args, "sort", None)),
+                    bool(getattr(args, "use_spl", False)),
+                ]
+            )
+            if use_hybrid:
+                hybrid_res = es.query_findings_hybrid(
+                    earliest=args.earliest,
+                    latest=args.latest,
+                    urgency=args.urgency,
+                    status=args.status,
+                    owner=args.owner,
+                    disposition=getattr(args, "disposition", None),
+                    rule_name=args.rule_name,
+                    search_text=args.search_text,
+                    tenant_id=getattr(args, "tenant", None),
+                    security_domain=getattr(args, "security_domain", None),
+                    severity=getattr(args, "severity", None),
+                    entity=getattr(args, "entity", None),
+                    src=getattr(args, "src", None),
+                    dest=getattr(args, "dest", None),
+                    user=getattr(args, "user", None),
+                    file_hash=getattr(args, "file_hash", None),
+                    min_risk_score=getattr(args, "min_risk_score", None),
+                    orig_sid=getattr(args, "orig_sid", None),
+                    raw_query=getattr(args, "raw_query", None),
+                    item_type=getattr(args, "item_type", "all"),
+                    limit=args.limit,
+                    offset=int(getattr(args, "offset", 0) or 0),
+                    sort=getattr(args, "sort", None),
+                    use_spl=bool(getattr(args, "use_spl", False)),
+                    include_investigations=bool(getattr(args, "include_investigations", False)),
+                )
+                notables = list(hybrid_res.get("items") or [])
+                if emit_json:
+                    _emit_json(
+                        {
+                            "count": len(notables),
+                            "total": hybrid_res.get("total", len(notables)),
+                            "offset": hybrid_res.get("offset", 0),
+                            "limit": hybrid_res.get("limit", args.limit),
+                            "source_backend": hybrid_res.get("source_backend", "mc_v2"),
+                            "notables": notables,
+                        }
+                    )
+                    return 0
+                _print_cli_table(
+                    notables,
+                    [
+                        "_time",
+                        "event_id",
+                        "tenant_id",
+                        "urgency",
+                        "status_label",
+                        "rule_name",
+                        "owner",
+                        "src",
+                        "dest",
+                    ],
+                )
+                return 0
+
             notables = es.list_notables(
                 earliest=args.earliest,
                 latest=args.latest,
@@ -4358,18 +5839,172 @@ def _handle_splunk_es(
             return 0
 
         if es_sub == "update-notable":
-            resp = es.update_notable(
-                [args.event_id],
-                status=args.status,
-                urgency=args.urgency,
-                owner=args.owner,
-                disposition=args.disposition,
-                comment=args.comment,
+            use_v2_triage = bool(
+                getattr(args, "use_v2", False)
+                or getattr(args, "sensitivity", None) is not None
+                or getattr(args, "queue_id", None) is not None
             )
+            if use_v2_triage:
+                resp = es.triage_findings_hybrid(
+                    [args.event_id],
+                    status=args.status,
+                    urgency=args.urgency,
+                    owner=args.owner,
+                    disposition=args.disposition,
+                    sensitivity=getattr(args, "sensitivity", None),
+                    queue_id=getattr(args, "queue_id", None),
+                    note=args.comment,
+                    earliest=getattr(args, "earliest", None),
+                    latest=getattr(args, "latest", None),
+                )
+            else:
+                resp = es.update_notable(
+                    [args.event_id],
+                    status=args.status,
+                    urgency=args.urgency,
+                    owner=args.owner,
+                    disposition=args.disposition,
+                    comment=args.comment,
+                )
             if emit_json:
                 _emit_json({"event_id": args.event_id, "result": resp})
             else:
                 print(f"[+] Updated Splunk ES notable '{args.event_id}'.")
+            return 0
+
+        if es_sub == "investigations":
+            tenant_filter = str(getattr(args, "tenant", None) or "").strip()
+            raw_inv_limit = getattr(args, "limit", 100)
+            raw_inv_offset = getattr(args, "offset", 0)
+            invs = es.list_investigations(
+                ids=_split_csv_arg(getattr(args, "ids", None)) or None,
+                limit=100 if raw_inv_limit is None else int(raw_inv_limit),
+                offset=0 if raw_inv_offset is None else int(raw_inv_offset),
+                sort=getattr(args, "sort", None),
+                disposition=getattr(args, "disposition", None),
+                status=getattr(args, "status", None),
+                owner=getattr(args, "owner", None),
+                urgency=getattr(args, "urgency", None),
+            )
+            if tenant_filter:
+                tenant_cfg = get_splunk_es_tenant_settings()
+                want_low = tenant_filter.casefold()
+                invs = [
+                    inv
+                    for inv in invs
+                    if (
+                        str(extract_finding_tenant(inv, tenant_cfg) or inv.get("tenant_id") or "")
+                        .strip()
+                        .casefold()
+                        == want_low
+                    )
+                ]
+            if emit_json:
+                _emit_json({"count": len(invs), "investigations": invs})
+                return 0
+            _print_cli_table(
+                invs,
+                [
+                    "event_id",
+                    "tenant_id",
+                    "name",
+                    "status_label",
+                    "urgency",
+                    "owner",
+                    "disposition_label",
+                ],
+            )
+            return 0
+
+        if es_sub == "notes":
+            record_id = str(getattr(args, "record_id", None) or "").strip()
+            if not record_id:
+                raise ValueError("--record-id is required (or use 'notes list <record_id>').")
+            raw_notes_limit = getattr(args, "limit", 50)
+            raw_notes_offset = getattr(args, "offset", 0)
+            notes_res = es.list_notes(
+                record_id,
+                finding_time=getattr(args, "finding_time", None),
+                search=getattr(args, "search", None),
+                note_type=getattr(args, "note_type", None),
+                limit=50 if raw_notes_limit is None else int(raw_notes_limit),
+                offset=0 if raw_notes_offset is None else int(raw_notes_offset),
+                sort=getattr(args, "sort", None),
+            )
+            if emit_json:
+                _emit_json({"record_id": record_id, **notes_res})
+                return 0
+            _print_cli_table(
+                list(notes_res.get("items") or []),
+                ["id", "title", "author", "create_time", "content"],
+            )
+            return 0
+
+        if es_sub == "history":
+            hist = es.get_history(
+                args.record_id,
+                finding_time=args.finding_time,
+                limit=args.limit,
+                offset=args.offset,
+                exclude_sources=_split_csv_arg(args.exclude_sources) or None,
+                include_findings=args.include_findings,
+            )
+            if emit_json:
+                _emit_json({"record_id": args.record_id, **hist})
+                return 0
+            _print_cli_table(
+                list(hist.get("items") or []),
+                ["time", "author", "action", "field", "old_value", "new_value", "source"],
+            )
+            return 0
+
+        if es_sub == "ar-invocations":
+            invs_ar = es.list_modaction_invocations(args.sid, args.rid)
+            if emit_json:
+                _emit_json(
+                    {
+                        "sid": args.sid,
+                        "rid": args.rid,
+                        "count": len(invs_ar),
+                        "invocations": invs_ar,
+                    }
+                )
+                return 0
+            cols = list(invs_ar[0].keys()) if invs_ar else ["action_name", "status", "sid", "rid"]
+            _print_cli_table(invs_ar, cols)
+            return 0
+
+        if es_sub == "ar-dispatch":
+            actions = es.list_adaptive_response_actions(
+                adhoc_only=not bool(getattr(args, "all_actions", False)),
+            )
+            if emit_json:
+                _emit_json({"count": len(actions), "actions": actions})
+                return 0
+            _print_cli_table(
+                actions,
+                ["name", "label", "supports_adhoc", "required_params", "description"],
+            )
+            return 0
+
+        if es_sub == "custom-fields":
+            tenant_cfg = get_splunk_es_tenant_settings()
+            discovered = es.discover_custom_fields(force_refresh=bool(getattr(args, "refresh", False)))
+            if emit_json:
+                _emit_json(
+                    {
+                        "tenant_field": tenant_cfg.tenant_field,
+                        "tenant_aliases": list(tenant_cfg.tenant_aliases),
+                        "pinned_custom_fields": list(tenant_cfg.custom_fields),
+                        "discovered_fields": discovered,
+                        "offline": False,
+                    }
+                )
+                return 0
+            print(f"Tenant Field  : {tenant_cfg.tenant_field}")
+            print(f"Tenant Aliases: {', '.join(tenant_cfg.tenant_aliases)}")
+            print(f"Pinned Fields : {', '.join(tenant_cfg.custom_fields) or '(none)'}")
+            _print_cli_table(discovered, ["field", "label"])
             return 0
 
         if es_sub == "correlations":
@@ -4454,6 +6089,16 @@ def _handle_splunk_es(
                         messages=list(res.get("messages") or []),
                     )
                 raw_events = [r for r in (res.get("results") or []) if isinstance(r, dict)]
+            elif getattr(args, "tenant", None) or bool(getattr(args, "use_v2", False)):
+                hybrid_res = es.query_findings_hybrid(
+                    earliest=args.earliest,
+                    latest=args.latest,
+                    urgency=args.urgency,
+                    status=args.status,
+                    tenant_id=getattr(args, "tenant", None),
+                    limit=args.limit,
+                )
+                raw_events = list(hybrid_res.get("items") or [])
             else:
                 raw_events = es.list_notables(
                     earliest=args.earliest,
@@ -4747,6 +6392,90 @@ def _check_s1_write_guard(
     return True, 0
 
 
+def _check_s1_admin_guard(
+    args: argparse.Namespace,
+    *,
+    use_json: bool,
+    action: str,
+) -> tuple[bool, int]:
+    """Enforce ``--admin`` (or ``--view admin``) for SentinelOne administrative mutations."""
+    if bool(getattr(args, "admin", False)) or getattr(args, "view", None) == "admin":
+        return True, 0
+    msg = (
+        f"Admin mode required for SentinelOne administrative action '{action}'. "
+        "Pass --admin to authorize administrative mutations."
+    )
+    if use_json:
+        print(
+            json.dumps(
+                {"error": msg, "action": action, "admin_required": True},
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+    else:
+        print(f"[-] {msg}", file=sys.stderr)
+    return False, 1
+
+
+def _resolve_s1_scope_and_roles(
+    args: argparse.Namespace,
+    *,
+    client: SentinelOneClient | None = None,
+    default_scope: str | None = None,
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """Resolve ``(scope, scopeRoles)`` from CLI flags or ``--clone-from``."""
+    raw_scope = getattr(args, "scope", None)
+    site_ids = _split_csv_arg(getattr(args, "site_id", None) or getattr(args, "s1_site_id", None))
+    account_ids = _split_csv_arg(
+        getattr(args, "account_id", None) or getattr(args, "s1_account_id", None)
+    )
+    if raw_scope:
+        scope = str(raw_scope).strip().lower()
+    elif site_ids:
+        scope = "site"
+    elif account_ids:
+        scope = "account"
+    else:
+        scope = (default_scope or "tenant").strip().lower()
+
+    scope_roles_json = getattr(args, "scope_roles_json", None)
+    if scope_roles_json:
+        parsed_roles = _parse_json_list_arg(scope_roles_json, flag_name="--scope-roles-json")
+        return scope, parsed_roles
+
+    clone_from = getattr(args, "clone_from", None)
+    if clone_from and client is not None:
+        cloned = client.clone_user_permissions(
+            str(clone_from),
+            target_site_ids=site_ids or None,
+        )
+        resolved_scope = str(raw_scope or cloned.get("scope") or scope).strip().lower()
+        raw_cloned_roles = cloned.get("scopeRoles")
+        roles_list = (
+            [dict(r) for r in raw_cloned_roles if isinstance(r, dict)]
+            if isinstance(raw_cloned_roles, list)
+            else None
+        )
+        return resolved_scope, roles_list
+
+    role_id = getattr(args, "role_id", None)
+    role_name = getattr(args, "role_name", None)
+    if role_id or role_name:
+        template: dict[str, Any] = {}
+        if role_id:
+            template["roleId"] = str(role_id).strip()
+        elif role_name:
+            template["roleName"] = str(role_name).strip()
+        if scope == "site" and site_ids:
+            return scope, [{"id": sid, **template} for sid in site_ids]
+        if scope == "account" and account_ids:
+            return scope, [{"id": aid, **template} for aid in account_ids]
+        return scope, [template]
+
+    return scope, None
+
+
 def _handle_s1(
     args: argparse.Namespace,
     *,
@@ -4756,12 +6485,12 @@ def _handle_s1(
     subcmd = getattr(args, "s1_command", None)
     if not subcmd:
         print(
-            "Usage: soclens s1 {status,agents,isolate,reconnect,scan,reboot,threats,triage,mitigate,exclusions,blocklist,sites,activities}",
+            "Usage: soclens s1 {status,agents,isolate,reconnect,scan,reboot,threats,triage,mitigate,exclusions,blocklist,sites,users,service-users,roles,cloud-alerts,activities}",
             file=sys.stderr,
         )
         return 1
 
-    # Guard mutating commands before requiring live network calls when in dry-run or unapproved
+    # Ops active response commands (no --admin required, --yes/--dry-run enforced)
     if subcmd in ("isolate", "reconnect", "reboot"):
         ids = _split_csv_arg(args.agent_ids)
         proceed, rc = _check_s1_write_guard(
@@ -4860,10 +6589,326 @@ def _handle_s1(
             print(f"[+] SentinelOne mitigation '{args.action}' executed (affected={affected}).")
         return 0
 
+    if subcmd == "agents":
+        ag_action = getattr(args, "agents_action", None)
+        flag_ids = _split_csv_arg(getattr(args, "ids", None))
+        if ag_action is None and (
+            getattr(args, "move_to_site", None)
+            or bool(getattr(args, "decommission", False))
+            or bool(getattr(args, "fetch_logs", False))
+        ):
+            if not flag_ids:
+                raise ValueError("--ids is required with --move-to-site, --decommission, or --fetch-logs.")
+            if getattr(args, "move_to_site", None):
+                ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="agents-move-to-site")
+                if not ok_admin:
+                    return rc
+                proceed, rc = _check_s1_write_guard(
+                    args,
+                    global_dry_run=global_dry_run,
+                    use_json=use_json,
+                    action="agents-move-to-site",
+                    target={"agent_ids": flag_ids, "target_site_id": args.move_to_site},
+                )
+                if not proceed:
+                    return rc
+                with _build_s1_client(args) as client:
+                    res = client.move_agents_to_site(flag_ids, args.move_to_site)
+                if use_json:
+                    _emit_json(res)
+                else:
+                    print(f"[+] Moved {len(flag_ids)} SentinelOne agent(s) to site '{args.move_to_site}'.")
+                return 0
+
+            if bool(getattr(args, "decommission", False)):
+                ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="agents-decommission")
+                if not ok_admin:
+                    return rc
+                proceed, rc = _check_s1_write_guard(
+                    args,
+                    global_dry_run=global_dry_run,
+                    use_json=use_json,
+                    action="agents-decommission",
+                    target={"agent_ids": flag_ids},
+                )
+                if not proceed:
+                    return rc
+                with _build_s1_client(args) as client:
+                    res = client.decommission_agents(flag_ids)
+                if use_json:
+                    _emit_json(res)
+                else:
+                    print(f"[+] Decommissioned {len(flag_ids)} SentinelOne agent(s).")
+                return 0
+
+            if bool(getattr(args, "fetch_logs", False)):
+                proceed, rc = _check_s1_write_guard(
+                    args,
+                    global_dry_run=global_dry_run,
+                    use_json=use_json,
+                    action="agents-fetch-logs",
+                    target={"agent_ids": flag_ids},
+                )
+                if not proceed:
+                    return rc
+                with _build_s1_client(args) as client:
+                    res = client.fetch_agent_logs(flag_ids)
+                if use_json:
+                    _emit_json(res)
+                else:
+                    print(f"[+] Requested diagnostic logs for {len(flag_ids)} SentinelOne agent(s).")
+                return 0
+
+        if ag_action == "fetch-logs":
+            ids = _split_csv_arg(args.agent_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="agents-fetch-logs",
+                target={"agent_ids": ids},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.fetch_agent_logs(
+                    ids,
+                    agent_logs=not bool(args.no_agent_logs),
+                    customer_facing_logs=not bool(args.no_customer_logs),
+                    platform_logs=bool(args.platform_logs),
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Requested diagnostic logs for {len(ids)} SentinelOne agent(s).")
+            return 0
+
+        if ag_action == "decommission":
+            ids = _split_csv_arg(args.agent_ids)
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="agents-decommission")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="agents-decommission",
+                target={"agent_ids": ids},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.decommission_agents(ids)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Decommissioned {len(ids)} SentinelOne agent(s).")
+            return 0
+
+        if ag_action == "move-to-site":
+            ids = _split_csv_arg(args.agent_ids)
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="agents-move-to-site")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="agents-move-to-site",
+                target={"agent_ids": ids, "target_site_id": args.target_site},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.move_agents_to_site(ids, args.target_site)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Moved {len(ids)} SentinelOne agent(s) to site '{args.target_site}'.")
+            return 0
+
+        # Read-only list (legacy `s1 agents` or `s1 agents list`)
+        with _build_s1_client(args) as client:
+            list_kwargs: dict[str, Any] = {
+                "query": getattr(args, "query", None),
+                "computer_name": getattr(args, "computer_name", None),
+                "infected": getattr(args, "infected", None),
+                "is_active": getattr(args, "active", None),
+                "network_status": getattr(args, "network_status", None),
+                "os_types": getattr(args, "os_type", None),
+                "limit": getattr(args, "limit", 100),
+            }
+            if getattr(args, "account_id", None):
+                list_kwargs["account_ids"] = _split_csv_arg(args.account_id)
+            if getattr(args, "site_id", None):
+                list_kwargs["site_ids"] = _split_csv_arg(args.site_id)
+            if getattr(args, "group_id", None):
+                list_kwargs["group_ids"] = _split_csv_arg(args.group_id)
+            agents = client.list_agents(**list_kwargs)
+        if use_json:
+            _emit_json(agents)
+        else:
+            print(f"[+] SentinelOne agents ({len(agents)}):")
+            for ag in agents:
+                print(
+                    f"  - {ag.get('id')} | {ag.get('computerName')} | {ag.get('osType')} | "
+                    f"net={ag.get('networkStatus')} | infected={ag.get('infected')}"
+                )
+        return 0
+
+    if subcmd == "cloud-alerts":
+        ca_act = getattr(args, "cloud_alerts_action", None) or "list"
+        if ca_act == "verdict":
+            ids = _split_csv_arg(args.alert_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="cloud-alert-verdict",
+                target={"alert_ids": ids, "verdict": args.verdict},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.update_cloud_alert_verdict(ids, args.verdict)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Updated verdict to '{args.verdict}' on {len(ids)} Cloud alert(s).")
+            return 0
+
+        if ca_act == "incident-status":
+            ids = _split_csv_arg(args.alert_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="cloud-alert-incident-status",
+                target={"alert_ids": ids, "status": args.status},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.update_cloud_alert_incident_status(ids, args.status)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Updated incident status to '{args.status}' on {len(ids)} Cloud alert(s).")
+            return 0
+
+        with _build_s1_client(args) as client:
+            alerts = client.list_cloud_alerts(
+                query=getattr(args, "query", None),
+                incident_statuses=_split_csv_arg(getattr(args, "status", None)) or None,
+                analyst_verdicts=_split_csv_arg(getattr(args, "verdict", None)) or None,
+                severities=_split_csv_arg(getattr(args, "severity", None)) or None,
+                scopes=_split_csv_arg(getattr(args, "scope", None)) or None,
+                os_types=_split_csv_arg(getattr(args, "os_type", None)) or None,
+                rule_name=getattr(args, "rule_name", None),
+                computer_name=getattr(args, "computer_name", None),
+                sha1=getattr(args, "sha1", None),
+                account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
+                site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
+                group_ids=_split_csv_arg(getattr(args, "group_id", None)) or None,
+                limit=getattr(args, "limit", 100),
+            )
+        if use_json:
+            _emit_json(alerts)
+        else:
+            print(f"[+] SentinelOne Cloud/STAR alerts ({len(alerts)}):")
+            for al in alerts:
+                print(
+                    f"  - {al.get('id')} | {al.get('ruleName', '-')} | "
+                    f"sev={al.get('severity', '-')} | status={al.get('incidentStatus', '-')}"
+                )
+        return 0
+
     if subcmd == "exclusions":
-        if args.create:
+        excl_act = getattr(args, "exclusions_action", None)
+        if excl_act == "clone":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="clone-exclusions")
+            if not ok_admin:
+                return rc
+            rps = float(args.rate_limit)
+            if not math.isfinite(rps) or rps <= 0:
+                raise ValueError("--rate-limit must be a finite positive number.")
+            is_dry = bool(global_dry_run or getattr(args, "dry_run", False))
+            if is_dry:
+                with _build_s1_client(args) as client:
+                    plan = client.clone_exclusions(
+                        args.from_site,
+                        args.to_site,
+                        source_site_name=args.source_site_name,
+                        dry_run=True,
+                        requests_per_second=rps,
+                        include_source_parents=bool(args.include_source_parents),
+                        continue_on_error=not bool(args.stop_on_error),
+                        limit=args.limit,
+                    )
+                if use_json:
+                    _emit_json(plan)
+                else:
+                    counts = plan.get("counts", {})
+                    print(
+                        f"[DRY-RUN] Exclusion clone {args.from_site} -> {args.to_site}: "
+                        f"will_create={counts.get('will_create', 0)}, "
+                        f"skipped_duplicate={counts.get('skipped_duplicate', 0)}, "
+                        f"inherited_from_account={counts.get('inherited_from_account', 0)}"
+                    )
+                return 0
+
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=False,
+                use_json=use_json,
+                action="clone-exclusions",
+                target={"from_site": args.from_site, "to_site": args.to_site, "rate_limit": rps},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.clone_exclusions(
+                    args.from_site,
+                    args.to_site,
+                    source_site_name=args.source_site_name,
+                    dry_run=False,
+                    requests_per_second=rps,
+                    include_source_parents=bool(args.include_source_parents),
+                    continue_on_error=not bool(args.stop_on_error),
+                    limit=args.limit,
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                counts = res.get("counts", {})
+                print(
+                    f"[+] Cloned exclusions {args.from_site} -> {args.to_site}: "
+                    f"created={counts.get('created', 0)}, failed={counts.get('failed', 0)}"
+                )
+            return 0
+
+        if excl_act == "validate":
+            with _build_s1_client(args) as client:
+                val_res = client.validate_exclusion(
+                    exclusion_type=args.exclusion_type,
+                    os_type=args.os_type,
+                    value=args.value,
+                )
+            if use_json:
+                _emit_json(val_res)
+            else:
+                print(f"[+] Exclusion validation result: {val_res}")
+            return 0
+
+        if excl_act == "create" or (excl_act is None and bool(getattr(args, "create", False))):
             if not args.exclusion_type or not args.value:
-                raise ValueError("--create requires --type and --value.")
+                raise ValueError("--create / create requires --type and --value.")
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="create-exclusion")
+            if not ok_admin:
+                return rc
+            site_scopes = _split_csv_arg(getattr(args, "site_id", None) or getattr(args, "s1_site_id", None))
+            acc_scopes = _split_csv_arg(getattr(args, "account_id", None) or getattr(args, "s1_account_id", None))
+            grp_scopes = _split_csv_arg(getattr(args, "group_id", None))
             proceed, rc = _check_s1_write_guard(
                 args,
                 global_dry_run=global_dry_run,
@@ -4875,6 +6920,9 @@ def _handle_s1(
                     "value": args.value,
                     "mode": args.mode,
                     "description": args.description,
+                    "site_ids": site_scopes,
+                    "account_ids": acc_scopes,
+                    "group_ids": grp_scopes,
                 },
             )
             if not proceed:
@@ -4886,6 +6934,11 @@ def _handle_s1(
                     value=args.value,
                     description=args.description,
                     mode=args.mode,
+                    path_exclusion_type=getattr(args, "path_exclusion_type", None),
+                    actions=_split_csv_arg(getattr(args, "actions", None)) or None,
+                    account_ids=acc_scopes or None,
+                    site_ids=site_scopes or None,
+                    group_ids=grp_scopes or None,
                 )
             if use_json:
                 _emit_json(res)
@@ -4893,8 +6946,41 @@ def _handle_s1(
                 print(f"[+] Created SentinelOne {args.exclusion_type} exclusion: {args.value}")
             return 0
 
-        if args.delete:
-            del_ids = _split_csv_arg(args.delete)
+        if excl_act == "update":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="update-exclusion")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="update-exclusion",
+                target={"exclusion_id": args.exclusion_id, "type": args.exclusion_type},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.update_exclusion(
+                    args.exclusion_id,
+                    exclusion_type=args.exclusion_type,
+                    os_type=args.os_type,
+                    value=args.value,
+                    description=args.description,
+                    mode=args.mode,
+                    path_exclusion_type=args.path_exclusion_type,
+                    actions=_split_csv_arg(args.actions) or None,
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Updated SentinelOne exclusion '{args.exclusion_id}'.")
+            return 0
+
+        if excl_act == "delete" or (excl_act is None and bool(getattr(args, "delete", None))):
+            del_ids = _split_csv_arg(args.ids if excl_act == "delete" else args.delete)
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="delete-exclusions")
+            if not ok_admin:
+                return rc
             proceed, rc = _check_s1_write_guard(
                 args,
                 global_dry_run=global_dry_run,
@@ -4912,12 +6998,30 @@ def _handle_s1(
                 print(f"[+] Deleted {len(del_ids)} SentinelOne exclusion(s).")
             return 0
 
+        # Read-only exclusions list (`s1 exclusions` or `s1 exclusions list`)
         with _build_s1_client(args) as client:
-            items = client.list_exclusions(
-                exclusion_type=args.exclusion_type,
-                query=args.query,
-                limit=args.limit,
-            )
+            excl_kwargs: dict[str, Any] = {
+                "exclusion_type": getattr(args, "exclusion_type", None),
+                "query": getattr(args, "query", None),
+                "limit": getattr(args, "limit", 100),
+            }
+            if getattr(args, "filter_os_type", None):
+                excl_kwargs["os_types"] = _split_csv_arg(args.filter_os_type)
+            if getattr(args, "account_id", None):
+                excl_kwargs["account_ids"] = _split_csv_arg(args.account_id)
+            if getattr(args, "site_id", None):
+                excl_kwargs["site_ids"] = _split_csv_arg(args.site_id)
+            if getattr(args, "group_id", None):
+                excl_kwargs["group_ids"] = _split_csv_arg(args.group_id)
+            if getattr(args, "include_parents", None) is not None:
+                excl_kwargs["include_parents"] = args.include_parents
+            if getattr(args, "include_children", None) is not None:
+                excl_kwargs["include_children"] = args.include_children
+            if getattr(args, "modes", None):
+                excl_kwargs["modes"] = _split_csv_arg(args.modes)
+            if getattr(args, "scopes", None):
+                excl_kwargs["scopes"] = _split_csv_arg(args.scopes)
+            items = client.list_exclusions(**excl_kwargs)
         if use_json:
             _emit_json(items)
         else:
@@ -4930,14 +7034,22 @@ def _handle_s1(
         return 0
 
     if subcmd == "blocklist":
-        if args.add_hash:
+        blk_act = getattr(args, "blocklist_action", None)
+        if blk_act == "add" or (blk_act is None and bool(getattr(args, "add_hash", None))):
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="add-blocklist")
+            if not ok_admin:
+                return rc
+            sha1_val = args.sha1_hash if blk_act == "add" else args.add_hash
+            site_scopes = _split_csv_arg(getattr(args, "site_id", None) or getattr(args, "s1_site_id", None))
+            acc_scopes = _split_csv_arg(getattr(args, "account_id", None) or getattr(args, "s1_account_id", None))
+            grp_scopes = _split_csv_arg(getattr(args, "group_id", None))
             proceed, rc = _check_s1_write_guard(
                 args,
                 global_dry_run=global_dry_run,
                 use_json=use_json,
                 action="add-blocklist",
                 target={
-                    "sha1_hash": args.add_hash,
+                    "sha1_hash": sha1_val,
                     "os_type": args.os_type,
                     "description": args.description,
                 },
@@ -4946,18 +7058,58 @@ def _handle_s1(
                 return rc
             with _build_s1_client(args) as client:
                 res = client.add_to_blocklist(
-                    args.add_hash,
+                    sha1_val,
                     os_type=args.os_type,
                     description=args.description,
+                    source=getattr(args, "source", "soclens"),
+                    account_ids=acc_scopes or None,
+                    site_ids=site_scopes or None,
+                    group_ids=grp_scopes or None,
                 )
             if use_json:
                 _emit_json(res)
             else:
-                print(f"[+] Added SHA-1 {args.add_hash} to SentinelOne blocklist.")
+                print(f"[+] Added SHA-1 {sha1_val} to SentinelOne blocklist.")
             return 0
 
-        if args.remove:
-            rem_ids = _split_csv_arg(args.remove)
+        if blk_act == "update":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="update-blocklist")
+            if not ok_admin:
+                return rc
+            site_scopes = _split_csv_arg(getattr(args, "site_id", None) or getattr(args, "s1_site_id", None))
+            acc_scopes = _split_csv_arg(getattr(args, "account_id", None) or getattr(args, "s1_account_id", None))
+            grp_scopes = _split_csv_arg(getattr(args, "group_id", None))
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="update-blocklist",
+                target={"entry_id": args.entry_id, "sha1_hash": args.sha1},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.update_blocklist(
+                    args.entry_id,
+                    sha1_hash=args.sha1,
+                    os_type=args.os_type,
+                    description=args.description,
+                    source=args.source,
+                    account_ids=acc_scopes or None,
+                    site_ids=site_scopes or None,
+                    group_ids=grp_scopes or None,
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Updated SentinelOne blocklist entry '{args.entry_id}'.")
+            return 0
+
+        if blk_act == "remove" or (blk_act is None and bool(getattr(args, "remove", None))):
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="remove-blocklist")
+            if not ok_admin:
+                return rc
+            rem_ids = _split_csv_arg(args.ids if blk_act == "remove" else args.remove)
             proceed, rc = _check_s1_write_guard(
                 args,
                 global_dry_run=global_dry_run,
@@ -4976,7 +7128,17 @@ def _handle_s1(
             return 0
 
         with _build_s1_client(args) as client:
-            items = client.list_blocklist(query=args.query, limit=args.limit)
+            blk_kwargs: dict[str, Any] = {
+                "query": getattr(args, "query", None),
+                "limit": getattr(args, "limit", 100),
+            }
+            if getattr(args, "filter_os_type", None):
+                blk_kwargs["os_types"] = _split_csv_arg(args.filter_os_type)
+            if getattr(args, "account_id", None):
+                blk_kwargs["account_ids"] = _split_csv_arg(args.account_id)
+            if getattr(args, "site_id", None):
+                blk_kwargs["site_ids"] = _split_csv_arg(args.site_id)
+            items = client.list_blocklist(**blk_kwargs)
         if use_json:
             _emit_json(items)
         else:
@@ -4985,6 +7147,742 @@ def _handle_s1(
                 print(
                     f"  - {item.get('id')} | {item.get('value')} | {item.get('osType')} | "
                     f"{item.get('description', '')}"
+                )
+        return 0
+
+    if subcmd == "sites":
+        site_act = getattr(args, "sites_action", None)
+        if site_act == "create":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="create-site")
+            if not ok_admin:
+                return rc
+            policy_dict = _parse_json_mapping_arg(args.policy_json, flag_name="--policy-json")
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="create-site",
+                target={
+                    "name": args.name,
+                    "account_id": args.account_id or getattr(args, "s1_account_id", None),
+                    "site_type": args.site_type,
+                    "total_licenses": args.total_licenses,
+                    "copy_policy_from": args.copy_policy_from,
+                    "clone_exclusions_from": args.clone_exclusions_from,
+                },
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                created_site = client.create_site(
+                    name=args.name,
+                    account_id=args.account_id or getattr(args, "s1_account_id", None),
+                    site_type=args.site_type,
+                    total_licenses=args.total_licenses,
+                    unlimited_licenses=args.unlimited_licenses,
+                    unlimited_expiration=not bool(args.no_unlimited_expiration),
+                    expiration=args.expiration,
+                    inherit_account_expiration=args.inherit_account_expiration,
+                    sku=args.sku,
+                    suite=args.suite,
+                    description=args.description,
+                    inherits=not bool(args.no_inherits),
+                    usage_type=args.usage_type,
+                    external_id=args.external_id,
+                    policy=policy_dict,
+                    copy_policy_from_site_id=args.copy_policy_from,
+                    clone_exclusions_from_site_id=args.clone_exclusions_from,
+                )
+            if use_json:
+                _emit_json(created_site)
+            else:
+                print(
+                    f"[+] Created SentinelOne site '{created_site.get('name', args.name)}' "
+                    f"(id={created_site.get('id', '-')})."
+                )
+            return 0
+
+        if site_act == "edit":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="edit-site")
+            if not ok_admin:
+                return rc
+            policy_dict = _parse_json_mapping_arg(args.policy_json, flag_name="--policy-json")
+            edit_fields: dict[str, Any] = {
+                "name": args.name,
+                "site_type": args.site_type,
+                "total_licenses": args.total_licenses,
+                "unlimited_licenses": args.unlimited_licenses,
+                "unlimited_expiration": args.unlimited_expiration,
+                "expiration": args.expiration,
+                "inherit_account_expiration": args.inherit_account_expiration,
+                "sku": args.sku,
+                "description": args.description,
+                "usage_type": args.usage_type,
+                "external_id": args.external_id,
+                "policy": policy_dict,
+            }
+            if not any(v is not None for v in edit_fields.values()):
+                raise ValueError("Provide at least one field to edit on the site.")
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="edit-site",
+                target={"site_id": args.site_id},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                updated_site = client.update_site(args.site_id, **edit_fields)
+            if use_json:
+                _emit_json(updated_site)
+            else:
+                print(f"[+] Updated SentinelOne site '{args.site_id}'.")
+            return 0
+
+        if site_act == "duplicate":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="duplicate-site")
+            if not ok_admin:
+                return rc
+            policy_dict = _parse_json_mapping_arg(args.policy_json, flag_name="--policy-json")
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="duplicate-site",
+                target={"source_site_id": args.source_site_id, "name": args.name},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                dup_site = client.duplicate_site(
+                    args.source_site_id,
+                    args.name,
+                    policy_source=args.policy_source,
+                    copy_users=bool(args.copy_users),
+                    total_licenses=args.total_licenses,
+                    unlimited_licenses=args.unlimited_licenses,
+                    policy=policy_dict,
+                )
+            if use_json:
+                _emit_json(dup_site)
+            else:
+                print(
+                    f"[+] Duplicated SentinelOne site '{args.source_site_id}' -> "
+                    f"'{dup_site.get('name', args.name)}' (id={dup_site.get('id', '-')})."
+                )
+            return 0
+
+        if site_act == "expire":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="expire-site")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="expire-site",
+                target={"site_id": args.site_id},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.expire_site(args.site_id)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Expired SentinelOne site '{args.site_id}'.")
+            return 0
+
+        if site_act == "reactivate":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="reactivate-site")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="reactivate-site",
+                target={"site_id": args.site_id, "unlimited": bool(args.unlimited)},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.reactivate_site(
+                    args.site_id,
+                    unlimited=bool(args.unlimited),
+                    expiration=args.expiration,
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Reactivated SentinelOne site '{args.site_id}'.")
+            return 0
+
+        if site_act in ("rotate-token", "regenerate-key"):
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action=site_act)
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action=site_act,
+                target={"site_id": args.site_id},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = (
+                    client.rotate_site_token(args.site_id)
+                    if site_act == "rotate-token"
+                    else client.regenerate_site_key(args.site_id)
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Executed '{site_act}' for SentinelOne site '{args.site_id}'.")
+            return 0
+
+        if site_act == "policy":
+            pol_act = getattr(args, "policy_action", None)
+            if not pol_act:
+                print("Usage: soclens s1 sites policy {get,update,revert} <site_id>", file=sys.stderr)
+                return 1
+            if pol_act == "get":
+                with _build_s1_client(args) as client:
+                    pol = client.get_site_policy(args.site_id)
+                if use_json:
+                    _emit_json(pol)
+                else:
+                    print(f"[+] Policy for SentinelOne site '{args.site_id}':")
+                    _emit_json(pol)
+                return 0
+            if pol_act == "update":
+                ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="update-site-policy")
+                if not ok_admin:
+                    return rc
+                pol_payload = _parse_json_mapping_arg(args.policy_json, flag_name="--policy-json")
+                if not pol_payload:
+                    raise ValueError("--policy-json must be a non-empty JSON object.")
+                proceed, rc = _check_s1_write_guard(
+                    args,
+                    global_dry_run=global_dry_run,
+                    use_json=use_json,
+                    action="update-site-policy",
+                    target={"site_id": args.site_id},
+                )
+                if not proceed:
+                    return rc
+                with _build_s1_client(args) as client:
+                    res = client.update_site_policy(args.site_id, pol_payload)
+                if use_json:
+                    _emit_json(res)
+                else:
+                    print(f"[+] Updated policy for SentinelOne site '{args.site_id}'.")
+                return 0
+            if pol_act == "revert":
+                ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="revert-site-policy")
+                if not ok_admin:
+                    return rc
+                proceed, rc = _check_s1_write_guard(
+                    args,
+                    global_dry_run=global_dry_run,
+                    use_json=use_json,
+                    action="revert-site-policy",
+                    target={"site_id": args.site_id},
+                )
+                if not proceed:
+                    return rc
+                with _build_s1_client(args) as client:
+                    res = client.revert_site_policy(args.site_id)
+                if use_json:
+                    _emit_json(res)
+                else:
+                    print(f"[+] Reverted policy for SentinelOne site '{args.site_id}'.")
+                return 0
+
+        if site_act == "delete":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="delete-site")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="delete-site",
+                target={"site_id": args.site_id, "confirm_name": args.confirm_name},
+            )
+            if not proceed:
+                return rc
+            confirm_name = getattr(args, "confirm_name", None)
+            if not isinstance(confirm_name, str) or not confirm_name.strip():
+                raise ValueError(
+                    "Site deletion requires --confirm-name matching the exact SentinelOne site name."
+                )
+            with _build_s1_client(args) as client:
+                site = client.get_site(args.site_id)
+                raw_name = site.get("name") if isinstance(site, Mapping) else None
+                expected_name = str(raw_name) if raw_name is not None else ""
+                if (expected_name or (isinstance(site, Mapping) and "name" in site)) and confirm_name != expected_name:
+                    raise ValueError(
+                        f"Site deletion confirmation name mismatch: expected {expected_name!r}, "
+                        f"got {confirm_name!r}."
+                    )
+                res = client.delete_site(
+                    args.site_id,
+                    confirm_site_name=confirm_name,
+                    expected_site_name=expected_name,
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Deleted SentinelOne site '{expected_name}' (id={args.site_id}).")
+            return 0
+
+        # Read-only list (`s1 sites` or `s1 sites list`)
+        with _build_s1_client(args) as client:
+            if bool(getattr(args, "accounts", False)):
+                items = client.list_accounts(query=args.query, limit=args.limit)
+                kind = "accounts"
+            elif bool(getattr(args, "groups", False)):
+                grp_kwargs: dict[str, Any] = {"query": args.query, "limit": args.limit}
+                if getattr(args, "account_id", None):
+                    grp_kwargs["account_ids"] = _split_csv_arg(args.account_id)
+                if getattr(args, "site_id", None):
+                    grp_kwargs["site_ids"] = _split_csv_arg(args.site_id)
+                items = client.list_groups(**grp_kwargs)
+                kind = "groups"
+            else:
+                site_kwargs: dict[str, Any] = {"query": args.query, "limit": args.limit}
+                if getattr(args, "account_id", None):
+                    site_kwargs["account_ids"] = _split_csv_arg(args.account_id)
+                items = client.list_sites(**site_kwargs)
+                tier_filter = getattr(args, "tier", None)
+                if tier_filter:
+                    items = client.enrich_sites_with_tiers(items)
+                    want_tier = str(tier_filter).strip().casefold()
+                    items = [
+                        it
+                        for it in items
+                        if str(it.get("tier") or "").strip().casefold() == want_tier
+                    ]
+                kind = "sites"
+        if use_json:
+            _emit_json(items)
+        else:
+            print(f"[+] SentinelOne {kind} ({len(items)}):")
+            for item in items:
+                print(f"  - {item.get('id')} | {item.get('name')} | {item.get('state', '')}")
+        return 0
+
+    if subcmd == "users":
+        usr_act = getattr(args, "users_action", None) or "list"
+        if usr_act == "create":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="create-user")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="create-user",
+                target={
+                    "email": args.email,
+                    "full_name": args.full_name,
+                    "scope": args.scope,
+                    "site_id": args.site_id,
+                    "clone_from": args.clone_from,
+                },
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                scope, scope_roles = _resolve_s1_scope_and_roles(args, client=client)
+                created_usr = client.create_user(
+                    email=args.email,
+                    full_name=args.full_name,
+                    scope=scope,
+                    scope_roles=scope_roles,
+                    password=args.password,
+                    two_fa_enabled=args.two_fa,
+                    allow_remote_shell=args.allow_remote_shell,
+                )
+            if use_json:
+                _emit_json(created_usr)
+            else:
+                print(
+                    f"[+] Created SentinelOne user '{created_usr.get('email', args.email)}' "
+                    f"(id={created_usr.get('id', '-')})."
+                )
+            return 0
+
+        if usr_act == "edit":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="edit-user")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="edit-user",
+                target={"user_id": args.user_id, "scope": args.scope},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                existing: Mapping[str, Any] | None = None
+                default_scope: str | None = None
+                if not args.scope and not args.site_id and not args.account_id:
+                    fetched = client.get_user(args.user_id)
+                    if isinstance(fetched, Mapping):
+                        existing = fetched
+                        raw_existing_scope = fetched.get("scope")
+                        if isinstance(raw_existing_scope, str) and raw_existing_scope.strip():
+                            default_scope = raw_existing_scope.strip().lower()
+                scope, scope_roles = _resolve_s1_scope_and_roles(
+                    args, client=client, default_scope=default_scope
+                )
+                if scope_roles is None:
+                    if existing is None:
+                        fetched = client.get_user(args.user_id)
+                        if isinstance(fetched, Mapping):
+                            existing = fetched
+                    if isinstance(existing, Mapping):
+                        raw_existing_scope = existing.get("scope")
+                        existing_scope = (
+                            raw_existing_scope.strip().lower()
+                            if isinstance(raw_existing_scope, str) and raw_existing_scope.strip()
+                            else ""
+                        )
+                        if not args.scope and not args.site_id and not args.account_id and existing_scope:
+                            scope = existing_scope
+                        existing_roles = existing.get("scopeRoles")
+                        changing_to_tenant = bool(
+                            args.scope and scope == "tenant" and existing_scope != "tenant"
+                        )
+                        if isinstance(existing_roles, list) and not changing_to_tenant:
+                            scope_roles = [
+                                dict(r) for r in existing_roles if isinstance(r, Mapping)
+                            ]
+                updated_usr = client.update_user(
+                    args.user_id,
+                    scope=scope,
+                    scope_roles=scope_roles,
+                    full_name=args.full_name,
+                    email=args.email,
+                    two_fa_enabled=args.two_fa,
+                    can_generate_api_token=args.can_generate_token,
+                )
+            if use_json:
+                _emit_json(updated_usr)
+            else:
+                print(f"[+] Updated SentinelOne user '{args.user_id}'.")
+            return 0
+
+        if usr_act == "clone":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="clone-user")
+            if not ok_admin:
+                return rc
+            if not args.target_user and not (args.email and args.full_name):
+                raise ValueError(
+                    "Specify --target-user <id> or both --email and --name to clone user permissions."
+                )
+            target_sites = _split_csv_arg(args.to_site) or None
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="clone-user",
+                target={
+                    "source_user_id": args.source_user_id,
+                    "target_user": args.target_user,
+                    "email": args.email,
+                    "target_sites": target_sites,
+                },
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                cloned = client.clone_user_permissions(
+                    args.source_user_id,
+                    target_site_ids=target_sites,
+                    service_user=bool(args.service_user),
+                )
+                if args.target_user:
+                    res = client.update_user(
+                        args.target_user,
+                        scope=cloned["scope"],
+                        scope_roles=cloned["scopeRoles"],
+                    )
+                else:
+                    res = client.create_user(
+                        email=args.email,
+                        full_name=args.full_name,
+                        scope=cloned["scope"],
+                        scope_roles=cloned["scopeRoles"],
+                    )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Cloned RBAC permissions from '{args.source_user_id}'.")
+            return 0
+
+        if usr_act == "reset-password":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="reset-password")
+            if not ok_admin:
+                return rc
+            ids = _split_csv_arg(args.user_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="reset-password",
+                target={"user_ids": ids},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.send_reset_password_email(ids)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Sent password reset email(s) to {len(ids)} user(s).")
+            return 0
+
+        if usr_act == "reset-2fa":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="reset-2fa")
+            if not ok_admin:
+                return rc
+            ids = _split_csv_arg(args.user_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="delete-2fa" if args.delete_2fa else "reset-2fa",
+                target={"user_ids": ids, "enroll": bool(args.enroll)},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = (
+                    client.delete_2fa(ids)
+                    if bool(args.delete_2fa)
+                    else client.reset_2fa(ids, enroll=bool(args.enroll))
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Updated 2FA for {len(ids)} SentinelOne user(s).")
+            return 0
+
+        if usr_act == "logout":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="logout-user")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="logout-user",
+                target={},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.logout_user()
+            if use_json:
+                _emit_json(res)
+            else:
+                print("[+] Logged out current SentinelOne API user session.")
+            return 0
+
+        if usr_act == "delete":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="delete-users")
+            if not ok_admin:
+                return rc
+            ids = _split_csv_arg(args.user_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="delete-users",
+                target={"user_ids": ids},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.delete_user(ids[0]) if len(ids) == 1 else client.delete_users(ids)
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Deleted {len(ids)} SentinelOne user(s).")
+            return 0
+
+        with _build_s1_client(args) as client:
+            users = client.list_users(
+                query=getattr(args, "query", None),
+                email=getattr(args, "email", None),
+                full_name=getattr(args, "full_name", None),
+                account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
+                site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
+                role_ids=_split_csv_arg(getattr(args, "role_id", None)) or None,
+                limit=getattr(args, "limit", 100),
+            )
+        if use_json:
+            _emit_json(users)
+        else:
+            print(f"[+] SentinelOne console users ({len(users)}):")
+            for usr in users:
+                print(
+                    f"  - {usr.get('id')} | {usr.get('email', '-')} | "
+                    f"{usr.get('fullName', '-')} | scope={usr.get('scope', '-')}"
+                )
+        return 0
+
+    if subcmd == "service-users":
+        su_act = getattr(args, "service_users_action", None) or "list"
+        if su_act == "create":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="create-service-user")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="create-service-user",
+                target={
+                    "name": args.name,
+                    "expiration_date": args.expiration_date,
+                    "scope": args.scope,
+                },
+            )
+            if not proceed:
+                return rc
+            scope, scope_roles = _resolve_s1_scope_and_roles(args)
+            with _build_s1_client(args) as client:
+                created_su = client.create_service_user(
+                    name=args.name,
+                    scope=scope,
+                    expiration_date=args.expiration_date,
+                    description=args.description,
+                    scope_roles=scope_roles,
+                    force_legacy=args.force_legacy,
+                )
+            if use_json:
+                _emit_json(created_su)
+            else:
+                print(
+                    f"[+] Created SentinelOne service user '{created_su.get('name', args.name)}' "
+                    f"(id={created_su.get('id', '-')})."
+                )
+            return 0
+
+        if su_act == "edit":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="edit-service-user")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="edit-service-user",
+                target={"service_user_id": args.service_user_id},
+            )
+            if not proceed:
+                return rc
+            scope_val: str | None = args.scope
+            scope_roles_val: list[dict[str, Any]] | None = None
+            if (
+                args.scope is not None
+                or args.scope_roles_json is not None
+                or args.role_id is not None
+                or args.role_name is not None
+            ):
+                resolved_scope, scope_roles_val = _resolve_s1_scope_and_roles(args)
+                scope_val = resolved_scope
+            with _build_s1_client(args) as client:
+                updated_su = client.update_service_user(
+                    args.service_user_id,
+                    description=args.description,
+                    scope=scope_val,
+                    scope_roles=scope_roles_val,
+                )
+            if use_json:
+                _emit_json(updated_su)
+            else:
+                print(f"[+] Updated SentinelOne service user '{args.service_user_id}'.")
+            return 0
+
+        if su_act == "delete":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="delete-service-users")
+            if not ok_admin:
+                return rc
+            ids = _split_csv_arg(args.service_user_ids)
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="delete-service-users",
+                target={"service_user_ids": ids},
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = (
+                    client.delete_service_user(ids[0])
+                    if len(ids) == 1
+                    else client.delete_service_users(ids)
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Deleted {len(ids)} SentinelOne service user(s).")
+            return 0
+
+        if su_act == "token":
+            ok_admin, rc = _check_s1_admin_guard(args, use_json=use_json, action="generate-service-user-token")
+            if not ok_admin:
+                return rc
+            proceed, rc = _check_s1_write_guard(
+                args,
+                global_dry_run=global_dry_run,
+                use_json=use_json,
+                action="generate-service-user-token",
+                target={
+                    "service_user_id": args.service_user_id,
+                    "expiration_date": args.expiration_date,
+                },
+            )
+            if not proceed:
+                return rc
+            with _build_s1_client(args) as client:
+                res = client.generate_service_user_token(
+                    args.service_user_id,
+                    expiration_date=args.expiration_date,
+                )
+            if use_json:
+                _emit_json(res)
+            else:
+                print(f"[+] Generated API token for service user '{args.service_user_id}'.")
+            return 0
+
+        with _build_s1_client(args) as client:
+            sus = client.list_service_users(
+                query=getattr(args, "query", None),
+                account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
+                site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
+                role_ids=_split_csv_arg(getattr(args, "role_id", None)) or None,
+                limit=getattr(args, "limit", 100),
+            )
+        if use_json:
+            _emit_json(sus)
+        else:
+            print(f"[+] SentinelOne service users ({len(sus)}):")
+            for su in sus:
+                print(
+                    f"  - {su.get('id')} | {su.get('name', '-')} | "
+                    f"scope={su.get('scope', '-')} | expires={su.get('expirationDate', '-')}"
                 )
         return 0
 
@@ -4998,25 +7896,24 @@ def _handle_s1(
                 print(f"[+] SentinelOne connected: {client.console_url} (build={info.get('build', '-')})")
             return 0
 
-        if subcmd == "agents":
-            agents = client.list_agents(
-                query=args.query,
-                computer_name=args.computer_name,
-                infected=args.infected,
-                is_active=args.active,
-                network_status=args.network_status,
-                os_types=args.os_type,
-                limit=args.limit,
+        if subcmd == "roles":
+            roles = client.list_rbac_roles(
+                account_ids=_split_csv_arg(getattr(args, "account_id", None)) or None,
+                site_ids=_split_csv_arg(getattr(args, "site_id", None)) or None,
+                group_ids=_split_csv_arg(getattr(args, "group_id", None)) or None,
+                include_parents=getattr(args, "include_parents", None),
+                include_children=getattr(args, "include_children", None),
+                predefined_role=getattr(args, "predefined_role", None),
+                name=getattr(args, "name", None),
+                query=getattr(args, "query", None),
+                limit=getattr(args, "limit", 100),
             )
             if use_json:
-                _emit_json(agents)
+                _emit_json(roles)
             else:
-                print(f"[+] SentinelOne agents ({len(agents)}):")
-                for ag in agents:
-                    print(
-                        f"  - {ag.get('id')} | {ag.get('computerName')} | {ag.get('osType')} | "
-                        f"net={ag.get('networkStatus')} | infected={ag.get('infected')}"
-                    )
+                print(f"[+] SentinelOne RBAC roles ({len(roles)}):")
+                for role in roles:
+                    print(f"  - {role.get('id')} | {role.get('name')} | predefined={role.get('predefinedRole', False)}")
             return 0
 
         if subcmd == "threats":
@@ -5047,24 +7944,6 @@ def _handle_s1(
                         f"  - {th.get('id')} | {tinfo.get('threatName', th.get('threatName', '-'))} | "
                         f"verdict={tinfo.get('analystVerdict', '-')} | status={tinfo.get('incidentStatus', '-')}"
                     )
-            return 0
-
-        if subcmd == "sites":
-            if args.accounts:
-                items = client.list_accounts(query=args.query, limit=args.limit)
-                kind = "accounts"
-            elif args.groups:
-                items = client.list_groups(query=args.query, limit=args.limit)
-                kind = "groups"
-            else:
-                items = client.list_sites(query=args.query, limit=args.limit)
-                kind = "sites"
-            if use_json:
-                _emit_json(items)
-            else:
-                print(f"[+] SentinelOne {kind} ({len(items)}):")
-                for item in items:
-                    print(f"  - {item.get('id')} | {item.get('name')} | {item.get('state', '')}")
             return 0
 
         if subcmd == "activities":
@@ -5372,7 +8251,405 @@ def _handle_settings(
     return 1
 
 
+def _build_secret_store_config_from_args(args: argparse.Namespace) -> SecretStoreConfig:
+    """Resolve ``SecretStoreConfig`` applying CLI provider and SSL overrides when set."""
+    verify_ssl: bool | str | None = None
+    if bool(getattr(args, "insecure", False)):
+        verify_ssl = False
+    else:
+        ca_bundle = getattr(args, "ca_bundle", None)
+        if isinstance(ca_bundle, str) and ca_bundle.strip():
+            verify_ssl = ca_bundle.strip()
+    return get_secret_store_config(
+        provider=getattr(args, "provider", None),
+        verify_ssl=verify_ssl,
+    )
+
+
+def _require_enabled_secret_store(cfg: SecretStoreConfig) -> SecretStoreConfig:
+    """Ensure a secret store provider is configured before executing live vault commands."""
+    if not cfg.is_enabled:
+        raise ConfigurationError(
+            "Secret store provider is disabled ('none'). "
+            "Configure 'secret_provider' via 'soclens settings set secret_provider <provider>'."
+        )
+    return cfg
+
+
+def _maybe_hydrate_startup_secrets(args: argparse.Namespace) -> None:
+    """Gracefully hydrate mapped secrets before non-TUI service commands."""
+    if bool(getattr(args, "no_secret_store", False)):
+        return
+    try:
+        cfg = get_secret_store_config()
+        if not cfg.is_enabled or not cfg.secret_map:
+            return
+        hydrate_secrets_from_store(overwrite_existing=False)
+    except (SecretStoreError, ConfigurationError, OSError) as exc:
+        logger.warning("Secret store startup hydration skipped: %s", exc)
+
+
+def _handle_secrets(
+    args: argparse.Namespace,
+    *,
+    global_dry_run: bool,
+    use_json: bool,
+) -> int:
+    subcmd = getattr(args, "secrets_command", None)
+    if not subcmd:
+        msg = "Usage: soclens secrets {test,list,fields,map,unmap,pull}"
+        if use_json:
+            print(json.dumps({"error": msg}, indent=2), file=sys.stderr)
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    is_dry = bool(global_dry_run or getattr(args, "dry_run", False))
+
+    if subcmd == "test":
+        cfg = _require_enabled_secret_store(_build_secret_store_config_from_args(args))
+        with build_secret_store_provider(cfg) as provider:
+            info = provider.test_connection()
+        if use_json:
+            _emit_json(info)
+        else:
+            print(f"[+] Secret store connection OK: provider={cfg.provider}")
+        return 0
+
+    if subcmd == "list":
+        cfg = _require_enabled_secret_store(_build_secret_store_config_from_args(args))
+        limit = int(args.limit)
+        if limit < 1:
+            raise ValueError("--limit must be at least 1.")
+        with build_secret_store_provider(cfg) as provider:
+            entries = provider.list_secrets(query=args.search or "", limit=limit)
+        serialized_entries = [
+            {
+                "ref": e.ref,
+                "display_label": e.display_label,
+                "provider": e.provider,
+                "item_id": e.item_id,
+                "field_key": e.field_key,
+                "item_title": e.item_title,
+                "path": e.path,
+                "is_secret": e.is_secret,
+            }
+            for e in entries
+        ]
+        if use_json:
+            _emit_json(
+                {
+                    "provider": cfg.provider,
+                    "count": len(serialized_entries),
+                    "entries": serialized_entries,
+                }
+            )
+            return 0
+        if not serialized_entries:
+            print("(No secrets found)")
+            return 0
+        _print_cli_table(serialized_entries, ["ref", "item_title", "field_key", "path"])
+        return 0
+
+    if subcmd == "fields":
+        cfg = _require_enabled_secret_store(_build_secret_store_config_from_args(args))
+        reveal = bool(getattr(args, "reveal", False))
+        with build_secret_store_provider(cfg) as provider:
+            entries = provider.list_secret_fields(args.secret_id)
+            revealed_map: dict[str, str] = {}
+            if reveal and entries:
+                revealed_map = provider.resolve_mapped_settings({e.ref: e.ref for e in entries})
+        rows: list[dict[str, Any]] = []
+        for entry in entries:
+            if reveal:
+                val_disp = revealed_map.get(entry.ref, "")
+                masked = False
+            else:
+                val_disp = "***" if entry.is_secret else ""
+                masked = True
+            rows.append(
+                {
+                    "ref": entry.ref,
+                    "field_key": entry.field_key,
+                    "item_id": entry.item_id,
+                    "item_title": entry.item_title,
+                    "is_secret": entry.is_secret,
+                    "masked": masked,
+                    "value": val_disp,
+                }
+            )
+        if use_json:
+            _emit_json(
+                {
+                    "provider": cfg.provider,
+                    "secret_id": args.secret_id,
+                    "count": len(rows),
+                    "revealed": reveal,
+                    "fields": rows,
+                }
+            )
+            return 0
+        if not rows:
+            print("(No fields found)")
+            return 0
+        disp_rows = [
+            {
+                "field_key": r["field_key"],
+                "ref": r["ref"],
+                "value": r["value"] if reveal else ("[MASKED]" if r["is_secret"] else ""),
+            }
+            for r in rows
+        ]
+        _print_cli_table(disp_rows, ["field_key", "ref", "value"])
+        return 0
+
+    if subcmd == "map":
+        canon = resolve_setting_key(args.setting_key)
+        if canon is None or canon not in SECRET_MANAGED_SETTING_KEYS:
+            valid = ", ".join(SECRET_MANAGED_SETTING_KEYS)
+            raise ValueError(
+                f"Setting {args.setting_key!r} is not a secret-managed credential key. "
+                f"Supported keys: {valid}."
+            )
+        parse_secret_ref(args.vault_ref)
+        target_profile = getattr(args, "profile", None)
+        if target_profile is not None:
+            target_profile = validate_profile_name(target_profile)
+        else:
+            target_profile = get_active_profile_name()
+
+        current_map = parse_vault_secret_map(
+            get_saved_setting("vault_secret_map", profile=target_profile),
+            strict=False,
+        )
+        cleaned_ref = args.vault_ref.strip()
+        current_map[canon] = cleaned_ref
+        serialized_map = serialize_vault_secret_map(current_map)
+        errors = validate_settings_values({"vault_secret_map": serialized_map})
+        if errors:
+            raise ValueError(errors[0][1])
+
+        if is_dry:
+            payload = {
+                "dry_run": True,
+                "action": "map",
+                "key": canon,
+                "ref": cleaned_ref,
+                "profile": target_profile,
+                "vault_secret_map": current_map,
+            }
+            if use_json:
+                _emit_json(payload)
+            else:
+                print(f"[DRY-RUN] Would map '{canon}' -> '{cleaned_ref}' in profile '{target_profile}'.")
+            return 0
+
+        path = save_profile_settings({"vault_secret_map": serialized_map}, profile=target_profile)
+        if use_json:
+            _emit_json(
+                {
+                    "mapped": True,
+                    "key": canon,
+                    "ref": cleaned_ref,
+                    "profile": target_profile,
+                    "path": str(path),
+                    "vault_secret_map": current_map,
+                }
+            )
+        else:
+            print(f"[+] Mapped '{canon}' -> '{cleaned_ref}' in profile '{target_profile}' ({path}).")
+        return 0
+
+    if subcmd == "unmap":
+        canon = resolve_setting_key(args.setting_key)
+        if canon is None or canon not in SECRET_MANAGED_SETTING_KEYS:
+            valid = ", ".join(SECRET_MANAGED_SETTING_KEYS)
+            raise ValueError(
+                f"Setting {args.setting_key!r} is not a secret-managed credential key. "
+                f"Supported keys: {valid}."
+            )
+        target_profile = getattr(args, "profile", None)
+        if target_profile is not None:
+            target_profile = validate_profile_name(target_profile)
+        else:
+            target_profile = get_active_profile_name()
+
+        current_map = parse_vault_secret_map(
+            get_saved_setting("vault_secret_map", profile=target_profile),
+            strict=False,
+        )
+        previous_ref = current_map.pop(canon, None)
+        unmap_serialized = serialize_vault_secret_map(current_map)
+
+        if is_dry:
+            payload = {
+                "dry_run": True,
+                "action": "unmap",
+                "key": canon,
+                "was_mapped": previous_ref is not None,
+                "previous_ref": previous_ref,
+                "profile": target_profile,
+                "vault_secret_map": current_map,
+            }
+            if use_json:
+                _emit_json(payload)
+            else:
+                print(f"[DRY-RUN] Would unmap '{canon}' from profile '{target_profile}'.")
+            return 0
+
+        path = save_profile_settings(
+            {"vault_secret_map": unmap_serialized or None},
+            profile=target_profile,
+        )
+        if use_json:
+            _emit_json(
+                {
+                    "unmapped": True,
+                    "key": canon,
+                    "was_mapped": previous_ref is not None,
+                    "previous_ref": previous_ref,
+                    "profile": target_profile,
+                    "path": str(path),
+                    "vault_secret_map": current_map,
+                }
+            )
+        else:
+            print(f"[+] Unmapped '{canon}' in profile '{target_profile}' ({path}).")
+        return 0
+
+    if subcmd == "pull":
+        cfg = _require_enabled_secret_store(_build_secret_store_config_from_args(args))
+        if not cfg.secret_map:
+            if use_json:
+                _emit_json(
+                    {
+                        "provider": cfg.provider,
+                        "count": 0,
+                        "pulled": {},
+                        "persisted_to_disk": False,
+                    }
+                )
+            else:
+                print("[*] No vault_secret_map entries configured.")
+            return 0
+
+        force_flag = bool(getattr(args, "force", False))
+        overwrite_flag = bool(getattr(args, "overwrite_existing", False))
+        target_map: dict[str, str] = {}
+        for setting_key, ref in cfg.secret_map.items():
+            if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+                continue
+            if not overwrite_flag and get_env_override_for_setting(setting_key) is not None:
+                continue
+            if not force_flag:
+                has_sess, sess_val = get_session_override(setting_key)
+                if has_sess and sess_val is not None:
+                    continue
+            target_map[setting_key] = ref
+
+        if is_dry:
+            dry_keys = sorted(target_map.keys())
+            if use_json:
+                _emit_json(
+                    {
+                        "dry_run": True,
+                        "action": "pull",
+                        "provider": cfg.provider,
+                        "count": len(dry_keys),
+                        "keys": dry_keys,
+                        "mappings": {k: target_map[k] for k in dry_keys},
+                        "persisted_to_disk": False,
+                    }
+                )
+            else:
+                print(
+                    f"[DRY-RUN] Would hydrate {len(dry_keys)} secret(s) from '{cfg.provider}' "
+                    f"into memory: {', '.join(dry_keys) or '(none)'}"
+                )
+            return 0
+
+        has_cli_override = bool(
+            getattr(args, "provider", None) is not None
+            or bool(getattr(args, "insecure", False))
+            or (
+                isinstance(getattr(args, "ca_bundle", None), str)
+                and str(getattr(args, "ca_bundle", "")).strip()
+            )
+        )
+        if has_cli_override:
+            to_apply: dict[str, str] = {}
+            if target_map:
+                with build_secret_store_provider(cfg) as provider:
+                    resolved = provider.resolve_mapped_settings(target_map)
+                for setting_key, secret_val in resolved.items():
+                    if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+                        continue
+                    cleaned = str(secret_val or "").strip()
+                    if not cleaned:
+                        continue
+                    if not overwrite_flag and get_env_override_for_setting(setting_key) is not None:
+                        continue
+                    to_apply[setting_key] = cleaned
+                if to_apply:
+                    set_session_overrides(to_apply, vault_hydrated=True)
+            pulled_masked = {k: mask_secret(v) for k, v in to_apply.items()}
+        else:
+            pulled_masked = hydrate_secrets_from_store(
+                force=force_flag,
+                overwrite_existing=overwrite_flag,
+            )
+
+        if use_json:
+            _emit_json(
+                {
+                    "provider": cfg.provider,
+                    "count": len(pulled_masked),
+                    "pulled": pulled_masked,
+                    "persisted_to_disk": False,
+                }
+            )
+        else:
+            if not pulled_masked:
+                print("[*] No secrets hydrated (all mapped keys skipped by env/session precedence).")
+            else:
+                print(f"[+] Hydrated {len(pulled_masked)} secret(s) into process memory from '{cfg.provider}':")
+                for k, mval in sorted(pulled_masked.items()):
+                    print(f"  - {k}: {mval}")
+        return 0
+
+    return 1
+
+
 def _emit_cli_error(exc: Exception, *, use_json: bool) -> None:
+    if isinstance(exc, SecretStoreError):
+        sec_payload: dict[str, Any] = {
+            "error": str(exc),
+            "provider": exc.provider,
+            "status_code": exc.status_code,
+            "endpoint": exc.endpoint,
+            "reason": exc.reason,
+            "type": type(exc).__name__,
+        }
+        if use_json:
+            print(json.dumps(sec_payload, indent=2, default=str), file=sys.stderr)
+        else:
+            print(f"[-] Secret Store error ({exc.provider or 'unknown'}): {exc}", file=sys.stderr)
+        return
+
+    if isinstance(exc, SplunkESError):
+        es_payload: dict[str, Any] = {
+            "error": str(exc),
+            "status_code": exc.status_code,
+            "endpoint": exc.endpoint,
+            "messages": exc.messages,
+            "type": type(exc).__name__,
+        }
+        if use_json:
+            print(json.dumps(es_payload, indent=2, default=str), file=sys.stderr)
+        else:
+            print(f"[-] Splunk ES error: {exc}", file=sys.stderr)
+        return
+
     if isinstance(exc, RecordedFutureError):
         payload: dict[str, Any] = {
             "error": str(exc),
@@ -5478,6 +8755,8 @@ def main() -> None:
                 tui_kwargs["image_viewer"] = resolved_image_viewer
             if resolved_view is not None:
                 tui_kwargs["view_mode"] = resolved_view
+            if bool(getattr(args, "no_secret_store", False)):
+                tui_kwargs["no_secret_store"] = True
             if args.command == "tui":
                 tui_dry = bool(global_dry_run or getattr(args, "dry_run", False))
                 ws_arg = getattr(args, "workspace", None)
@@ -5487,6 +8766,18 @@ def main() -> None:
             else:
                 run_unified_tui(client, dry_run=global_dry_run, **tui_kwargs)
             return
+
+        if args.command in (
+            "watchlist",
+            "rf",
+            "research",
+            "sigma",
+            "validate",
+            "splunk",
+            "s1",
+            "llm",
+        ) and not is_interactive_wl:
+            _maybe_hydrate_startup_secrets(args)
 
         if args.command == "watchlist":
             client = _build_rf_client(args)
@@ -5517,6 +8808,8 @@ def main() -> None:
             rc = _handle_llm(args, use_json=use_json)
         elif args.command == "settings":
             rc = _handle_settings(args, global_dry_run=global_dry_run, use_json=use_json)
+        elif args.command == "secrets":
+            rc = _handle_secrets(args, global_dry_run=global_dry_run, use_json=use_json)
         else:
             parser.print_help()
             rc = 1
@@ -5527,6 +8820,7 @@ def main() -> None:
         ConfigurationError,
         LocalLLMError,
         RecordedFutureError,
+        SecretStoreError,
         SentinelOneError,
         SigmaConfigurationError,
         SplunkESError,
