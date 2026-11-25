@@ -778,7 +778,8 @@ def test_f4_remove_non_auto_resolved_company_via_client_cli_and_tui(
 
             ent_table = app.query_one("#wl-entities-table", DataTable)
             assert ent_table.row_count == 1
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            ent_table.move_cursor(row=0, column=0)
+            app.query_one("WatchlistsPane").action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             opts = app.screen.query_one("#ctx-menu-options", OptionList)

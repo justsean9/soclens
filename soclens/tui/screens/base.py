@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len, get_character_cell_size
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -35,6 +36,7 @@ from soclens.tui.pivot import (
     build_keyword_spl,
     emit_pivot,
     extract_pivot_from_click,
+    is_clickable_known_field,
 )
 
 
@@ -73,6 +75,45 @@ def extract_richlog_text(log_widget: RichLog) -> str:
     return "\n".join(extracted).strip()
 
 
+def _apply_selection_highlight(
+    widget: Any,
+    strip: Strip,
+    line_index: int,
+    line_text: str,
+    scroll_x: int,
+) -> Strip:
+    """Apply Textual selection highlight styling to a rendered ``Strip`` line."""
+    selection = getattr(widget, "text_selection", None)
+    if selection is None:
+        return strip
+    span = selection.get_span(line_index)
+    if span is None:
+        return strip
+    start_char, end_char = span
+    start_cell = cell_len(line_text[:start_char]) if start_char > 0 else 0
+    end_cell = (
+        strip.cell_length + scroll_x
+        if end_char == -1
+        else cell_len(line_text[:end_char])
+    )
+    line_len = strip.cell_length
+    vis_start = max(0, start_cell - scroll_x)
+    vis_end = max(0, min(line_len, end_cell - scroll_x))
+    if vis_start >= vis_end:
+        return strip
+    try:
+        sel_style = widget.screen.get_component_rich_style("screen--selection")
+    except Exception:
+        sel_style = Style(bgcolor="#264f78", color="#ffffff")
+    if not sel_style:
+        sel_style = Style(bgcolor="#264f78", color="#ffffff")
+    parts = strip.divide([vis_start, vis_end])
+    if len(parts) == 3:
+        before, middle, after = parts
+        return Strip.join([before, middle.apply_style(sel_style), after])
+    return strip.apply_style(sel_style)
+
+
 class SelectableRichLog(RichLog):
     """``RichLog`` subclass with native mouse-drag text highlighting and selection extraction."""
 
@@ -86,7 +127,10 @@ class SelectableRichLog(RichLog):
         extracted = selection.extract(full_text)
         if not extracted:
             return None
-        return extracted, "\n"
+        cleaned = "\n".join(part.rstrip() for part in extracted.splitlines()).strip()
+        if not cleaned:
+            return None
+        return cleaned, "\n"
 
     def selection_updated(self, selection: Selection | None) -> None:
         """Refresh visible lines immediately as the user drags a text highlight."""
@@ -94,41 +138,33 @@ class SelectableRichLog(RichLog):
         self.refresh()
 
     def render_line(self, y: int) -> Strip:
-        """Render a viewport line and apply selection highlight styling when selected."""
+        """Render a viewport line with selection offset metadata and highlight styling."""
         strip = super().render_line(y)
-        selection = self.text_selection
-        if selection is None:
-            return strip
         scroll_x, scroll_y = self.scroll_offset
-        span = selection.get_span(scroll_y + y)
-        if span is None:
+        line_index = scroll_y + y
+        if not (0 <= line_index < len(self.lines)):
             return strip
-        start_x, end_x = span
-        line_len = strip.cell_length
-        vis_start = max(0, start_x - scroll_x)
-        vis_end = line_len if end_x == -1 else max(0, min(line_len, end_x - scroll_x))
-        if vis_start >= vis_end:
-            return strip
-        try:
-            sel_style = self.screen.get_component_rich_style("screen--selection")
-        except Exception:
-            sel_style = Style(bgcolor="#264f78", color="#ffffff")
-        if not sel_style:
-            sel_style = Style(bgcolor="#264f78", color="#ffffff")
-        parts = strip.divide([vis_start, vis_end])
-        if len(parts) == 3:
-            before, middle, after = parts
-            return Strip.join([before, middle.apply_style(sel_style), after])
-        return strip.apply_style(sel_style)
+        line_text = self.lines[line_index].text
+        char_x = 0
+        if scroll_x > 0:
+            cells = 0
+            for ch in line_text:
+                if cells >= scroll_x:
+                    break
+                cells += get_character_cell_size(ch)
+                char_x += 1
+        strip = strip.apply_offsets(char_x, line_index)
+        return _apply_selection_highlight(self, strip, line_index, line_text, scroll_x)
 
 
 class DoubleClickDataTable(DataTable[Any]):
-    """DataTable emitting ``RowSelected`` on double-click/Enter and ``RowRightClicked`` on button 3."""
+    """Selectable DataTable emitting ``RowSelected`` on double-click/Enter."""
 
+    ALLOW_SELECT = True
     DOUBLE_CLICK_WINDOW: float = 0.55
 
     class RowRightClicked(Message):
-        """Posted when a user right-clicks inside a ``DoubleClickDataTable``."""
+        """Legacy message type kept for backwards-compatible imports."""
 
         def __init__(
             self,
@@ -155,6 +191,102 @@ class DoubleClickDataTable(DataTable[Any]):
         self._last_click_time: float = 0.0
         self._hovered_row_index: int | None = None
         self._row_tooltip_provider: Callable[[int], str | None] | None = None
+
+    def _fixed_rows_height(self) -> int:
+        fixed_h = 0
+        for i in range(self.fixed_rows):
+            row_key = self._row_locations.get_key(i)
+            if row_key is not None:
+                fixed_h += self.get_row_height(row_key)
+        if self.show_header:
+            fixed_h += self.get_row_height(self._header_row_key)
+        return fixed_h
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        """Refresh table lines immediately as the user drags a text highlight."""
+        self._line_cache.clear()
+        self.refresh()
+
+    def render_line(self, y: int) -> Strip:
+        """Render a table line with selection offset metadata and highlight styling."""
+        strip = super().render_line(y)
+        scroll_x, scroll_y = self.scroll_offset
+        fixed_h = self._fixed_rows_height()
+        line_index = y if y < fixed_h else y + scroll_y
+        char_x = 0
+        if scroll_x > 0:
+            left_strip = self._render_line(line_index, 0, scroll_x, self.rich_style)
+            char_x = len(left_strip.text)
+        strip = strip.apply_offsets(char_x, line_index)
+        if self.text_selection is None:
+            return strip
+        if scroll_x > 0:
+            full_w = max(self.virtual_size.width, self.size.width)
+            full_text = self._render_line(line_index, 0, full_w, self.rich_style).text
+        else:
+            full_text = strip.text
+        return _apply_selection_highlight(self, strip, line_index, full_text, scroll_x)
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Extract highlighted cell text from rendered ``DataTable`` rows."""
+        total_lines = self._fixed_rows_height() + sum(
+            self.get_row_height(row.key) for row in self.ordered_rows
+        )
+        if total_lines <= 0:
+            return None
+        start_y = max(0, selection.start.y) if selection.start is not None else 0
+        end_y = (
+            min(total_lines - 1, selection.end.y)
+            if selection.end is not None
+            else total_lines - 1
+        )
+        if end_y < start_y:
+            return None
+        full_w = max(self.virtual_size.width, self.size.width)
+        lines: list[str] = [""] * start_y
+        for idx in range(start_y, end_y + 1):
+            rendered = self._render_line(idx, 0, full_w, self.rich_style)
+            lines.append(rendered.text)
+        extracted = selection.extract("\n".join(lines))
+        if not extracted:
+            return None
+        cleaned = "\n".join(part.rstrip() for part in extracted.splitlines()).strip()
+        if not cleaned:
+            return None
+        return cleaned, "\n"
+
+    def extract_cell_at_event(self, event: events.MouseEvent) -> tuple[str, str] | None:
+        """Return ``(column_label, cell_value)`` when pointer is on a searchable known cell."""
+        style = getattr(event, "style", None)
+        meta = getattr(style, "meta", None) if style is not None else None
+        if not isinstance(meta, dict):
+            return None
+        if "row" not in meta or "column" not in meta:
+            return None
+        try:
+            row_index = int(meta["row"])
+            col_index = int(meta["column"])
+        except (TypeError, ValueError):
+            return None
+        if row_index < 0 or not self.is_valid_row_index(row_index):
+            return None
+        columns = list(self.ordered_columns)
+        if not (0 <= col_index < len(columns)):
+            return None
+        try:
+            row_key = self.ordered_rows[row_index].key
+            cells = self.get_row(row_key)
+        except Exception:
+            return None
+        if col_index >= len(cells):
+            return None
+        cell = cells[col_index]
+        val = (cell.plain if isinstance(cell, Text) else str(cell)).strip()
+        raw_label = columns[col_index].label
+        col_label = (raw_label.plain if isinstance(raw_label, Text) else str(raw_label)).strip() or "Field"
+        if not is_clickable_known_field(col_label, val):
+            return None
+        return col_label, val
 
     def set_row_tooltip_provider(self, provider: Callable[[int], str | None] | None) -> None:
         """Register an optional callback returning custom full-line hover text for a row index."""
@@ -198,37 +330,6 @@ class DoubleClickDataTable(DataTable[Any]):
     async def _on_click(self, event: events.Click) -> None:
         event.prevent_default()
         self._set_hover_cursor(True)
-
-        if event.button == 3:
-            event.stop()
-            self.focus()
-            meta = event.style.meta
-            if "row" in meta and "column" in meta:
-                row_index = int(meta["row"])
-                column_index = int(meta["column"])
-                if self.is_valid_row_index(row_index):
-                    self.cursor_coordinate = Coordinate(row_index, max(0, column_index))
-                    row_key = self.ordered_rows[row_index].key
-                    self.post_message(
-                        DoubleClickDataTable.RowRightClicked(
-                            self,
-                            row_index,
-                            row_key,
-                            event.screen_x,
-                            event.screen_y,
-                        )
-                    )
-                    return
-            self.post_message(
-                DoubleClickDataTable.RowRightClicked(
-                    self,
-                    None,
-                    None,
-                    event.screen_x,
-                    event.screen_y,
-                )
-            )
-            return
 
         if event.button != 1:
             return
@@ -491,26 +592,24 @@ class BaseSocPane(VerticalScroll):
         origin: tuple[int, int] = (2, 2),
         source_tab: str = "",
     ) -> None:
-        """Open a universal right-click search & pivot menu for any clicked field value."""
-        clean_val = str(value or "").strip()
+        """Open a right-click RF / Splunk search menu for a clicked field or highlighted text."""
+        clean_val = " ".join(str(value or "").strip().splitlines()).strip()
         if not clean_val or clean_val == "-":
             return
+        app_menu = getattr(self.app, "open_selection_pivot_menu", None)
+        if callable(app_menu):
+            app_menu(clean_val, origin=origin, field_label=field_label)
+            return
+
         short_val = clean_val if len(clean_val) <= 34 else f"{clean_val[:31]}..."
         spl_preview = build_keyword_spl(short_val)
         items: list[tuple[str, str]] = [
-            ("splunk_keyword", f"Splunk Search: {spl_preview}"),
-            ("research", f"Deep Research (RF + OSINT): {short_val}"),
-            ("rf_intel", "RF Intel Lookup (v2 / Entity Match)"),
-            ("splunk_es", "Search Splunk ES Notables"),
-            ("sentinelone", "Search SentinelOne"),
-            ("llm", "Analyze in Local LLM (F7)"),
-            ("copy_value", f"Copy Value ({field_label})"),
+            ("research", f"Search in RF (Research): {short_val}"),
+            ("rf_intel", f"Search in RF Intel: {short_val}"),
+            ("splunk_keyword", f"Search in Splunk: {spl_preview}"),
         ]
 
         def _on_select(action_id: str) -> None:
-            if action_id == "copy_value":
-                self.copy_to_clipboard(clean_val, label=field_label)
-                return
             if action_id == "splunk_keyword":
                 spl = build_keyword_spl(clean_val)
                 open_fn = getattr(self.app, "open_splunk_search", None)
@@ -527,16 +626,7 @@ class BaseSocPane(VerticalScroll):
                         ),
                     )
                 return
-            target_map = {
-                "research": "tab-research",
-                "rf_intel": "tab-rf-intel",
-                "splunk_es": "tab-splunk-es",
-                "sentinelone": "tab-sentinelone",
-                "llm": "tab-llm",
-            }
-            target_tab = target_map.get(action_id)
-            if not target_tab:
-                return
+            target_tab = "tab-research" if action_id == "research" else "tab-rf-intel"
             emit_pivot(
                 self.app,
                 PivotPayload(
@@ -548,9 +638,14 @@ class BaseSocPane(VerticalScroll):
                 ),
             )
 
+        title = (
+            f"Search {field_label}: {short_val}"
+            if field_label and field_label != "Selection"
+            else f"Search: {short_val}"
+        )
         self.open_context_menu(
             items,
-            title=f"Pivot {field_label}: {short_val}",
+            title=title,
             origin=origin,
             on_select=_on_select,
         )
@@ -561,7 +656,7 @@ class BaseSocPane(VerticalScroll):
         *,
         source_tab: str = "",
     ) -> bool:
-        """If ``event`` is a right-click with highlighted text or on a pivotable field, open the menu."""
+        """If ``event`` is a right-click with highlighted text or on a known field, open search."""
         if event.button != 3:
             return False
         get_sel = getattr(self.app, "get_selected_text", None)
@@ -580,6 +675,8 @@ class BaseSocPane(VerticalScroll):
         if hit is None:
             return False
         field_label, value = hit
+        if not is_clickable_known_field(field_label, value):
+            return False
         event.stop()
         self.open_field_pivot_menu(
             field_label,
@@ -588,10 +685,6 @@ class BaseSocPane(VerticalScroll):
             source_tab=source_tab,
         )
         return True
-
-    def on_click(self, event: events.Click) -> None:
-        """Default pane right-click handler enabling any-field search & pivot."""
-        self.handle_field_pivot_right_click(event)
 
     def confirm_destructive_action(
         self,

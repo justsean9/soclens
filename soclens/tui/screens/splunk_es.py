@@ -13,7 +13,7 @@ from rich import box
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
@@ -2997,7 +2997,10 @@ class SplunkESPane(BaseSocPane):
                 cf_tbl.add_column(ratio=1, overflow="fold")
                 for k, v in pinned_items:
                     lbl = self._discovered_labels.get(k, _pretty_field_label(k))
-                    cf_tbl.add_row(f"{lbl} ({k})", Text(_format_human_value(v)))
+                    cf_tbl.add_row(
+                        f"{lbl} ({k})",
+                        make_pivot_text(_format_human_value(v), field=lbl),
+                    )
                 detail.write(
                     Panel(
                         cf_tbl,
@@ -3034,7 +3037,10 @@ class SplunkESPane(BaseSocPane):
         ):
             if row.get(k) not in (None, ""):
                 label = "Time" if k == "_time" else _pretty_field_label(k)
-                meta_tbl.add_row(label, Text(_format_human_value(row.get(k))))
+                meta_tbl.add_row(
+                    label,
+                    make_pivot_text(_format_human_value(row.get(k)), field=label),
+                )
         detail.write(
             Panel(
                 meta_tbl,
@@ -3066,7 +3072,10 @@ class SplunkESPane(BaseSocPane):
             for k in sorted(custom_map.keys()):
                 lbl = self._discovered_labels.get(k, _pretty_field_label(k))
                 prefix = f"{lbl} ({k})" if lbl != k else _pretty_field_label(k)
-                cf_tbl.add_row(prefix, Text(_format_human_value(custom_map[k])))
+                cf_tbl.add_row(
+                    prefix,
+                    make_pivot_text(_format_human_value(custom_map[k]), field=lbl),
+                )
             detail.write(
                 Panel(
                     cf_tbl,
@@ -3097,7 +3106,12 @@ class SplunkESPane(BaseSocPane):
         ):
             val = row.get(k) if row.get(k) not in (None, "") else raw_obj.get(k)
             if val not in (None, ""):
-                detail.write(f"{k}: {val}")
+                detail.write(
+                    Text.assemble(
+                        Text(f"{k}: ", style="bold cyan"),
+                        make_pivot_text(str(val), field=k),
+                    )
+                )
         if "rf_observables" in row:
             detail.write("")
             detail.write("--- RF Observable Matches ---")
@@ -3242,121 +3256,6 @@ class SplunkESPane(BaseSocPane):
                 self._render_filtered_table(select_row=event.cursor_row)
                 return
             self._render_detail(event.cursor_row)
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        if self.handle_field_pivot_right_click(event, source_tab="tab-splunk-es"):
-            return
-        event.stop()
-        self._open_es_menu(
-            row_index=self._selected_row_index(),
-            origin=(event.screen_x, event.screen_y),
-        )
-
-    @on(DoubleClickDataTable.RowRightClicked, "#es-table")
-    def handle_table_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        row_index = event.row_index if event.row_index is not None else self._selected_row_index()
-        self._open_es_menu(
-            row_index=row_index,
-            origin=(event.screen_x, event.screen_y),
-        )
-
-    def _open_es_menu(
-        self,
-        *,
-        row_index: int | None,
-        origin: tuple[int, int],
-    ) -> None:
-        items: list[tuple[str, str]] = [
-            ("inspect", "Inspect Detail"),
-            ("refresh", "Refresh View"),
-        ]
-        if self._current_view == "notables":
-            items.extend(
-                [
-                    ("triage", "Triage Notable"),
-                    ("bulk_triage", "Bulk Triage Selected"),
-                    ("add_note", "Add Markdown Note"),
-                    ("ar_modal", "Adaptive Response"),
-                    ("investigations", "Create / Attach Investigation"),
-                    ("enrich_selected", "Enrich Selected Notable with RF"),
-                    ("enrich_all", "Enrich All Loaded Notables"),
-                    ("post_rf_comment", "Post RF Comment to Notable"),
-                    ("pivot_f8", "Pivot to Splunk Search (F8)"),
-                    ("pivot_s1", "Pivot to SentinelOne (9)"),
-                    ("pivot_rf", "Pivot IOC to RF Intel (4)"),
-                    ("pivot_research", "Pivot IOC to Research (7)"),
-                    ("pivot_llm", "Send Bundle to Local LLM (F7)"),
-                ]
-            )
-        elif self._current_view == "correlations":
-            items.append(("toggle_corr", "Toggle Enable/Disable"))
-            items.append(("pivot_spl", "Open SPL in Splunk Search"))
-        items.append(("open_logs", "Open Logs Tab"))
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "inspect":
-                if row_index is not None and 0 <= row_index < len(self._displayed_rows):
-                    self._render_detail(row_index)
-                    self.query_one("#es-detail", RichLog).focus()
-                else:
-                    self.set_status("No row selected to inspect.")
-            elif action_id == "refresh":
-                self.handle_refresh()
-            elif action_id == "triage":
-                self.handle_triage_notable()
-            elif action_id == "bulk_triage":
-                self.handle_bulk_triage()
-            elif action_id == "add_note":
-                self.handle_add_note_modal()
-            elif action_id == "ar_modal":
-                self.handle_open_ar_modal()
-            elif action_id == "investigations":
-                target_ids = self._target_event_ids()
-                self._open_investigation_worker(target_ids, [], default_mode="create")
-            elif action_id == "enrich_selected":
-                self.handle_enrich_selected()
-            elif action_id == "enrich_all":
-                self.handle_enrich_all()
-            elif action_id == "post_rf_comment":
-                self.handle_post_rf_comment()
-            elif action_id == "pivot_f8":
-                self.handle_pivot_to_search()
-            elif action_id == "pivot_s1":
-                self.handle_pivot_to_sentinelone()
-            elif action_id == "pivot_rf":
-                self._emit_pivot_for_target("tab-rf-intel", auto_run=True)
-            elif action_id == "pivot_research":
-                self._emit_pivot_for_target("tab-research", auto_run=True)
-            elif action_id == "pivot_llm":
-                self.handle_pivot_to_llm_copilot()
-            elif action_id == "toggle_corr":
-                self.handle_toggle_correlation()
-            elif action_id == "pivot_spl":
-                row = (
-                    self._displayed_rows[row_index]
-                    if row_index is not None and 0 <= row_index < len(self._displayed_rows)
-                    else self.get_selected_row()
-                )
-                spl = str((row or {}).get("search") or "").strip()
-                open_fn = getattr(self.app, "open_splunk_search", None)
-                if spl and callable(open_fn):
-                    open_fn(spl, auto_run=False)
-                else:
-                    self.set_status("Selected correlation search has no SPL query to load.")
-            elif action_id == "open_logs":
-                open_logs = getattr(self.app, "open_logs_tab", None)
-                if callable(open_logs):
-                    open_logs(source="splunk")
-
-        self.open_context_menu(
-            items,
-            title="Splunk ES",
-            origin=origin,
-            on_select=_on_select,
-        )
 
     # ------------------------------------------------------------------
     # Refresh / Load Triggers (Protected by _request_seq)

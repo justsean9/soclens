@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from rich.style import Style
@@ -18,8 +19,137 @@ __all__ = [
     "extract_pivot_from_click",
     "extract_tenant_from_site_name",
     "format_copilot_context",
+    "is_clickable_known_field",
+    "join_pivot_texts",
     "make_pivot_text",
 ]
+
+_NON_SEARCHABLE_VALUES: frozenset[str] = frozenset(
+    {
+        "-",
+        "n/a",
+        "none",
+        "unassigned",
+        "unknown",
+        "[ ]",
+        "[x]",
+        "✓",
+        "✗",
+        "yes",
+        "no",
+        "true",
+        "false",
+    }
+)
+
+_FREE_TEXT_OR_NON_SEARCH_FIELDS: frozenset[str] = frozenset(
+    {
+        # Free-text / prose / raw dumps (user must highlight exact substring)
+        "raw event",
+        "_raw",
+        "raw",
+        "description",
+        "rule description",
+        "explanation",
+        "rationale",
+        "content",
+        "note",
+        "notes",
+        "ai insights",
+        "summary",
+        "evidence summary",
+        "message",
+        "comment",
+        "comments",
+        "fragment",
+        "details",
+        "detail",
+        "output",
+        "log",
+        "event summary",
+        "entry",
+        "evidence",
+        "evidence / mitigations",
+        "evidence / references",
+        "classification",
+        "detection source",
+        "detection engines",
+        # Scalar status / badges / timestamps / counts / UI columns
+        "status",
+        "incident status",
+        "mitigation status",
+        "network status",
+        "priority",
+        "urgency",
+        "severity",
+        "confidence / severity",
+        "analyst verdict",
+        "verdict",
+        "triage verdict",
+        "service tier",
+        "tier",
+        "alert type",
+        "created",
+        "updated",
+        "expires",
+        "downloaded",
+        "time",
+        "timestamp",
+        "last active",
+        "registered",
+        "last updated",
+        "sightings window",
+        "file size",
+        "size",
+        "risk score",
+        "risk level",
+        "risk",
+        "score",
+        "criticality",
+        "rules triggered",
+        "private reg",
+        "empty contacts",
+        "actions taken",
+        "count",
+        "hits",
+        "hits count",
+        "sel",
+        "#",
+        "selected",
+        "age",
+        "state",
+        "infected",
+        "active threats",
+        "scan status",
+        "mitigation mode",
+        "is up to date",
+        "is decommissioned",
+        "api family",
+        "endpoint base",
+        "auth header",
+        "toolkit surface",
+    }
+)
+
+
+def is_clickable_known_field(field: str, value: str) -> bool:
+    """Return True when ``(field, value)`` is a structured searchable field, not free text."""
+    clean_val = str(value or "").strip()
+    if not clean_val or clean_val.lower() in _NON_SEARCHABLE_VALUES:
+        return False
+    if "\n" in clean_val or len(clean_val) > 180:
+        return False
+    norm_field = " ".join(str(field or "").strip().lower().split())
+    if norm_field in _FREE_TEXT_OR_NON_SEARCH_FIELDS:
+        return False
+    return True
+
+
+def _has_pivot_spans(text: Text) -> bool:
+    for sp in text.spans:
+        if isinstance(sp.style, Style) and sp.style.meta and sp.style.meta.get("pivot_value"):
+            return True
+    return False
 
 
 def _spl_quote(value: str) -> str:
@@ -36,12 +166,34 @@ def build_keyword_spl(keyword: str) -> str:
 
 
 def make_pivot_text(value: str | Text, *, field: str = "") -> Text:
-    """Attach right-click pivot metadata (``pivot_field``/``pivot_value``) to a Rich ``Text``."""
+    """Attach right-click search metadata (``pivot_field``/``pivot_value``) to known fields."""
     text = value.copy() if isinstance(value, Text) else Text(str(value))
+    if _has_pivot_spans(text):
+        return text
     plain = text.plain.strip()
-    if plain and plain != "-":
+    if is_clickable_known_field(field, plain):
         text.stylize(Style(meta={"pivot_field": field, "pivot_value": plain}))
     return text
+
+
+def join_pivot_texts(
+    values: Sequence[str],
+    *,
+    field: str,
+    sep: str = ", ",
+    style: str | Style = "",
+) -> Text:
+    """Join multiple structured values so each individual item can be right-clicked."""
+    cleaned = [str(v).strip() for v in values if str(v).strip() and str(v).strip() != "-"]
+    if not cleaned:
+        return Text("-")
+    out = Text()
+    for idx, item in enumerate(cleaned):
+        if idx > 0:
+            out.append(sep)
+        tok = Text(item, style=style) if style else Text(item)
+        out.append_text(make_pivot_text(tok, field=field))
+    return out
 
 
 def extract_pivot_from_click(event: Any) -> tuple[str, str] | None:

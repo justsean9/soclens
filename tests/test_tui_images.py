@@ -596,12 +596,11 @@ def test_tui_toggle_os_viewer_default_persists_and_opens_directly(
                 app.screen.query_one("#shot-os-default-btn", Button).label
             )
 
-            # Right-click inside ScreenshotViewerModal -> toggle OS default OFF and back ON
+            # Right-click inside ScreenshotViewerModal opens no legacy menu; toggle via button
             await pilot.click("#shot-viewer-canvas", offset=(6, 4), button=3)
             await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option_by_id(app, "toggle_os_default")
-            await pilot.press("enter")
+            assert isinstance(app.screen, ScreenshotViewerModal)
+            await pilot.click("#shot-os-default-btn")
             await pilot.pause()
             assert isinstance(app.screen, ScreenshotViewerModal)
             assert app.open_images_in_os_viewer is False
@@ -686,7 +685,7 @@ def test_tui_right_click_on_right_details_pane_and_inline_images(
 
             log_widget = app.query_one("#rf-log", RichLog)
 
-            # 1) Right-click directly on Screenshot 2/2 inside #rf-log
+            # 1) Right-click on a screenshot panel (not a searchable field or highlighted text) opens no legacy menu
             shot2_line = _find_richlog_line(log_widget, "Screenshot 2/2")
             log_widget.scroll_to(y=max(0, shot2_line - 2), animate=False)
             await pilot.pause()
@@ -694,49 +693,51 @@ def test_tui_right_click_on_right_details_pane_and_inline_images(
             shot2_screen_y = scr_reg.y + (shot2_line - int(round(log_widget.scroll_y))) + 1
             await pilot.click(offset=(scr_reg.x + 8, shot2_screen_y), button=3)
             await pilot.pause()
+            assert not isinstance(app.screen, ContextMenuModal)
 
+            # Keyboard [m] opens item context menu for Playbook Alert images & actions
+            await pilot.press("m")
+            await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             opts = app.screen.query_one("#ctx-menu-options", OptionList)
-            first_option = opts.get_option_at_index(0)
-            assert first_option.id == "open_screenshot"
-            assert "2/2" in str(first_option.prompt)
-
-            # Selecting open_screenshot opens blurred copy of png_2 while blur is ON
+            option_ids = [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)]
+            assert "open_screenshot" in option_ids
+            _select_context_option_by_id(app, "open_screenshot")
             await pilot.press("enter")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert len(opened_calls) == 1
-            assert opened_calls[0][1] == "img:shot-2_blurred"
-            assert opened_calls[0][0] != png_2
+            assert opened_calls[0][1] == "img:shot-1_blurred"
+            assert opened_calls[0][0] != png_1
             assert opened_calls[0][0].startswith(b"\x89PNG\r\n\x1a\n")
 
-            # Right-click Screenshot 2/2 -> Open Unblurred Screenshot opens exact unmodified png_2
-            await pilot.click(offset=(scr_reg.x + 8, shot2_screen_y), button=3)
+            # Keyboard [m] -> Open Unblurred Screenshot opens exact unmodified png_1
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "open_screenshot_unblurred")
             await pilot.press("enter")
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert opened_calls[1] == (png_2, "img:shot-2")
+            assert opened_calls[1] == (png_1, "img:shot-1")
 
-            # 2) Right-click Screenshot 2/2 -> View Screenshot 2/2 in TUI Modal opens at index 1 (2 of 2)
-            await pilot.click(offset=(scr_reg.x + 8, shot2_screen_y), button=3)
+            # 2) Keyboard [m] -> View Screenshots in TUI Modal opens viewer
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "view_screenshots")
             await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, ScreenshotViewerModal)
-            assert "Screenshot 2 of 2" in str(
+            assert "Screenshot 1 of 2" in str(
                 app.screen.query_one("#shot-viewer-header", Static).render()
             )
             await pilot.press("escape")
             await pilot.pause()
             assert not isinstance(app.screen, ScreenshotViewerModal)
 
-            # 3) Right-click Screenshot 2/2 -> Save Screenshot 2/2 PNG ALWAYS saves exact unmodified png_2
-            await pilot.click(offset=(scr_reg.x + 8, shot2_screen_y), button=3)
+            # 3) Keyboard [m] -> Save Screenshot PNG ALWAYS saves exact unmodified png_1
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "save_screenshot")
@@ -745,25 +746,12 @@ def test_tui_right_click_on_right_details_pane_and_inline_images(
             await pilot.pause()
             saved_files = list((tmp_path / "screenshots").glob("*.png"))
             assert len(saved_files) == 1
-            assert saved_files[0].read_bytes() == png_2
+            assert saved_files[0].read_bytes() == png_1
 
-            # 4) Right-click on general details text (outside screenshot panels) opens item menu (NOT pane menu)
-            detail_line = _find_richlog_line(log_widget, "Playbook ID")
-            log_widget.scroll_to(y=max(0, detail_line), animate=False)
+            # 4) Keyboard [m] -> Open All Screenshots (2) while blur ON -> blurred copies
+            await pilot.press("m")
             await pilot.pause()
-            scr_reg = log_widget.scrollable_content_region
-            detail_screen_y = scr_reg.y + (detail_line - int(round(log_widget.scroll_y)))
-            await pilot.click(offset=(scr_reg.x + 8, detail_screen_y), button=3)
-            await pilot.pause()
-
             assert isinstance(app.screen, ContextMenuModal)
-            menu_title = str(app.screen.query_one("#ctx-menu-title", Static).render())
-            assert "RF Intel Actions" not in menu_title
-            opts = app.screen.query_one("#ctx-menu-options", OptionList)
-            assert opts.get_option_at_index(0).id == "open_screenshot"
-            assert "2/2" not in str(opts.get_option_at_index(0).prompt)
-
-            # Choose Open All Screenshots (2) while blur ON -> blurred copies
             _select_context_option_by_id(app, "open_all_screenshots")
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -773,8 +761,8 @@ def test_tui_right_click_on_right_details_pane_and_inline_images(
                 "img:shot-2_blurred",
             ]
 
-            # Toggle blur OFF via context menu -> Open All Screenshots now sends exact unmodified bytes
-            await pilot.click(offset=(scr_reg.x + 8, detail_screen_y), button=3)
+            # Toggle blur OFF via [m] menu -> Open All Screenshots now sends exact unmodified bytes
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "toggle_image_blur")
@@ -782,7 +770,7 @@ def test_tui_right_click_on_right_details_pane_and_inline_images(
             await pilot.pause()
             assert app.blur_images is False
 
-            await pilot.click(offset=(scr_reg.x + 8, detail_screen_y), button=3)
+            await pilot.press("m")
             await pilot.pause()
             _select_context_option_by_id(app, "open_all_screenshots")
             await pilot.press("enter")
@@ -827,6 +815,10 @@ def test_tui_right_click_details_pane_for_non_playbook_alert(tmp_path: Path) -> 
             log_widget = app.query_one("#rf-log", RichLog)
             scr_reg = log_widget.scrollable_content_region
             await pilot.click(offset=(scr_reg.x + 8, scr_reg.y + 1), button=3)
+            await pilot.pause()
+            assert not isinstance(app.screen, ContextMenuModal)
+
+            await pilot.press("m")
             await pilot.pause()
 
             assert isinstance(app.screen, ContextMenuModal)

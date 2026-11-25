@@ -75,6 +75,7 @@ from soclens.tui.logging_bridge import (
 from soclens.tui.pivot import (
     build_keyword_spl,
     build_spl_from_pivot,
+    extract_pivot_from_click,
     format_copilot_context,
 )
 from soclens.tui.screens import (
@@ -1648,24 +1649,20 @@ class SocLensApp(App[None]):
         selected_text: str,
         *,
         origin: tuple[int, int] = (4, 4),
+        field_label: str = "Selection",
     ) -> None:
-        """Open a floating Pivot menu for any highlighted text across all dashboards."""
+        """Open a floating RF / Splunk search menu for highlighted text or a clicked field."""
         clean_val = " ".join(str(selected_text or "").strip().splitlines()).strip()
         if not clean_val:
             return
-        from soclens.tui.clipboard import copy_text_to_clipboard
         from soclens.tui.modals import ContextMenuModal
 
         short_val = clean_val if len(clean_val) <= 34 else f"{clean_val[:31]}..."
         spl_preview = build_keyword_spl(short_val)
         items: list[tuple[str, str]] = [
-            ("research", f"Deep Research (RF + OSINT): {short_val}"),
-            ("splunk_keyword", f"Splunk Search: {spl_preview}"),
-            ("rf_intel", "RF Intel Lookup (v2 / Entity Match)"),
-            ("splunk_es", "Search Splunk ES Notables"),
-            ("sentinelone", "Search SentinelOne"),
-            ("llm", "Analyze in Local LLM (F7)"),
-            ("copy_value", "Copy Highlighted Text"),
+            ("research", f"Search in RF (Research): {short_val}"),
+            ("rf_intel", f"Search in RF Intel: {short_val}"),
+            ("splunk_keyword", f"Search in Splunk: {spl_preview}"),
         ]
 
         active_tab = ""
@@ -1675,35 +1672,33 @@ class SocLensApp(App[None]):
         def _on_select(action_id: str | None) -> None:
             if not action_id:
                 return
-            if action_id == "copy_value":
-                res = copy_text_to_clipboard(clean_val, app=self)
-                if res.success:
-                    self.notify(f"Copied selection ({res.char_count:,} chars).", title="Clipboard")
-                return
             if action_id == "splunk_keyword":
                 self.open_splunk_search(build_keyword_spl(clean_val), auto_run=False)
                 return
-            target_map = {
-                "research": "tab-research",
-                "rf_intel": "tab-rf-intel",
-                "splunk_es": "tab-splunk-es",
-                "sentinelone": "tab-sentinelone",
-                "llm": "tab-llm",
-            }
-            target_tab = target_map.get(action_id)
+            target_tab = "tab-research" if action_id == "research" else (
+                "tab-rf-intel" if action_id == "rf_intel" else ""
+            )
             if target_tab:
+                summary_prefix = (
+                    f"{field_label}: " if field_label and field_label != "Selection" else "Highlighted selection: "
+                )
                 self.dispatch_pivot(
                     PivotPayload(
                         source_tab=active_tab or "selection",
                         target_tab=target_tab,
                         entity=clean_val,
                         entity_type="auto",
-                        summary=f"Highlighted selection: {clean_val}",
+                        summary=f"{summary_prefix}{clean_val}",
                     )
                 )
 
+        title = (
+            f"Search {field_label}: {short_val}"
+            if field_label and field_label != "Selection"
+            else f"Search: {short_val}"
+        )
         self.push_screen(
-            ContextMenuModal(items, title=f"Selection: {short_val}", origin=origin),
+            ContextMenuModal(items, title=title, origin=origin),
             _on_select,
         )
 
@@ -1772,14 +1767,43 @@ class SocLensApp(App[None]):
             self.notify(f"Copied selection ({res.char_count:,} chars).", title="Clipboard")
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
-        """Right-clicking anywhere while text is highlighted opens the global Pivot menu."""
+        """Right-clicking opens RF/Splunk search for highlighted text or known fields."""
         if event.button != 3 or isinstance(self.screen, ModalScreen):
             return
         selected = self.get_selected_text()
-        if not selected:
+        if selected:
+            event.stop()
+            self.open_selection_pivot_menu(
+                selected,
+                origin=(event.screen_x, event.screen_y),
+                field_label="Selection",
+            )
             return
-        event.stop()
-        self.open_selection_pivot_menu(selected, origin=(event.screen_x, event.screen_y))
+        hit = extract_pivot_from_click(event)
+        if hit is not None:
+            field_label, val = hit
+            event.stop()
+            self.open_selection_pivot_menu(
+                val,
+                origin=(event.screen_x, event.screen_y),
+                field_label=field_label,
+            )
+            return
+        from soclens.tui.screens.base import DoubleClickDataTable
+
+        with contextlib.suppress(Exception):
+            widget, _region = self.screen.get_widget_at(event.screen_x, event.screen_y)
+            if isinstance(widget, DoubleClickDataTable):
+                cell_hit = widget.extract_cell_at_event(event)
+                if cell_hit is not None:
+                    col_label, cell_val = cell_hit
+                    event.stop()
+                    self.open_selection_pivot_menu(
+                        cell_val,
+                        origin=(event.screen_x, event.screen_y),
+                        field_label=col_label,
+                    )
+                    return
 
     def open_splunk_search(self, spl: str, *, auto_run: bool = False) -> None:
         """Switch to the Splunk Search tab and load an SPL query."""

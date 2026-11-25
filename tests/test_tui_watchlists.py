@@ -94,8 +94,10 @@ def test_tui_watchlists_names_columns_copy_id_and_back_navigation(
                 await pilot.pause()
                 assert copied[-1] == "report:wl_hash_01"
 
-                # Right-click context menu still works on browse list & has Copy List ID
-                await pilot.click("#wl-lists-table", offset=(4, 2), button=3)
+                # Context menu on browse list has Copy List ID
+                wl_pane = app.query_one("WatchlistsPane")
+                lists_table.move_cursor(row=0, column=0)
+                wl_pane.action_open_context_menu()
                 await pilot.pause()
                 assert isinstance(app.screen, ContextMenuModal)
                 _select_context_option_by_id(app, "copy_list_id")
@@ -124,12 +126,13 @@ def test_tui_watchlists_names_columns_copy_id_and_back_navigation(
                 assert str(ent_table.get_row_at(0)[0]) == "lookalike-bank.example"
                 assert str(ent_table.get_row_at(1)[0]) == "hash:" + ("a" * 64)
 
-                # Copy List ID from expanded entity view + right-click Copy Entity ID
+                # Copy List ID from expanded entity view + context menu Copy Entity ID
                 await pilot.click("#wl-entities-copy-id-btn")
                 await pilot.pause()
                 assert copied[-1] == "report:wl_ent_01"
 
-                await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+                ent_table.move_cursor(row=0, column=0)
+                wl_pane.action_open_context_menu()
                 await pilot.pause()
                 assert isinstance(app.screen, ContextMenuModal)
                 _select_context_option_by_id(app, "copy_entity_id")
@@ -160,7 +163,7 @@ def test_tui_watchlists_names_columns_copy_id_and_back_navigation(
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 assert not ent_pane.has_class("wl-hidden")
-                await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+                wl_pane.action_open_context_menu()
                 await pilot.pause()
                 _select_context_option_by_id(app, "back_to_lists")
                 await pilot.press("enter")

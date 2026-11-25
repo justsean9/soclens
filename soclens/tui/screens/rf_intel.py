@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, HorizontalScroll, Vertical
@@ -2175,47 +2175,6 @@ class RFIntelPane(BaseSocPane):
     # ------------------------------------------------------------------
     # Context Menus & Cross-Tab Pivots
     # ------------------------------------------------------------------
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        if self.handle_field_pivot_right_click(event, source_tab="tab-rf-intel"):
-            return
-        event.stop()
-        in_detail = False
-        try:
-            detail_pane = self.query_one("#rf-detail-pane", Vertical)
-            in_detail = detail_pane.region.contains(event.screen_x, event.screen_y)
-        except Exception:
-            in_detail = False
-        if in_detail and self._active_mode != "welcome":
-            item = self._get_selected_item()
-            if item is not None:
-                clicked_sc_id = str(event.style.meta.get("screenshot_id") or "").strip() or None
-                self._open_item_context_menu(
-                    item,
-                    origin=(event.screen_x, event.screen_y),
-                    focused_screenshot_id=clicked_sc_id,
-                    from_detail=True,
-                )
-                return
-        self._open_pane_context_menu(origin=(event.screen_x, event.screen_y))
-
-    @on(DoubleClickDataTable.RowRightClicked, "#rf-results-table")
-    def handle_table_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        if (
-            event.row_index is not None
-            and 0 <= event.row_index < len(self._visible_items)
-            and self._active_mode != "welcome"
-        ):
-            self._selected_index = event.row_index
-            self._update_toolbar_state()
-            self._render_detail_panel()
-            item = self._visible_items[event.row_index]
-            self._open_item_context_menu(item, origin=(event.screen_x, event.screen_y))
-        else:
-            self._open_pane_context_menu(origin=(event.screen_x, event.screen_y))
 
     def _get_copyable_detail(self) -> tuple[str, str, str | None]:
         """Return ``(text, title, language)`` for copying or viewing the active detail panel."""

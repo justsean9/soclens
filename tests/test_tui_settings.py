@@ -55,23 +55,6 @@ def test_tui_open_settings_via_keys_dashboard_button_and_context_menu(tmp_path: 
             await pilot.pause()
             assert tabs.active == "tab-settings"
 
-            # Dashboard right-click context menu also offers Open Settings
-            await pilot.press("1")
-            await pilot.pause()
-            dash = app.query_one("DashboardPane")
-            dash._open_dashboard_menu(row_summary=None, origin=(10, 10))
-            await pilot.pause()
-            ctx_opts = app.screen.query_one("#ctx-menu-options", OptionList)
-            idx = next(
-                i
-                for i in range(ctx_opts.option_count)
-                if ctx_opts.get_option_at_index(i).id == "open_settings"
-            )
-            ctx_opts.highlighted = idx
-            await pilot.press("enter")
-            await pilot.pause()
-            assert tabs.active == "tab-settings"
-
     asyncio.run(_run())
 
 

@@ -379,10 +379,13 @@ def test_splunk_search_detail_is_human_readable(tmp_path: Path) -> None:
 def test_any_field_right_click_pivot_and_keyword_spl(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
+    from textual.widgets import OptionList
+
     from soclens.tui.modals import ContextMenuModal
     from soclens.tui.pivot import (
         build_keyword_spl,
         extract_pivot_from_click,
+        is_clickable_known_field,
         make_pivot_text,
     )
 
@@ -391,10 +394,17 @@ def test_any_field_right_click_pivot_and_keyword_spl(tmp_path: Path) -> None:
         'index=* "da39a3ee5e6b4b0d3255bfef95601890afd80709"'
     )
 
+    # Known structured fields get pivot metadata; free-text/status fields do NOT
     tagged = make_pivot_text("services.exe", field="Process")
     span_style = tagged.spans[0].style
     fake_event = SimpleNamespace(style=span_style)
     assert extract_pivot_from_click(fake_event) == ("Process", "services.exe")
+
+    assert is_clickable_known_field("Description", "Some long narrative text") is False
+    assert is_clickable_known_field("Status", "Resolved") is False
+    assert is_clickable_known_field("Explanation", "Domain looked suspicious") is False
+    free_text = make_pivot_text("Some long narrative text", field="Description")
+    assert free_text.spans == []
 
     app = create_app(
         client=MagicMock(),
@@ -411,7 +421,11 @@ def test_any_field_right_click_pivot_and_keyword_spl(tmp_path: Path) -> None:
             pane.open_field_pivot_menu("Process", "services.exe", origin=(10, 10))
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
-            # Selecting the first item ("splunk_keyword") pivots to Splunk Search with index=* "services.exe"
+            opts = app.screen.query_one("#ctx-menu-options", OptionList)
+            opt_ids = [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)]
+            assert opt_ids == ["research", "rf_intel", "splunk_keyword"]
+
+            # Selecting "splunk_keyword" pivots to Splunk Search with index=* "services.exe"
             app.screen.dismiss("splunk_keyword")
             await pilot.pause()
             await pilot.pause()
@@ -425,7 +439,7 @@ def test_any_field_right_click_pivot_and_keyword_spl(tmp_path: Path) -> None:
 
 
 def test_global_highlight_selection_pivots_to_research_and_splunk(tmp_path: Path) -> None:
-    from textual.widgets import Input, TextArea
+    from textual.widgets import Input, OptionList, TextArea
 
     from soclens.tui.modals import ContextMenuModal
     from soclens.tui.screens.research import ResearchPane
@@ -459,10 +473,13 @@ def test_global_highlight_selection_pivots_to_research_and_splunk(tmp_path: Path
             res_pane = app.query_one(ResearchPane)
             assert res_pane.query_one("#res-target-input", Input).value == "svchost.exe"
 
-            # F6 -> Floating transparent Pivot menu for highlighted text
+            # F6 -> Floating transparent RF/Splunk-only menu for highlighted text
             await pilot.press("f6")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
+            opts = app.screen.query_one("#ctx-menu-options", OptionList)
+            opt_ids = [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)]
+            assert opt_ids == ["research", "rf_intel", "splunk_keyword"]
             app.screen.dismiss(None)
             await pilot.pause()
 
@@ -626,5 +643,298 @@ def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
             await asyncio.sleep(0.12)
             await pilot.pause()
             assert banner.display is False
+
+    asyncio.run(_run())
+
+
+def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Path) -> None:
+    from textual.widgets import Input, OptionList, TextArea
+
+    from soclens.tui.modals import ContextMenuModal
+    from soclens.tui.rf_formatters import render_playbook_alert_detail
+    from soclens.tui.s1_formatters import render_s1_record_detail
+    from soclens.tui.screens.base import SelectableRichLog
+
+    async def _find_line_and_col(
+        log: SelectableRichLog, needle: str
+    ) -> tuple[int, int]:
+        for idx, strip in enumerate(log.lines):
+            col = strip.text.find(needle)
+            if col != -1:
+                return idx, col
+        raise AssertionError(f"Could not find {needle!r} in SelectableRichLog")
+
+    # 1. SentinelOne bottom detail panel: real drag highlight + known field right-click vs free text
+    s1_app = create_app(
+        client=MagicMock(),
+        s1_client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run_s1() -> None:
+        async with s1_app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            s1_log = s1_app.query_one("#s1-detail-log", SelectableRichLog)
+            s1_log.clear()
+            rec = {
+                "id": "th-901",
+                "threatInfo": {
+                    "threatName": "evil_dropper.exe",
+                    "classification": "Suspicious binary execution from user temp directory",
+                    "originatorProcess": "powershell.exe",
+                    "commandLine": "powershell.exe -enc SQBFAFgA",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                },
+                "agentRealtimeInfo": {"agentComputerName": "WKSTN-042"},
+            }
+            s1_log.write(render_s1_record_detail("threats", rec))
+            await pilot.pause()
+
+            # A. Free-text field (Classification) without highlight -> right-click opens NO menu
+            cls_line, cls_col = await _find_line_and_col(s1_log, "Suspicious binary")
+            s1_log.scroll_to(y=max(0, cls_line - 1), animate=False)
+            await pilot.pause()
+            sy = s1_log.content_region.y + (cls_line - int(round(s1_log.scroll_y)))
+            sx = s1_log.content_region.x + cls_col + 2
+            await pilot.click(offset=(sx, sy), button=3)
+            await pilot.pause()
+            assert not isinstance(s1_app.screen, ContextMenuModal)
+
+            # B. Real mouse-drag highlight inside free-text Classification -> right-click searches exact substring!
+            drag_start_x = s1_log.content_region.x + cls_col
+            drag_end_x = drag_start_x + len("Suspicious binary") - 1
+            await pilot.mouse_down(offset=(drag_start_x, sy))
+            await pilot.hover(offset=(drag_end_x, sy))
+            await pilot.mouse_up(offset=(drag_end_x, sy))
+            await pilot.pause()
+            assert s1_app.get_selected_text() == "Suspicious binary"
+
+            await pilot.click(offset=(drag_start_x + 3, sy), button=3)
+            await pilot.pause()
+            assert isinstance(s1_app.screen, ContextMenuModal)
+            opts = s1_app.screen.query_one("#ctx-menu-options", OptionList)
+            assert [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)] == [
+                "research",
+                "rf_intel",
+                "splunk_keyword",
+            ]
+            s1_app.screen.dismiss(None)
+            await pilot.pause()
+            s1_app.screen.clear_selection()
+            await pilot.pause()
+
+            # C. Known field (Process -> powershell.exe) without highlighting -> right-click opens RF/Splunk menu directly!
+            proc_line, proc_col = await _find_line_and_col(s1_log, "powershell.exe")
+            s1_log.scroll_to(y=max(0, proc_line - 1), animate=False)
+            await pilot.pause()
+            psy = s1_log.content_region.y + (proc_line - int(round(s1_log.scroll_y)))
+            psx = s1_log.content_region.x + proc_col + 2
+            await pilot.click(offset=(psx, psy), button=3)
+            await pilot.pause()
+            assert isinstance(s1_app.screen, ContextMenuModal)
+            opts = s1_app.screen.query_one("#ctx-menu-options", OptionList)
+            assert [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)] == [
+                "research",
+                "rf_intel",
+                "splunk_keyword",
+            ]
+            assert "powershell.exe" in str(opts.get_option_at_index(0).prompt)
+            s1_app.screen.dismiss("splunk_keyword")
+            await pilot.pause()
+            await pilot.pause()
+            assert (
+                s1_app.query_one("#splunk-search-spl", TextArea).text
+                == 'index=* "powershell.exe"'
+            )
+
+    asyncio.run(_run_s1())
+
+    # 2. RF Playbook Alert bottom detail panel: real drag highlight + known field right-click
+    rf_app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-rf-intel",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run_rf() -> None:
+        async with rf_app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            rf_log = rf_app.query_one("#rf-log", SelectableRichLog)
+            rf_log.clear()
+            norm = {
+                "id": "pb-hl-1",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "spoof-bank.example",
+                "rule_name": "Brand Lookalike",
+                "assignee": "analyst",
+                "created": "2026-11-24T10:00:00Z",
+                "updated": "2026-11-24T12:00:00Z",
+                "targets": ["mybank.example", "portal.mybank.example"],
+                "logo_hashes": ["hash:" + ("f" * 64)],
+                "raw": {
+                    "panel_evidence_summary": {
+                        "explanation": "Typosquatted portal observed hosting credential form",
+                    },
+                    "panel_evidence_dns": {
+                        "ip_list": [{"ip": "203.0.113.77", "risk_score": 85, "criticality": "High"}],
+                    },
+                },
+            }
+            rf_log.write(render_playbook_alert_detail(norm))
+            await pilot.pause()
+
+            # A. Free-text Explanation without highlight -> right-click opens NO menu
+            exp_line, exp_col = await _find_line_and_col(rf_log, "credential form")
+            rf_log.scroll_to(y=max(0, exp_line - 1), animate=False)
+            await pilot.pause()
+            esy = rf_log.content_region.y + (exp_line - int(round(rf_log.scroll_y)))
+            esx = rf_log.content_region.x + exp_col
+            await pilot.click(offset=(esx + 2, esy), button=3)
+            await pilot.pause()
+            assert not isinstance(rf_app.screen, ContextMenuModal)
+
+            # B. Drag highlight "observed" in free-text Explanation -> right-click opens RF/Splunk-only menu
+            obs_line, obs_col = await _find_line_and_col(rf_log, "observed")
+            rf_log.scroll_to(y=max(0, obs_line - 1), animate=False)
+            await pilot.pause()
+            osy = rf_log.content_region.y + (obs_line - int(round(rf_log.scroll_y)))
+            osx = rf_log.content_region.x + obs_col
+            await pilot.mouse_down(offset=(osx, osy))
+            await pilot.hover(offset=(osx + len("observed") - 1, osy))
+            await pilot.mouse_up(offset=(osx + len("observed") - 1, osy))
+            await pilot.pause()
+            assert rf_app.get_selected_text() == "observed"
+            await pilot.click(offset=(osx + 2, osy), button=3)
+            await pilot.pause()
+            assert isinstance(rf_app.screen, ContextMenuModal)
+            opts = rf_app.screen.query_one("#ctx-menu-options", OptionList)
+            assert [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)] == [
+                "research",
+                "rf_intel",
+                "splunk_keyword",
+            ]
+            rf_app.screen.dismiss(None)
+            await pilot.pause()
+            rf_app.screen.clear_selection()
+            await pilot.pause()
+
+            # C. Known field DNS IP (203.0.113.77) without highlighting -> right-click searches RF/Splunk!
+            ip_line, ip_col = await _find_line_and_col(rf_log, "203.0.113.77")
+            rf_log.scroll_to(y=max(0, ip_line - 1), animate=False)
+            await pilot.pause()
+            isy = rf_log.content_region.y + (ip_line - int(round(rf_log.scroll_y)))
+            isx = rf_log.content_region.x + ip_col + 2
+            await pilot.click(offset=(isx, isy), button=3)
+            await pilot.pause()
+            assert isinstance(rf_app.screen, ContextMenuModal)
+            rf_app.screen.dismiss("research")
+            await pilot.pause()
+            await pilot.pause()
+            assert rf_app.query_one("#res-target-input", Input).value == "203.0.113.77"
+
+    asyncio.run(_run_rf())
+
+
+def test_datatable_highlight_and_known_cell_right_click(tmp_path: Path) -> None:
+    from textual.widgets import OptionList
+
+    from soclens.tui.modals import ContextMenuModal
+    from soclens.tui.screens.base import DoubleClickDataTable
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#s1-table", DoubleClickDataTable)
+            table.clear(columns=True)
+            table.add_columns("Host", "Status", "SHA-1")
+            sha1 = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"
+            table.add_row("FIN-WKSTN-07", "Resolved", sha1)
+            await pilot.pause()
+
+            row_y = table.content_region.y + 1
+            line_txt = table.render_line(1).text
+            host_col = line_txt.index("FIN-WKSTN-07")
+            status_col = line_txt.index("Resolved")
+
+            # 1. Right-click Status cell without highlight -> non-searchable field, NO menu
+            await pilot.click(offset=(table.content_region.x + status_col + 2, row_y), button=3)
+            await pilot.pause()
+            assert not isinstance(app.screen, ContextMenuModal)
+
+            # 2. Right-click Host cell without highlight -> known field, RF/Splunk-only menu
+            await pilot.click(offset=(table.content_region.x + host_col + 2, row_y), button=3)
+            await pilot.pause()
+            assert isinstance(app.screen, ContextMenuModal)
+            opts = app.screen.query_one("#ctx-menu-options", OptionList)
+            assert [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)] == [
+                "research",
+                "rf_intel",
+                "splunk_keyword",
+            ]
+            assert "FIN-WKSTN-07" in str(opts.get_option_at_index(0).prompt)
+            app.screen.dismiss(None)
+            await pilot.pause()
+
+            # 3. Mouse-drag highlight substring inside table cell -> extracts exact text
+            sha_col = line_txt.index(sha1)
+            sx1 = table.content_region.x + sha_col
+            sx2 = sx1 + 11
+            await pilot.mouse_down(offset=(sx1, row_y))
+            await pilot.hover(offset=(sx2, row_y))
+            await pilot.mouse_up(offset=(sx2, row_y))
+            await pilot.pause()
+            assert app.get_selected_text() == sha1[:12]
+
+    asyncio.run(_run())
+
+
+def test_legacy_right_click_menus_removed_across_panes(tmp_path: Path) -> None:
+    from soclens.tui.modals import ContextMenuModal
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-dashboard",
+        view_mode="admin",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            for tab_id, target_sel in (
+                ("tab-dashboard", "#dash-env-summary"),
+                ("tab-logs", "#app-log"),
+                ("tab-llm", "#llm-transcript"),
+                ("tab-settings", "#settings-status"),
+                ("tab-sigma", "#sigma-log"),
+                ("tab-splunk-bundle", "#splunk-results-table"),
+                ("tab-splunk-es", "#es-detail"),
+                ("tab-splunk-search", "#splunk-search-detail"),
+                ("tab-watchlists", "#wl-status"),
+                ("tab-brand-logos", "#brand-status"),
+            ):
+                app.activate_tab(tab_id)
+                await pilot.pause()
+                await pilot.pause()
+                await pilot.click(target_sel, offset=(2, 0), button=3)
+                await pilot.pause()
+                assert not isinstance(app.screen, ContextMenuModal), (
+                    f"Unexpected right-click menu opened on {tab_id} ({target_sel})"
+                )
 
     asyncio.run(_run())

@@ -15,6 +15,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, RichLog, Select, Static
 
 from soclens.config import classify_site_tier
+from soclens.tui.screens.base import SelectableRichLog
 
 
 def _site_option_label(site: Mapping[str, Any]) -> str:
@@ -311,7 +312,7 @@ class CloneExclusionsModal(ModalScreen[dict[str, Any] | None]):
                     id="s1-clone-summary",
                     markup=False,
                 )
-                yield RichLog(
+                yield SelectableRichLog(
                     id="s1-clone-preview-log",
                     highlight=False,
                     markup=False,
@@ -858,7 +859,7 @@ class S1SitePolicyModal(ModalScreen[dict[str, Any] | None]):
                     markup=False,
                 )
             with VerticalScroll(id="s1-policy-scroll"):
-                yield RichLog(id="s1-policy-log", highlight=False, markup=False, wrap=True)
+                yield SelectableRichLog(id="s1-policy-log", highlight=False, markup=False, wrap=True)
                 yield Select(
                     src_options,
                     allow_blank=False,

@@ -12,7 +12,6 @@ from textual import events, on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
-from textual.message import Message
 from textual.widgets import (
     Button,
     Collapsible,
@@ -45,7 +44,6 @@ from soclens.logos.extractor import load_domains_file
 from soclens.tui.screens.base import (
     BaseSocPane,
     DoubleClickDataTable,
-    extract_table_row_text,
 )
 
 BRAND_HASH_FETCH_TYPES: tuple[str, ...] = ("hash", "brand", "domain")
@@ -169,47 +167,11 @@ def format_watchlist_option_label(item: Mapping[str, Any]) -> str:
 
 
 class _RightClickSelectionList(SelectionList[str]):
-    """SelectionList that emits ``DomainRightClicked`` without toggling on right-click."""
-
-    class DomainRightClicked(Message):
-        """Posted when a user right-clicks inside the domain checklist."""
-
-        def __init__(
-            self,
-            selection_list: _RightClickSelectionList,
-            domain: str,
-            screen_x: int,
-            screen_y: int,
-        ) -> None:
-            self.selection_list: _RightClickSelectionList = selection_list
-            self.domain: str = domain
-            self.screen_x: int = screen_x
-            self.screen_y: int = screen_y
-            super().__init__()
-
-        @property
-        def control(self) -> _RightClickSelectionList:
-            return self.selection_list
+    """SelectionList that ignores right-click toggles."""
 
     async def _on_click(self, event: events.Click) -> None:
         if event.button == 3:
             event.prevent_default()
-            event.stop()
-            self.focus()
-            clicked_option: int | None = event.style.meta.get("option")
-            domain = ""
-            if clicked_option is not None and 0 <= clicked_option < self.option_count:
-                self.highlighted = clicked_option
-                opt = self.get_option_at_index(clicked_option)
-                domain = str(getattr(opt, "value", "") or "").strip().lower()
-            self.post_message(
-                _RightClickSelectionList.DomainRightClicked(
-                    self,
-                    domain,
-                    event.screen_x,
-                    event.screen_y,
-                )
-            )
             return
         await super()._on_click(event)
 
@@ -1781,35 +1743,6 @@ class BrandLogosPane(BaseSocPane):
             and " " not in clean
         )
 
-    def _resolve_table_row_domain(
-        self, event: DoubleClickDataTable.RowRightClicked
-    ) -> str:
-        if self._active_view == "hashes" or event.row_key is None:
-            return ""
-        if (
-            event.row_index is not None
-            and 0 <= event.row_index < len(self._visible_result_rows)
-        ):
-            row_dict = self._visible_result_rows[event.row_index]
-            cand = str(row_dict.get("domain") or "").strip().lower()
-            if self._is_valid_single_domain(cand):
-                return cand
-            issue_doms = row_dict.get("issue_domains")
-            if isinstance(issue_doms, (list, tuple)) and len(issue_doms) == 1:
-                only = str(issue_doms[0]).strip().lower()
-                if self._is_valid_single_domain(only):
-                    return only
-            return ""
-        table = self.query_one("#brand-table", DoubleClickDataTable)
-        try:
-            row = table.get_row(event.row_key)
-        except Exception:
-            return ""
-        if not row:
-            return ""
-        cand = str(row[0]).strip().lower()
-        return cand if self._is_valid_single_domain(cand) else ""
-
     def _sync_single_domain_action(self, domain: str, *, force_dry_run: bool) -> None:
         list_id = self._resolve_target_list_id()
         if not list_id:
@@ -1833,167 +1766,6 @@ class BrandLogosPane(BaseSocPane):
         else:
             self.query_one("#brand-domains", Input).value = clean
         self.set_status(f"Selected only '{clean}' for Brand Sync.")
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        self._open_brand_menu(origin=(event.screen_x, event.screen_y))
-
-    @on(DoubleClickDataTable.RowRightClicked, "#brand-table")
-    def handle_brand_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        clicked_domain = self._resolve_table_row_domain(event)
-        self._open_brand_menu(
-            origin=(event.screen_x, event.screen_y),
-            domain=clicked_domain,
-            row_index=event.row_index,
-        )
-
-    @on(_RightClickSelectionList.DomainRightClicked, "#brand-domain-selection")
-    def handle_domain_selection_right_click(
-        self, event: _RightClickSelectionList.DomainRightClicked
-    ) -> None:
-        event.stop()
-        clicked_domain = (
-            event.domain if self._is_valid_single_domain(event.domain) else ""
-        )
-        self._open_brand_menu(
-            origin=(event.screen_x, event.screen_y),
-            domain=clicked_domain,
-        )
-
-    def _extract_brand_hash_or_domain(self, row_index: int | None = None) -> tuple[str, str]:
-        """Return ``(primary_value, full_row_text)`` from ``#brand-table``."""
-        table = self.query_one("#brand-table", DataTable)
-        full_row = extract_table_row_text(table, row_index=row_index)
-        if table.row_count <= 0:
-            return "", full_row
-        idx = table.cursor_row if row_index is None else row_index
-        if idx is None or idx < 0 or idx >= table.row_count:
-            return "", full_row
-        try:
-            cells = table.get_row(table.ordered_rows[idx].key)
-            domain_val = str(cells[0]).strip() if len(cells) > 0 else ""
-            detail_val = str(cells[-1]).strip() if len(cells) >= 3 else ""
-            # Prefer a 64-hex SHA-256 hash when present in the detail column, otherwise domain/key
-            if len(detail_val) == 64 and all(c in "0123456789abcdefABCDEF" for c in detail_val):
-                return detail_val, full_row
-            return domain_val or detail_val, full_row
-        except Exception:
-            return "", full_row
-
-    def _open_brand_menu(
-        self,
-        *,
-        origin: tuple[int, int],
-        domain: str = "",
-        row_index: int | None = None,
-    ) -> None:
-        clean_domain = domain.strip().lower()
-        items: list[tuple[str, str]] = []
-        if clean_domain:
-            items.extend(
-                [
-                    ("sync_single_domain", f"Sync '{clean_domain}' Only"),
-                    ("validate_single_domain", f"Validate '{clean_domain}' Only (Dry-Run)"),
-                    ("select_single_domain", f"Select Only '{clean_domain}' in Checklist"),
-                ]
-            )
-        items.extend(
-            [
-                ("copy_hash_domain", "Copy Hash / Domain"),
-                ("copy_row", "Copy Selected Row"),
-                ("open_copy_view", "Open Copyable View"),
-            ]
-        )
-        items.extend(
-            [
-                ("issue_missing_hashes", "Issue Dashboard: Missing Hashes (0)"),
-                ("issue_silent_zero_hashes", "Issue Dashboard: Zero Hashes (No Error)"),
-                ("issue_domain_errors", "Issue Dashboard: Domain / HTTP / Bot Errors"),
-                ("issue_image_errors", "Issue Dashboard: Image Fetch Errors"),
-                ("issue_failing_grace", "Issue Dashboard: Repeated Failures (Grace)"),
-                ("issue_duplicate_hashes", "Issue Dashboard: Shared / Duplicate Hashes"),
-                ("issue_all", "Issue Dashboard: All Issues"),
-                ("select_issue_domains", "Select Affected Issue Domains"),
-                ("cycle_sort", "Cycle Results Table Sort"),
-                ("toggle_sort_dir", "Toggle Results Sort Direction"),
-                ("reset_sort", "Reset Results Sort"),
-                ("cycle_domain_sort", "Cycle Watchlist Domain Sort"),
-                ("reload_lists", "Reload Brand Hash Lists"),
-                ("load_domains", "Reload Watchlist Domains"),
-                ("select_all_domains", "Select All Watchlist Domains"),
-                ("deselect_all_domains", "Deselect All Watchlist Domains"),
-                ("view_hashes", "View Selected List Hashes"),
-                ("validate", "Validate Logos (Dry-Run)"),
-                ("sync", "Sync Brand Logos"),
-                ("load_state", "Load Local Sync State"),
-                ("view_logs", "Open Brand Sync Logs"),
-                ("toggle_adv", "Toggle Advanced & Watch Options"),
-            ]
-        )
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "copy_hash_domain":
-                val, _row = self._extract_brand_hash_or_domain(row_index=row_index)
-                self.copy_to_clipboard(val, label="Hash / Domain")
-            elif action_id == "copy_row":
-                _val, row_text = self._extract_brand_hash_or_domain(row_index=row_index)
-                self.copy_to_clipboard(row_text, label="Brand Logo Row")
-            elif action_id == "open_copy_view":
-                _val, row_text = self._extract_brand_hash_or_domain(row_index=row_index)
-                self.open_copy_modal(row_text, title="Brand Logo Entry")
-            elif action_id == "sync_single_domain" and clean_domain:
-                self._sync_single_domain_action(
-                    clean_domain, force_dry_run=self.effective_dry_run
-                )
-            elif action_id == "validate_single_domain" and clean_domain:
-                self._sync_single_domain_action(clean_domain, force_dry_run=True)
-            elif action_id == "select_single_domain" and clean_domain:
-                self._select_single_domain_action(clean_domain)
-            elif action_id.startswith("issue_"):
-                cat = action_id.removeprefix("issue_")
-                self._set_active_view(f"issue:{cat}", announce=True)
-            elif action_id == "select_issue_domains":
-                self.handle_select_issue_domains()
-            elif action_id == "cycle_sort":
-                self.action_cycle_table_sort()
-            elif action_id == "toggle_sort_dir":
-                self.handle_sort_dir_pressed()
-            elif action_id == "reset_sort":
-                self._set_table_sort("none")
-            elif action_id == "cycle_domain_sort":
-                self.handle_cycle_domain_sort()
-            elif action_id == "reload_lists":
-                self.handle_reload_brand_lists()
-            elif action_id == "load_domains":
-                self.handle_load_watchlist_domains()
-            elif action_id == "select_all_domains":
-                self.handle_select_all_domains()
-            elif action_id == "deselect_all_domains":
-                self.handle_deselect_all_domains()
-            elif action_id == "view_hashes":
-                self.handle_view_list_hashes()
-            elif action_id == "validate":
-                self.handle_validate_logos()
-            elif action_id == "sync":
-                self.handle_sync_logos()
-            elif action_id == "load_state":
-                self.handle_load_state()
-            elif action_id == "view_logs":
-                self.handle_view_logs()
-            elif action_id == "toggle_adv":
-                col = self.query_one("#brand-advanced-collapsible", Collapsible)
-                col.collapsed = not col.collapsed
-
-        menu_title = f"Brand Sync: {clean_domain}" if clean_domain else "Brand Logos"
-        self.open_context_menu(
-            items,
-            title=menu_title,
-            origin=origin,
-            on_select=_on_select,
-        )
 
     @on(Button.Pressed, "#brand-watch-start-btn")
     def handle_start_watch(self) -> None:

@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
@@ -3328,40 +3328,3 @@ class SettingsPane(BaseSocPane):
         except Exception as exc:
             self.report_error("Test OSINT Sources", exc)
 
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        items = [
-            ("save", "Save Settings"),
-            ("reload", "Reload from Disk"),
-            ("import_env", "Import from Environment"),
-            ("test_all", "Test Configured Connections"),
-            ("open_dashboard", "Open Dashboard Tab"),
-            ("open_logs", "Open Logs Tab"),
-        ]
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "save":
-                self.handle_save_settings()
-            elif action_id == "reload":
-                self.handle_reload_settings()
-            elif action_id == "import_env":
-                self.handle_import_from_env()
-            elif action_id == "test_all":
-                self.handle_test_all()
-            elif action_id == "open_dashboard":
-                open_fn = getattr(self.app, "action_switch_tab", None)
-                if callable(open_fn):
-                    open_fn("tab-dashboard")
-            elif action_id == "open_logs":
-                open_logs = getattr(self.app, "open_logs_tab", None)
-                if callable(open_logs):
-                    open_logs()
-
-        self.open_context_menu(
-            items,
-            title="Settings",
-            origin=(event.screen_x, event.screen_y),
-            on_select=_on_select,
-        )

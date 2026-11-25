@@ -7,7 +7,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, DataTable, Input, Select, Static, TabbedContent
@@ -381,76 +381,6 @@ class DashboardPane(BaseSocPane):
     @on(Button.Pressed, "#dash-refresh-btn")
     def handle_refresh(self) -> None:
         self._refresh_diagnostics_worker()
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        self._open_dashboard_menu(row_summary=None, origin=(event.screen_x, event.screen_y))
-
-    @on(DoubleClickDataTable.RowRightClicked, "#dash-errors-table")
-    @on(DoubleClickDataTable.RowRightClicked, "#dash-apis-table")
-    def handle_table_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        row_summary: str | None = None
-        if event.row_key is not None:
-            try:
-                row = event.data_table.get_row(event.row_key)
-                if row:
-                    row_summary = " | ".join(str(cell) for cell in row)
-            except Exception:
-                row_summary = None
-        self._open_dashboard_menu(
-            row_summary=row_summary, origin=(event.screen_x, event.screen_y)
-        )
-
-    def _open_dashboard_menu(
-        self, *, row_summary: str | None, origin: tuple[int, int]
-    ) -> None:
-        items: list[tuple[str, str]] = []
-        if row_summary:
-            items.append(("log_row", "Log Selected Row Details"))
-        items.extend(
-            [
-                ("refresh_diag", "Refresh Diagnostics"),
-                ("check_splunk", "Check Splunk Connection"),
-                ("toggle_ssl", "Toggle Insecure SSL (Proxy Mode)"),
-                ("toggle_image_viewer", "Toggle Default Image Viewer (OS / TUI)"),
-                ("open_watchlists", "Open Watchlists Tab"),
-                ("open_research", "Open Research Tab"),
-                ("open_logs", "Open Logs Tab"),
-                ("open_settings", "Open Settings"),
-            ]
-        )
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "log_row" and row_summary:
-                self.append_log(row_summary)
-            elif action_id == "refresh_diag":
-                self.handle_refresh()
-            elif action_id == "check_splunk":
-                self.handle_check_splunk()
-            elif action_id == "toggle_ssl":
-                self.handle_toggle_insecure_ssl()
-            elif action_id == "toggle_image_viewer":
-                self.handle_toggle_image_viewer()
-            elif action_id == "open_watchlists":
-                self.app.query_one("#main-tabs", TabbedContent).active = "tab-watchlists"
-            elif action_id == "open_research":
-                self.app.query_one("#main-tabs", TabbedContent).active = "tab-research"
-            elif action_id == "open_logs":
-                open_fn = getattr(self.app, "open_logs_tab", None)
-                if callable(open_fn):
-                    open_fn()
-            elif action_id == "open_settings":
-                self.handle_open_settings()
-
-        self.open_context_menu(
-            items,
-            title="Dashboard",
-            origin=origin,
-            on_select=_on_select,
-        )
 
     @work(thread=True, exit_on_error=False)
     def _refresh_diagnostics_worker(self) -> None:

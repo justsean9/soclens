@@ -184,11 +184,11 @@ def test_tui_user_vs_admin_context_menus_hide_watchlist_pivots(tmp_path: Path) -
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
 
-            # Research tab (default User view): no Send Entity to Watchlists option
+            # Research tab (default User view): [m] menu has no Send Entity to Watchlists option
             res_pane = app.query_one(ResearchPane)
             res_table = res_pane.query_one("#res-table")
             res_table.focus()
-            await pilot.click("#res-table", offset=(4, 2), button=3)
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             res_opts = app.screen.query_one("#ctx-menu-options", OptionList)
@@ -201,7 +201,7 @@ def test_tui_user_vs_admin_context_menus_hide_watchlist_pivots(tmp_path: Path) -
             await pilot.press("escape")
             await pilot.pause()
 
-            # RF Intel tab (User view): no Send to Watchlists option
+            # RF Intel tab (User view): [m] menu has no Send to Watchlists option
             await pilot.press("4")
             await pilot.pause()
             await pilot.click("#rf-alerts-btn")
@@ -209,7 +209,7 @@ def test_tui_user_vs_admin_context_menus_hide_watchlist_pivots(tmp_path: Path) -
             await pilot.pause()
             rf_pane = app.query_one(RFIntelPane)
             rf_pane.query_one("#rf-results-table").focus()
-            await pilot.click("#rf-results-table", offset=(4, 2), button=3)
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             rf_opts = app.screen.query_one("#ctx-menu-options", OptionList)
@@ -225,7 +225,7 @@ def test_tui_user_vs_admin_context_menus_hide_watchlist_pivots(tmp_path: Path) -
             # Enable Admin view -> Send to Watchlists reappears
             await pilot.press("f2")
             await pilot.pause()
-            await pilot.click("#rf-results-table", offset=(4, 2), button=3)
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             rf_admin_opts = app.screen.query_one("#ctx-menu-options", OptionList)

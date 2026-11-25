@@ -445,8 +445,10 @@ def test_tui_watchlists_context_menu_pivots_to_brand_logos(tmp_path: Path) -> No
             await app.workers.wait_for_complete()
             await pilot.pause()
 
-            # Right-click row 0 (hash list) -> Use in Brand Logos Tab
-            await pilot.click("#wl-lists-table", offset=(4, 2), button=3)
+            # Row 0 (hash list) -> [m] context menu Use in Brand Logos Tab
+            wl_pane = app.query_one("WatchlistsPane")
+            app.query_one("#wl-lists-table", DataTable).move_cursor(row=0, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "send_brand_logos")
@@ -459,10 +461,11 @@ def test_tui_watchlists_context_menu_pivots_to_brand_logos(tmp_path: Path) -> No
             assert app.query_one("#brand-list-id", Input).value == "report:brand-hash-1"
             assert app.query_one("#brand-list-select", Select).value == "report:brand-hash-1"
 
-            # Return to Watchlists tab, right-click row 1 (domain list) -> Use as Domain Source
+            # Return to Watchlists tab, row 1 (domain list) -> Use as Domain Source
             tabs.active = "tab-watchlists"
             await pilot.pause()
-            await pilot.click("#wl-lists-table", offset=(4, 3), button=3)
+            app.query_one("#wl-lists-table", DataTable).move_cursor(row=1, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "send_brand_source")
@@ -862,7 +865,7 @@ def test_tui_brand_logos_right_click_table_and_checklist_single_domain_sync(
                 await pilot.pause()
                 assert brand_table.row_count == 2
 
-                # 1. Right-click row 0 in #brand-table -> Validate single domain only
+                # 1. Right-click domain cell in #brand-table -> opens RF/Splunk-only search menu
                 await pilot.click("#brand-table", offset=(4, 2), button=3)
                 await pilot.pause()
                 assert isinstance(app.screen, ContextMenuModal)
@@ -871,40 +874,18 @@ def test_tui_brand_logos_right_click_table_and_checklist_single_domain_sync(
                     str(opts.get_option_at_index(i).id)
                     for i in range(opts.option_count)
                 ]
-                assert opt_ids[:3] == [
-                    "sync_single_domain",
-                    "validate_single_domain",
-                    "select_single_domain",
-                ]
+                assert opt_ids == ["research", "rf_intel", "splunk_keyword"]
                 assert "conn-err.test" in str(opts.get_option_at_index(0).prompt)
-                _select_context_option_by_id(app, "validate_single_domain")
-                await pilot.press("enter")
+                await pilot.press("escape")
+                await pilot.pause()
+
+                # 2. Single-domain sync helper preserves multi-domain checklist selections
+                brand_pane = app.query_one("BrandLogosPane")
+                brand_pane._sync_single_domain_action("silent-zero.test", force_dry_run=False)
                 await app.workers.wait_for_complete()
                 await pilot.pause()
 
                 assert mock_delta.call_count == 1
-                assert mock_delta.call_args.args[2] == ["conn-err.test"]
-                assert mock_exec.call_count == 0
-                assert set(dom_list.selected) == {
-                    "conn-err.test",
-                    "silent-zero.test",
-                    "two-hashes.test",
-                }
-
-                # 2. Switch back to Missing Hashes and right-click row 1 -> Sync single domain only
-                await pilot.click("#brand-issues-btn")
-                await pilot.pause()
-                await pilot.click("#brand-table", offset=(4, 3), button=3)
-                await pilot.pause()
-                assert isinstance(app.screen, ContextMenuModal)
-                opts = app.screen.query_one("#ctx-menu-options", OptionList)
-                assert "silent-zero.test" in str(opts.get_option_at_index(0).prompt)
-                _select_context_option_by_id(app, "sync_single_domain")
-                await pilot.press("enter")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
-
-                assert mock_delta.call_count == 2
                 assert mock_delta.call_args.args[2] == ["silent-zero.test"]
                 assert mock_exec.call_count == 1
                 assert mock_exec.call_args.args[2] == ["silent-zero.test"]
@@ -914,30 +895,20 @@ def test_tui_brand_logos_right_click_table_and_checklist_single_domain_sync(
                     "two-hashes.test",
                 }
 
-                # 3. Right-click inside #brand-domain-selection (row 0 at y=1 inside border)
+                # 3. Right-click inside #brand-domain-selection does NOT toggle or open legacy menu
                 await pilot.click("#brand-domain-selection", offset=(6, 1), button=3)
                 await pilot.pause()
-                assert isinstance(app.screen, ContextMenuModal)
-                checklist_opts = app.screen.query_one("#ctx-menu-options", OptionList)
-                assert "conn-err.test" in str(checklist_opts.get_option_at_index(0).prompt)
-                _select_context_option_by_id(app, "select_single_domain")
-                await pilot.press("enter")
-                await pilot.pause()
+                assert not isinstance(app.screen, ContextMenuModal)
+                assert set(dom_list.selected) == {
+                    "conn-err.test",
+                    "silent-zero.test",
+                    "two-hashes.test",
+                }
 
-                assert list(dom_list.selected) == ["conn-err.test"]
-
-                # 4. Right-clicking pane empty area does not include single-domain options
+                # 4. Right-clicking pane empty/status area opens NO context menu
                 await pilot.click("#brand-status", offset=(2, 0), button=3)
                 await pilot.pause()
-                assert isinstance(app.screen, ContextMenuModal)
-                empty_opts = app.screen.query_one("#ctx-menu-options", OptionList)
-                empty_ids = [
-                    str(empty_opts.get_option_at_index(i).id)
-                    for i in range(empty_opts.option_count)
-                ]
-                assert "sync_single_domain" not in empty_ids
-                await pilot.press("escape")
-                await pilot.pause()
+                assert not isinstance(app.screen, ContextMenuModal)
 
     asyncio.run(_run())
 

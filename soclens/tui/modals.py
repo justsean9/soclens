@@ -134,6 +134,8 @@ class ContextMenuModal(ModalScreen[str | None]):
         self.dismiss(event.option.id)
 
     def on_click(self, event: events.Click) -> None:
+        if event.button != 1:
+            return
         box = self.query_one("#ctx-menu-box", Vertical)
         if not box.region.contains(event.screen_x, event.screen_y):
             event.stop()
@@ -1327,70 +1329,6 @@ class ScreenshotViewerModal(ModalScreen[str | None]):
     @on(Button.Pressed, "#shot-close-btn")
     def handle_close(self) -> None:
         self.dismiss(None)
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        is_os = bool(getattr(self.app, "open_images_in_os_viewer", False))
-        items: list[tuple[str, str]] = [
-            (
-                "open_viewer",
-                "Open Blurred in OS Image Viewer" if self._blurred else "Open in OS Image Viewer",
-            ),
-        ]
-        if self._blurred:
-            items.append(("open_viewer_unblurred", "Open Unblurred in OS Image Viewer"))
-        items.extend(
-            [
-                ("toggle_blur", "Unblur Image ([b])" if self._blurred else "Blur Image ([b])"),
-                ("save_png", "Save Original PNG to Workspace"),
-                (
-                    "toggle_crop",
-                    "Crop: Switch to Full Page" if self._auto_crop else "Crop: Switch to Auto",
-                ),
-            ]
-        )
-        if self._zoom_idx > 0:
-            items.append(("reset_zoom", "Reset Zoom (1x)"))
-        items.append(
-            (
-                "toggle_os_default",
-                (
-                    "Default Image Viewer: OS Viewer [ON] -> Switch to TUI"
-                    if is_os
-                    else "Default Image Viewer: TUI Modal -> Set OS Viewer Default"
-                ),
-            )
-        )
-        items.append(("close", "Close Viewer"))
-
-        def _on_select(action_id: str | None) -> None:
-            if action_id == "open_viewer":
-                self.action_open_viewer()
-            elif action_id == "open_viewer_unblurred":
-                self.action_open_viewer(force_unblurred=True)
-            elif action_id == "toggle_blur":
-                self.action_toggle_blur()
-            elif action_id == "save_png":
-                self.handle_save()
-            elif action_id == "toggle_crop":
-                self.action_toggle_crop()
-            elif action_id == "reset_zoom":
-                self.action_reset_zoom()
-            elif action_id == "toggle_os_default":
-                self.handle_toggle_os_default()
-            elif action_id == "close":
-                self.action_cancel()
-
-        self.app.push_screen(
-            ContextMenuModal(
-                items,
-                title=self._title[:40] or "Screenshot Viewer",
-                origin=(event.screen_x, event.screen_y),
-            ),
-            _on_select,
-        )
 
     def action_cancel(self) -> None:
         """Close the screenshot viewer modal."""

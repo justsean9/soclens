@@ -730,9 +730,10 @@ def test_tui_watchlists_right_click_context_menu_load_and_interact(tmp_path: Pat
 
             lists_table = app.query_one("#wl-lists-table", DataTable)
             ent_table = app.query_one("#wl-entities-table", DataTable)
+            wl_pane = app.query_one("WatchlistsPane")
             assert lists_table.row_count == 0
 
-            await pilot.click("#wl-lists-table", offset=(4, 2), button=3)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             await pilot.click("#ctx-menu-options", offset=(2, 0))
@@ -740,7 +741,8 @@ def test_tui_watchlists_right_click_context_menu_load_and_interact(tmp_path: Pat
             await pilot.pause()
             assert lists_table.row_count == 2
 
-            await pilot.click("#wl-lists-table", offset=(4, 3), button=3)
+            lists_table.move_cursor(row=1, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "inspect_info")
@@ -751,7 +753,8 @@ def test_tui_watchlists_right_click_context_menu_load_and_interact(tmp_path: Pat
             mock_client.get_list_status.assert_called_once_with("report:wl-1")
             assert "Beta Domains" in str(app.query_one("#wl-status", Static).render())
 
-            await pilot.click("#wl-lists-table", offset=(4, 3), button=3)
+            lists_table.move_cursor(row=1, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             assert app.query_one("#wl-target-list-id", Input).value == "report:wl-1"
@@ -762,7 +765,8 @@ def test_tui_watchlists_right_click_context_menu_load_and_interact(tmp_path: Pat
             assert ent_table.row_count == 1
             assert "evil.test" in [str(c) for c in ent_table.get_row_at(0)]
 
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            ent_table.move_cursor(row=0, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "lookup_intel")
@@ -786,14 +790,14 @@ def test_tui_watchlists_right_click_context_menu_load_and_interact(tmp_path: Pat
             await pilot.pause()
             await pilot.click("#wl-back-btn")
             await pilot.pause()
-            await pilot.click("#wl-lists-table", offset=(4, 2), button=3)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             await pilot.press("escape")
             await pilot.pause()
             assert not isinstance(app.screen, ContextMenuModal)
 
-            await pilot.click("#wl-lists-table", offset=(4, 2), button=3)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             await pilot.click(offset=(1, 1))
@@ -867,7 +871,9 @@ def test_tui_delete_entity_always_requires_approval_prompt(tmp_path: Path) -> No
             await app.workers.wait_for_complete()
             await pilot.pause()
 
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            wl_pane = app.query_one("WatchlistsPane")
+            app.query_one("#wl-entities-table", DataTable).move_cursor(row=0, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "remove_entity")
@@ -881,7 +887,7 @@ def test_tui_delete_entity_always_requires_approval_prompt(tmp_path: Path) -> No
             await pilot.pause()
             assert mock_client.remove_entity.call_count == 1
 
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             _select_context_option_by_id(app, "remove_entity")
             await pilot.press("enter")
@@ -984,11 +990,12 @@ def test_tui_other_tabs_right_click_menus(tmp_path: Path) -> None:
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
 
+            # Right-clicking empty/non-field areas in Dashboard & Sigma opens no legacy menu
             await pilot.click("#dash-apis-table", offset=(4, 2), button=3)
             await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option_by_id(app, "open_watchlists")
-            await pilot.press("enter")
+            assert not isinstance(app.screen, ContextMenuModal)
+
+            await pilot.press("2")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.query_one("#main-tabs", TabbedContent).active == "tab-watchlists"
@@ -997,9 +1004,8 @@ def test_tui_other_tabs_right_click_menus(tmp_path: Path) -> None:
             await pilot.pause()
             await pilot.click("#sigma-table", offset=(4, 2), button=3)
             await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option_by_id(app, "load_cached")
-            await pilot.press("enter")
+            assert not isinstance(app.screen, ContextMenuModal)
+            await pilot.click("#sigma-load-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
             sigma_table = app.query_one("#sigma-table", DataTable)
@@ -1562,7 +1568,7 @@ def test_tui_rf_intel_triage_create_case_and_context_pivots(tmp_path: Path) -> N
             await pilot.pause()
             mock_client.update_alerts_v2.assert_not_called()
 
-            await pilot.click("#rf-results-table", offset=(4, 2), button=3)
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(dry_app.screen, ContextMenuModal)
             _select_context_option_by_id(dry_app, "create_case")
@@ -1607,7 +1613,7 @@ def test_tui_rf_intel_triage_create_case_and_context_pivots(tmp_path: Path) -> N
             table = live_app.query_one("#rf-results-table", DataTable)
             assert "Resolved" in [str(c) for c in table.get_row_at(0)]
 
-            await pilot.click("#rf-results-table", offset=(4, 2), button=3)
+            await pilot.press("m")
             await pilot.pause()
             _select_context_option_by_id(live_app, "create_case")
             await pilot.press("enter")
@@ -1618,13 +1624,14 @@ def test_tui_rf_intel_triage_create_case_and_context_pivots(tmp_path: Path) -> N
             await pilot.pause()
             mock_client.create_case.assert_called_once()
 
-            # Entity Match -> right-click pivot to Connect v2 -> right-click Send to Watchlists
+            # Entity Match -> [m] menu pivot to Connect v2 -> [m] menu Send to Watchlists
             live_app.query_one("#rf-query-input", Input).value = "pivot.test"
             await pilot.click("#rf-match-btn")
             await live_app.workers.wait_for_complete()
             await pilot.pause()
 
-            await pilot.click("#rf-results-table", offset=(4, 2), button=3)
+            live_app.query_one("#rf-results-table", DataTable).focus()
+            await pilot.press("m")
             await pilot.pause()
             assert isinstance(live_app.screen, ContextMenuModal)
             _select_context_option_by_id(live_app, "pivot_v2")
@@ -1634,7 +1641,8 @@ def test_tui_rf_intel_triage_create_case_and_context_pivots(tmp_path: Path) -> N
             mock_client.v2_lookup.assert_called_once()
             assert "pivot.test" in _rich_log_text(live_app)
 
-            await pilot.click("#rf-results-table", offset=(4, 2), button=3)
+            live_app.query_one("#rf-results-table", DataTable).focus()
+            await pilot.press("m")
             await pilot.pause()
             _select_context_option_by_id(live_app, "send_watchlist")
             await pilot.press("enter")
@@ -2524,8 +2532,9 @@ def test_tui_watchlists_sort_entities_and_lists(tmp_path: Path) -> None:
             await pilot.pause()
             assert str(app.query_one("#wl-entity-sort-select", Select).value) == "type"
 
-            # Right-click context menu sort options + reset
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            # Keyboard [m] context menu sort options + reset
+            wl_pane = app.query_one("WatchlistsPane")
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "sort_name")
@@ -2538,7 +2547,7 @@ def test_tui_watchlists_sort_entities_and_lists(tmp_path: Path) -> None:
                 "zeta.com",
             ]
 
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             _select_context_option_by_id(app, "toggle_sort_dir")
             await pilot.press("enter")
@@ -2559,7 +2568,7 @@ def test_tui_watchlists_sort_entities_and_lists(tmp_path: Path) -> None:
             ]
 
             # Reset sort via context menu restores original API order
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             _select_context_option_by_id(app, "reset_sort")
             await pilot.press("enter")
@@ -2872,12 +2881,10 @@ def test_tui_sigma_custom_indexes_table_fields_and_preview(tmp_path: Path) -> No
             assert "tenant_id env" in log_text
             assert "alert.suppress.fields = tenant_id,host,User" in log_text
 
-            # Preview second rule via right-click context menu
-            await pilot.click("#sigma-table", offset=(4, 3), button=3)
+            # Preview second rule via row selection + preview button
+            await pilot.click("#sigma-table", offset=(4, 3))
             await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option_by_id(app, "preview_splunk")
-            await pilot.press("enter")
+            await pilot.click("#sigma-preview-btn")
             await pilot.pause()
             log_text_after = _rich_log_text(app, selector="#sigma-log")
             assert "index=cloud_aws" in log_text_after
@@ -3044,8 +3051,10 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
             await pilot.click("#wl-lists-table", offset=(4, 2), times=2)
             await _wait_for_settled(app, pilot)
 
-            # 1. Right-click Company row -> modal displays name & ID, approve calls remove_entity(..., "iuiKOZ", is_id=True)
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            # 1. Context menu on Company row -> modal displays name & ID, approve calls remove_entity(..., "iuiKOZ", is_id=True)
+            wl_pane = app.query_one("WatchlistsPane")
+            app.query_one("#wl-entities-table", DataTable).move_cursor(row=0, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "remove_entity")
@@ -3084,12 +3093,13 @@ def test_tui_remove_company_entity_uses_rf_id_across_all_paths(tmp_path: Path) -
                 await _wait_for_settled(app, pilot)
                 mock_client.remove_entity.assert_called_with("report:fOqHJL", "iuiKOZ", is_id=True)
 
-            # 4. Filter by annotation "1015" and right-click filtered row -> removes "iuiKOZ" with is_id=True
+            # 4. Filter by annotation "1015" and context menu on filtered row -> removes "iuiKOZ" with is_id=True
             mock_client.remove_entity.reset_mock()
             app.query_one("#wl-entity-search-input", Input).value = "1015"
             await pilot.pause()
             assert app.query_one("#wl-entities-table", DataTable).row_count == 1
-            await pilot.click("#wl-entities-table", offset=(4, 2), button=3)
+            app.query_one("#wl-entities-table", DataTable).move_cursor(row=0, column=0)
+            wl_pane.action_open_context_menu()
             await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option_by_id(app, "remove_entity")

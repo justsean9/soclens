@@ -848,22 +848,6 @@ class ResearchPane(BaseSocPane):
                     return
             self._render_detail_panel()
 
-    @on(DoubleClickDataTable.RowRightClicked, "#res-table")
-    def handle_table_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        if event.row_index is not None and 0 <= event.row_index < len(self._visible_rows):
-            self._selected_index = event.row_index
-            self._render_detail_panel()
-        self._open_research_context_menu(origin=(event.screen_x, event.screen_y))
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        if self.handle_field_pivot_right_click(event, source_tab="tab-research"):
-            return
-        event.stop()
-        self._open_research_context_menu(origin=(event.screen_x, event.screen_y))
-
     def _get_copyable_detail(self) -> tuple[str, str, str | None]:
         """Return ``(text, title, language)`` for copying or viewing the active research detail."""
         item = self._selected_finding()

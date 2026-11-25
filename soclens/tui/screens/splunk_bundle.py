@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Button, Checkbox, DataTable, Input, Select, Static
@@ -206,20 +206,6 @@ class SplunkBundlePane(BaseSocPane):
         app_ov = self.query_one("#splunk-app", Input).value.strip() or None
         self._check_connection_worker(host_ov, app_ov)
 
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        self._open_splunk_menu(origin=(event.screen_x, event.screen_y))
-
-    @on(DoubleClickDataTable.RowRightClicked, "#splunk-results-table")
-    def handle_results_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        self._open_splunk_menu(
-            origin=(event.screen_x, event.screen_y),
-            row_index=event.row_index,
-        )
-
     def _selected_stanza_or_row_text(self, row_index: int | None = None) -> tuple[str, str]:
         """Return ``(copy_text, modal_title)`` for the selected Splunk stanza or table row."""
         table = self.query_one("#splunk-results-table", DataTable)
@@ -233,46 +219,6 @@ class SplunkBundlePane(BaseSocPane):
                 return text, f"Splunk Stanza - {stanza_name}"
         row_text = extract_table_row_text(table, row_index=row_index)
         return row_text, "Splunk Validation Row"
-
-    def _open_splunk_menu(
-        self,
-        *,
-        origin: tuple[int, int],
-        row_index: int | None = None,
-    ) -> None:
-        items = [
-            ("copy_stanza_row", "Copy Selected Stanza / Row"),
-            ("open_copy_view", "Open Copyable View"),
-            ("validate", "Validate Searches"),
-            ("check_splunk", "Check Splunk Connection"),
-            ("build_bundle", "Build Air-Gapped Bundle"),
-            ("open_logs", "Open Logs Tab"),
-        ]
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "copy_stanza_row":
-                text, _title = self._selected_stanza_or_row_text(row_index=row_index)
-                self.copy_to_clipboard(text, label="Splunk Stanza / Row")
-            elif action_id == "open_copy_view":
-                text, title = self._selected_stanza_or_row_text(row_index=row_index)
-                self.open_copy_modal(text, title=title)
-            elif action_id == "validate":
-                self.handle_validate()
-            elif action_id == "check_splunk":
-                self.handle_check_connection()
-            elif action_id == "build_bundle":
-                self.handle_build_bundle()
-            elif action_id == "open_logs":
-                open_fn = getattr(self.app, "open_logs_tab", None)
-                if callable(open_fn):
-                    open_fn(source="splunk")
-
-        self.open_context_menu(
-            items,
-            title="Splunk & Bundle",
-            origin=origin,
-            on_select=_on_select,
-        )
 
     @work(thread=True, exit_on_error=False)
     def _check_connection_worker(self, host_ov: str | None, app_ov: str | None) -> None:

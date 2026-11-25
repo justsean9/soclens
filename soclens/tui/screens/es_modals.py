@@ -18,6 +18,7 @@ from soclens.splunk_es import (
     MC_FINDING_STATUSES,
     NOTABLE_URGENCIES,
 )
+from soclens.tui.screens.base import SelectableRichLog
 
 _SECURITY_DOMAINS: tuple[tuple[str, str], ...] = (
     ("Threat", "threat"),
@@ -650,7 +651,7 @@ class ESAdaptiveResponseModal(ModalScreen[dict[str, Any] | None]):
                 )
             with VerticalScroll(id="es-ar-scroll"):
                 yield Static("Recent AR Invocations", classes="es-modal-label", markup=False)
-                yield RichLog(
+                yield SelectableRichLog(
                     id="es-ar-history-log",
                     highlight=False,
                     markup=False,

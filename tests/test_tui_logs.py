@@ -471,12 +471,11 @@ def test_tui_logs_pane_filters_clear_export_and_responsive_layout(tmp_path: Path
             assert "Brand error timeout" in exported_content
             assert "Research query note" in exported_content
 
-            # Right-click context menu -> Filter: Research
+            # Right-clicking #app-log without highlighted text opens no context menu; filter via Select
             await pilot.click("#app-log", offset=(4, 2), button=3)
             await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option_by_id(app, "filter_research")
-            await pilot.press("enter")
+            assert not isinstance(app.screen, ContextMenuModal)
+            app.query_one("#logs-source-select", Select).value = "research"
             await pilot.pause()
             assert app.query_one("#logs-source-select", Select).value == "research"
             assert "Research query note" in _rich_log_text(app)

@@ -77,11 +77,10 @@ _RESERVED_TYPE_FILTER_KEYS: frozenset[str] = frozenset(
 
 
 class _WatchlistSelectTable(DoubleClickDataTable):
-    """DataTable that opens a watchlist on single left-click while keeping right-click & header sorts."""
+    """DataTable that opens a watchlist on single left-click while keeping header sorts."""
 
     async def _on_click(self, event: events.Click) -> None:
         if event.button != 1:
-            await super()._on_click(event)
             return
 
         event.prevent_default()
@@ -833,23 +832,6 @@ class WatchlistsPane(BaseSocPane):
                 return
         self._open_empty_watchlists_menu(origin=(lists_table.region.x + 4, lists_table.region.y + 2))
 
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        items = [
-            ("reload_lists", "Load / Reload Watchlists"),
-            ("load_selected", "Load Selected Watchlist Entities"),
-            ("toggle_filter", "Toggle Search & Filter"),
-            ("focus_create", "Create New Watchlist..."),
-        ]
-        self.open_context_menu(
-            items,
-            title="Watchlists",
-            origin=(event.screen_x, event.screen_y),
-            on_select=self._handle_pane_menu_action,
-        )
-
     def _handle_pane_menu_action(self, action_id: str) -> None:
         if action_id == "reload_lists":
             self.handle_load_watchlists()
@@ -1166,30 +1148,6 @@ class WatchlistsPane(BaseSocPane):
         tabs.active = "tab-research"
         res_pane = self.app.query_one(ResearchPane)
         self.call_after_refresh(res_pane.investigate_external, ent_val, mapped)
-
-    @on(DoubleClickDataTable.RowRightClicked, "#wl-lists-table")
-    def handle_lists_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        if event.row_key is None:
-            self._open_empty_watchlists_menu(origin=(event.screen_x, event.screen_y))
-            return
-        item = self._watchlist_for_row(row_key=event.row_key, row_index=event.row_index)
-        if item is None:
-            self._open_empty_watchlists_menu(origin=(event.screen_x, event.screen_y))
-            return
-        self._open_watchlist_menu(item, origin=(event.screen_x, event.screen_y))
-
-    @on(DoubleClickDataTable.RowRightClicked, "#wl-entities-table")
-    def handle_entities_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        if event.row_key is None:
-            self._open_empty_entities_menu(origin=(event.screen_x, event.screen_y))
-            return
-        entry = self._entity_for_row(row_key=event.row_key, row_index=event.row_index)
-        if entry is None:
-            self._open_empty_entities_menu(origin=(event.screen_x, event.screen_y))
-            return
-        self._open_entity_menu(entry, origin=(event.screen_x, event.screen_y))
 
     @work(thread=True, exit_on_error=False)
     def _inspect_list_info_worker(self, list_id: str, list_name: str) -> None:
@@ -1662,7 +1620,7 @@ class WatchlistsPane(BaseSocPane):
                 ids = ", ".join(ci_id_matches.keys())
                 raise ValueError(
                     f"Multiple loaded entities match ID '{clean_val}' ({ids}); "
-                    "right-click the specific row or enter its exact case-sensitive Entity ID."
+                    "select the specific row and press [m] or enter its exact case-sensitive Entity ID."
                 )
 
             if len(typed_name_matches) == 1:
@@ -1672,7 +1630,7 @@ class WatchlistsPane(BaseSocPane):
                 ids = ", ".join(typed_name_matches.keys())
                 raise ValueError(
                     f"Multiple loaded entities match '{clean_val}' ({ids}); "
-                    "right-click the specific row or enter its exact Entity ID."
+                    "select the specific row and press [m] or enter its exact Entity ID."
                 )
             if not typed_name_matches and len(all_name_matches) == 1:
                 eid, etype, ename = next(iter(all_name_matches.values()))
@@ -1681,7 +1639,7 @@ class WatchlistsPane(BaseSocPane):
                 ids = ", ".join(all_name_matches.keys())
                 raise ValueError(
                     f"Multiple loaded entities match '{clean_val}' ({ids}); "
-                    "right-click the specific row or enter its exact Entity ID."
+                    "select the specific row and press [m] or enter its exact Entity ID."
                 )
 
         return clean_val, ent_type, False, clean_val

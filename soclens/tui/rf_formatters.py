@@ -15,7 +15,7 @@ from rich.table import Table
 from rich.text import Text
 
 from soclens.tui.image_render import render_screenshot_panel
-from soclens.tui.pivot import make_pivot_text
+from soclens.tui.pivot import join_pivot_texts, make_pivot_text
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -892,7 +892,7 @@ def render_welcome_view() -> Group:
     keys = Panel(
         Text(
             "Shortcuts: [/] Filter & Tools   [Enter / Double-Click] Fetch Deep Detail   "
-            "[t] Triage Status   [j] Toggle Raw JSON   [m / Right-Click] Context Menu",
+            "[t] Triage Status   [j] Toggle Raw JSON   [m] Menu   [Right-Click] RF / Splunk Search",
             style="dim",
         ),
         border_style="dim",
@@ -1059,7 +1059,7 @@ def render_alert_v3_detail(
             if not ent_name and refs:
                 ent_name = "Document Entities"
             enr_table.add_row(
-                Text(ent_name or "-"),
+                make_pivot_text(ent_name or "-", field="Entity"),
                 Text(ent_type),
                 Text(" | ".join(summary_parts) if summary_parts else "-"),
             )
@@ -1169,7 +1169,13 @@ def _build_whois_rows(whois_body: list[dict[str, Any]]) -> list[tuple[str, str |
                 ns_list = val.get("nameServers") or val.get("name_servers")
                 if isinstance(ns_list, list) and ns_list:
                     rows.append(
-                        ("Name Servers", ", ".join(strip_rf_prefix(ns) for ns in ns_list if ns))
+                        (
+                            "Name Servers",
+                            join_pivot_texts(
+                                [strip_rf_prefix(ns) for ns in ns_list if ns],
+                                field="Name Server",
+                            ),
+                        )
                     )
                 continue
 
@@ -1358,9 +1364,25 @@ def render_playbook_alert_detail(
     if effective.get("entity_name"):
         rows.append(("Entity", strip_rf_prefix(effective["entity_name"])))
     if effective.get("targets"):
-        rows.append(("Target(s)", ", ".join(strip_rf_prefix(t) for t in effective["targets"])))
+        rows.append(
+            (
+                "Target(s)",
+                join_pivot_texts(
+                    [strip_rf_prefix(t) for t in effective["targets"]],
+                    field="Target",
+                ),
+            )
+        )
     if effective.get("attackers"):
-        rows.append(("Attacker(s)", ", ".join(strip_rf_prefix(a) for a in effective["attackers"])))
+        rows.append(
+            (
+                "Attacker(s)",
+                join_pivot_texts(
+                    [strip_rf_prefix(a) for a in effective["attackers"]],
+                    field="Attacker",
+                ),
+            )
+        )
     ctx_tags = [_as_str(c) for c in _as_list(pstatus.get("context_list") or raw.get("context_list")) if c]
     if ctx_tags:
         rows.append(("Context Tags", ", ".join(ctx_tags)))
@@ -1425,12 +1447,19 @@ def render_playbook_alert_detail(
     if ev.get("url"):
         ev_rows.append(("Matched URL", _as_str(ev["url"])))
     if ev.get("brands"):
-        ev_rows.append(("Brands", ", ".join(_as_str(b) for b in _as_list(ev["brands"]))))
+        rows_brands = [_as_str(b) for b in _as_list(ev["brands"]) if _as_str(b)]
+        if rows_brands:
+            ev_rows.append(("Brands", join_pivot_texts(rows_brands, field="Brand")))
     if effective.get("logo_hashes"):
         ev_rows.append(
             (
                 "Logo Hashes",
-                Text("\n".join(strip_rf_prefix(h) for h in effective["logo_hashes"]), style="bold yellow"),
+                join_pivot_texts(
+                    [strip_rf_prefix(h) for h in effective["logo_hashes"]],
+                    field="Logo Hash",
+                    sep="\n",
+                    style="bold yellow",
+                ),
             )
         )
     if effective.get("logotypes"):
@@ -1504,7 +1533,7 @@ def render_playbook_alert_detail(
         for rtype, host, r_score, crit, ctx_str in dns_entries[:25]:
             dns_table.add_row(
                 Text(rtype, style="cyan"),
-                Text(host),
+                make_pivot_text(host, field="Host / IP"),
                 score_text(r_score, max_score=99),
                 priority_text(crit),
                 Text(ctx_str),
@@ -1573,12 +1602,12 @@ def render_playbook_alert_detail(
         if os_viewer_default:
             action_hint = (
                 "Press [v] or click Images to open in OS viewer | [b] Blur/Reveal | "
-                "Right-click here -> Open / TUI Modal / Save PNG"
+                "Press [m] for image menu"
             )
         else:
             action_hint = (
                 "Press [v] or click Images for viewer | [o] Open in OS viewer | "
-                "[b] Blur/Reveal | Right-click here -> Open / Save PNG"
+                "[b] Blur/Reveal | Press [m] for image menu"
             )
         if len(available_sc) > len(shown_sc):
             renderables.append(
@@ -1934,7 +1963,7 @@ def render_entity_match_detail(
     hint = Panel(
         Text(
             "Tip: Press Enter / Deep Detail to fetch full aliases via /entity-match/entity/{id}, "
-            "or right-click to pivot to Connect v2 Lookup or Watchlists.",
+            "press [m] for actions, or right-click a field / highlighted text to search RF or Splunk.",
             style="dim",
         ),
         border_style="dim",

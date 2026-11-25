@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import yaml
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -576,100 +576,6 @@ class SigmaPane(BaseSocPane):
         if isinstance(self.app.focused, Input):
             return
         self.handle_open_copy_modal()
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        rule_id = (
-            str(self._selected_rule.get("rule_id") or "")
-            if self._selected_rule is not None
-            else None
-        )
-        self._open_sigma_menu(row_rule_id=rule_id or None, origin=(event.screen_x, event.screen_y))
-
-    @on(DoubleClickDataTable.RowRightClicked, "#sigma-table")
-    def handle_sigma_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        rule_id: str | None = None
-        if event.row_key is not None:
-            table = self.query_one("#sigma-table", DoubleClickDataTable)
-            try:
-                row = table.get_row(event.row_key)
-                if row:
-                    rule_id = str(row[0])
-                    match = self._find_rule_by_id(rule_id)
-                    if match is not None:
-                        self._select_rule(match, write_to_log=False)
-            except Exception:
-                rule_id = None
-        self._open_sigma_menu(row_rule_id=rule_id, origin=(event.screen_x, event.screen_y))
-
-    def _open_sigma_menu(
-        self, *, row_rule_id: str | None, origin: tuple[int, int]
-    ) -> None:
-        items: list[tuple[str, str]] = []
-        if row_rule_id:
-            items.append(("view_rule", "View Rule YAML in Log"))
-            items.append(("preview_splunk", "Preview Splunk SPL & Stanza"))
-            items.append(("explain_llm", "Explain with Local LLM"))
-            items.append(("run_splunk", "Run in Splunk Search"))
-        items.extend(
-            [
-                ("copy_spl", "Copy SPL Query"),
-                ("copy_stanza", "Copy Full Splunk Stanza"),
-                ("copy_yaml", "Copy Raw Sigma YAML"),
-                ("copy_rule_id", "Copy Rule ID"),
-                ("open_copy_view", "Open Copyable Text View"),
-                ("load_cached", "Load Cached Rules"),
-                ("refresh_api", "Refresh Rules from RF API"),
-                ("focus_search", "Focus Rule Search"),
-                ("toggle_export", "Toggle Custom Export & Fields"),
-            ]
-        )
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "view_rule" and row_rule_id:
-                match = self._find_rule_by_id(row_rule_id)
-                if match is not None:
-                    self._select_rule(match, write_to_log=True)
-            elif action_id == "preview_splunk":
-                self._preview_rule_stanza(row_rule_id)
-            elif action_id == "explain_llm" and row_rule_id:
-                self._pivot_rule_to_llm(row_rule_id)
-            elif action_id == "run_splunk":
-                self._pivot_rule_to_splunk(rule_id=row_rule_id)
-            elif action_id == "copy_spl":
-                self.handle_copy_spl()
-            elif action_id == "copy_stanza":
-                self.handle_copy_stanza()
-            elif action_id == "copy_yaml":
-                self.handle_copy_yaml()
-            elif action_id == "copy_rule_id":
-                target_id = row_rule_id or (
-                    str(self._selected_rule.get("rule_id") or "")
-                    if self._selected_rule is not None
-                    else ""
-                )
-                self.copy_to_clipboard(target_id, label="Rule ID")
-            elif action_id == "open_copy_view":
-                self.handle_open_copy_modal()
-            elif action_id == "load_cached":
-                self.handle_load_cached()
-            elif action_id == "refresh_api":
-                self.handle_refresh_rules()
-            elif action_id == "focus_search":
-                self.query_one("#sigma-query-input", Input).focus()
-            elif action_id == "toggle_export":
-                col = self.query_one("#sigma-export-collapsible", Collapsible)
-                col.collapsed = not col.collapsed
-
-        self.open_context_menu(
-            items,
-            title=row_rule_id or "Sigma Rules",
-            origin=origin,
-            on_select=_on_select,
-        )
 
     def _pivot_rule_to_llm(self, rule_id: str) -> None:
         match = next(

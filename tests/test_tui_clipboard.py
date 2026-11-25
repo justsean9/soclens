@@ -344,14 +344,12 @@ def test_sigma_pane_copy_buttons_bindings_and_context_menu(
             await pilot.pause()
             assert not isinstance(app.screen, CopyTextModal)
 
-            # Context menu copy_rule_id
-            pane._open_sigma_menu(row_rule_id="sigma-ps-001", origin=(5, 5))
+            # Copyable View opens CopyTextModal via button
+            await pilot.click("#sigma-copy-modal-btn")
             await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option(app, "copy_rule_id")
-            await pilot.press("enter")
+            assert isinstance(app.screen, CopyTextModal)
+            await pilot.press("escape")
             await pilot.pause()
-            assert copied[-1] == "sigma-ps-001"
 
     asyncio.run(_run())
 
@@ -421,7 +419,7 @@ def test_cross_pane_copy_and_modal_actions(
             await pilot.pause()
             assert copied[-1] == "report:wl-123"
 
-            # 4. Brand Logos Pane: context menu Copy Hash / Domain
+            # 4. Brand Logos Pane: table row text extraction
             app.action_switch_tab("tab-brand-logos")
             await pilot.pause()
             brand_pane = app.query_one(BrandLogosPane)
@@ -429,15 +427,13 @@ def test_cross_pane_copy_and_modal_actions(
             brand_table.clear()
             sha256_sample = "a" * 64
             brand_table.add_row("example.com", "synced", "1", sha256_sample)
-            brand_pane._open_brand_menu(origin=(5, 5), row_index=0)
-            await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option(app, "copy_hash_domain")
-            await pilot.press("enter")
-            await pilot.pause()
-            assert copied[-1] == sha256_sample
+            from soclens.tui.screens.base import extract_table_row_text
 
-            # 5. Splunk & Bundle Pane: context menu Copy Selected Stanza / Row
+            row_txt = extract_table_row_text(brand_table, row_index=0)
+            assert "example.com" in row_txt
+            assert sha256_sample in row_txt
+
+            # 5. Splunk & Bundle Pane: selected stanza extraction
             app.action_switch_tab("tab-splunk-bundle")
             await pilot.pause()
             splunk_pane = app.query_one(SplunkBundlePane)
@@ -450,14 +446,9 @@ def test_cross_pane_copy_and_modal_actions(
             ]
             splunk_table = splunk_pane.query_one("#splunk-results-table", DataTable)
             splunk_table.add_row("RF Test Detection", "savedsearches.conf", "DRY-RUN", "-", "")
-            splunk_pane._open_splunk_menu(origin=(5, 5), row_index=0)
-            await pilot.pause()
-            assert isinstance(app.screen, ContextMenuModal)
-            _select_context_option(app, "copy_stanza_row")
-            await pilot.press("enter")
-            await pilot.pause()
-            assert "[RF Test Detection]" in copied[-1]
-            assert "index=*wineventlog EventCode=4688" in copied[-1]
+            stanza_text, _title = splunk_pane._selected_stanza_or_row_text(row_index=0)
+            assert "[RF Test Detection]" in stanza_text
+            assert "index=*wineventlog EventCode=4688" in stanza_text
 
             # 6. Logs Pane: Copy Visible Logs button
             app.action_switch_tab("tab-logs")

@@ -12,7 +12,7 @@ from rich import box
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, DataTable, Input, RichLog, Select, Static, TextArea
@@ -595,65 +595,6 @@ class SplunkSearchPane(BaseSocPane):
                 self.set_status(f"Loaded index '{idx_name}' query into SPL editor.")
         else:
             self._render_event_detail(idx)
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        if self.handle_field_pivot_right_click(event, source_tab="tab-splunk-search"):
-            return
-        event.stop()
-        self._open_search_menu(
-            row_index=self._selected_row_index(),
-            origin=(event.screen_x, event.screen_y),
-        )
-
-    @on(DoubleClickDataTable.RowRightClicked, "#splunk-search-table")
-    def handle_table_right_click(self, event: DoubleClickDataTable.RowRightClicked) -> None:
-        event.stop()
-        row_index = event.row_index if event.row_index is not None else self._selected_row_index()
-        self._open_search_menu(
-            row_index=row_index,
-            origin=(event.screen_x, event.screen_y),
-        )
-
-    def _open_search_menu(
-        self,
-        *,
-        row_index: int | None,
-        origin: tuple[int, int],
-    ) -> None:
-        items: list[tuple[str, str]] = [
-            ("inspect_event", "Inspect Event"),
-            ("enrich_rf", "Enrich Results with RF"),
-            ("export_json", "Export JSON"),
-            ("export_csv", "Export CSV"),
-            ("open_logs", "Open Logs Tab"),
-        ]
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "inspect_event":
-                if row_index is not None and 0 <= row_index < len(self._current_rows):
-                    self._render_event_detail(row_index)
-                    self.query_one("#splunk-search-detail", RichLog).focus()
-                else:
-                    self.set_status("No event selected to inspect.")
-            elif action_id == "enrich_rf":
-                self.handle_enrich_results_rf()
-            elif action_id == "export_json":
-                self.handle_export_json()
-            elif action_id == "export_csv":
-                self.handle_export_csv()
-            elif action_id == "open_logs":
-                open_fn = getattr(self.app, "open_logs_tab", None)
-                if callable(open_fn):
-                    open_fn(source="splunk")
-
-        self.open_context_menu(
-            items,
-            title="Splunk Search",
-            origin=origin,
-            on_select=_on_select,
-        )
 
     @on(Button.Pressed, "#splunk-search-run-btn")
     def handle_run_search(self) -> None:

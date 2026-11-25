@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.text import Text
-from textual import events, on
+from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -374,46 +374,3 @@ class LogsPane(BaseSocPane):
         msg = f"Exported {len(matching)} log entry/entries to {dest}"
         self.set_status(msg)
         self.notify_user(msg, title="Logs Exported")
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        items = [
-            ("copy_logs", "Copy Visible Logs"),
-            ("open_copy_view", "Open Copyable View"),
-            ("filter_all", "Filter: All Sources"),
-            ("filter_brand", "Filter: Brand Sync"),
-            ("filter_research", "Filter: Research"),
-            ("filter_errors", "Filter: Errors Only"),
-            ("toggle_scroll", "Toggle Auto-Scroll"),
-            ("export_log", "Export Visible Log"),
-            ("clear_log", "Clear All Logs"),
-        ]
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "copy_logs":
-                self.handle_copy_visible_logs()
-            elif action_id == "open_copy_view":
-                self.open_copy_modal(self._visible_logs_plain_text(), title="Visible Logs")
-            elif action_id == "filter_all":
-                self.set_source_filter("all")
-            elif action_id == "filter_brand":
-                self.set_source_filter("brand_sync")
-            elif action_id == "filter_research":
-                self.set_source_filter("research")
-            elif action_id == "filter_errors":
-                self.handle_toggle_errors_only()
-            elif action_id == "toggle_scroll":
-                self.handle_toggle_autoscroll()
-            elif action_id == "export_log":
-                self.handle_export_logs()
-            elif action_id == "clear_log":
-                self.handle_clear_logs()
-
-        self.open_context_menu(
-            items,
-            title="Application Logs",
-            origin=(event.screen_x, event.screen_y),
-            on_select=_on_select,
-        )

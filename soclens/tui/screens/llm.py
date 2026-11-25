@@ -7,7 +7,7 @@ import threading
 from typing import Any, ClassVar
 
 from rich.text import Text
-from textual import events, on, work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Button, Input, RichLog, Select, Static
@@ -635,45 +635,3 @@ class LocalLLMPane(BaseSocPane):
         except Exception:
             pass
         self.set_status("Cleared LLM transcript and attached context.")
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button != 3:
-            return
-        event.stop()
-        items: list[tuple[str, str]] = [
-            ("attack_chain", "Summarize Attack Chain"),
-            ("closing_note", "Draft Closing Note"),
-            ("copy_reply", "Copy Last Reply"),
-            ("check_conn", "Check LLM Connection"),
-            ("refresh_models", "Refresh Models"),
-            ("stop_req", "Stop Active Request"),
-            ("clear_chat", "Clear Transcript & Context"),
-            ("open_logs", "Open Logs Tab"),
-        ]
-
-        def _on_select(action_id: str) -> None:
-            if action_id == "attack_chain":
-                self.handle_attack_chain()
-            elif action_id == "closing_note":
-                self.handle_closing_note()
-            elif action_id == "copy_reply":
-                self.handle_copy_reply()
-            elif action_id == "check_conn":
-                self.handle_check_connection()
-            elif action_id == "refresh_models":
-                self.handle_refresh_models()
-            elif action_id == "stop_req":
-                self.handle_stop()
-            elif action_id == "clear_chat":
-                self.handle_clear()
-            elif action_id == "open_logs":
-                open_fn = getattr(self.app, "open_logs_tab", None)
-                if callable(open_fn):
-                    open_fn(source="llm")
-
-        self.open_context_menu(
-            items,
-            title="Local LLM",
-            origin=(event.screen_x, event.screen_y),
-            on_select=_on_select,
-        )
