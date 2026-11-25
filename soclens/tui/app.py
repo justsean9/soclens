@@ -743,6 +743,12 @@ class SocLensApp(App[None]):
     #res-target-type {
         width: 20;
     }
+    #res-source-mode {
+        width: 18;
+    }
+    #res-source-group-filter {
+        width: 19;
+    }
     #res-timeframe-preset {
         width: 22;
     }
@@ -754,6 +760,24 @@ class SocLensApp(App[None]):
     }
     #res-links-timeframe {
         width: 12;
+    }
+    .-compact-narrow #res-toolbar {
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .-compact-narrow #res-toolbar Input,
+    .-compact-narrow #res-toolbar Select,
+    .-compact-narrow #res-toolbar Button {
+        width: 1fr;
+        min-width: 6;
+        height: 1;
+        margin-right: 0;
+    }
+    .-compact-narrow #res-toolbar Select > SelectCurrent {
+        height: 1;
     }
     #logs-source-select {
         width: 19;
@@ -1064,6 +1088,7 @@ class SocLensApp(App[None]):
         *,
         client: RecordedFutureClient | None = None,
         s1_client: SentinelOneClient | None = None,
+        osint_client: Any = None,
         dry_run: bool = False,
         initial_tab: str | None = None,
         workspace_dir: Path | str | None = None,
@@ -1086,12 +1111,14 @@ class SocLensApp(App[None]):
         self._shutting_down = False
         self._custom_client_injected = client is not None
         self._custom_s1_client_injected = s1_client is not None
+        self._custom_osint_client_injected = osint_client is not None
         self._custom_workspace_injected = workspace_dir is not None
         self._ui_mounted = False
         self.client = (
             client if client is not None else RecordedFutureClient(stop_event=self._stop_event)
         )
         self.s1_client = s1_client
+        self.osint_client = osint_client
         self.dry_run = dry_run
         self.no_secret_store: bool = bool(no_secret_store)
         if view_mode is not None:
@@ -1608,10 +1635,20 @@ class SocLensApp(App[None]):
             )
         return ok
 
-    def open_settings_tab(self) -> None:
-        """Switch to the Settings & Credentials tab."""
+    def open_settings_tab(self, *, category: str | None = None) -> None:
+        """Switch to the Settings & Credentials tab, optionally focusing a category."""
+
+        def _focus_cat(pane: BaseSocPane) -> None:
+            if category and isinstance(pane, SettingsPane):
+                select_fn = getattr(pane, "select_category", None)
+                if callable(select_fn):
+                    select_fn(category)
+
         with contextlib.suppress(Exception):
-            self.activate_tab("tab-settings")
+            self.activate_tab(
+                "tab-settings",
+                on_ready=_focus_cat if category else None,
+            )
 
     def action_open_settings(self) -> None:
         """Open the Settings tab unless a modal dialog is currently active."""
@@ -2055,6 +2092,7 @@ def create_app(
     *,
     client: RecordedFutureClient | None = None,
     s1_client: SentinelOneClient | None = None,
+    osint_client: Any = None,
     dry_run: bool = False,
     initial_tab: str | None = None,
     workspace_dir: Path | str | None = None,
@@ -2066,6 +2104,7 @@ def create_app(
     return SocLensApp(
         client=client,
         s1_client=s1_client,
+        osint_client=osint_client,
         dry_run=dry_run,
         initial_tab=initial_tab,
         workspace_dir=workspace_dir,

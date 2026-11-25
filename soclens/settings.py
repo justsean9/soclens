@@ -88,6 +88,7 @@ SETTING_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("network", "Network, SSL & Proxy"),
     ("workspace", "Workspace & Tool Defaults"),
     ("secret_manager", "Secret Manager (PAM / Vault)"),
+    ("osint", "OSINT Enrichment APIs"),
 )
 
 SETTING_SPECS: tuple[SettingSpec, ...] = (
@@ -680,6 +681,73 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         label="Bitwarden Organization ID",
         env_vars=("BW_ORGANIZATION_ID", "SOCLENS_BW_ORGANIZATION_ID"),
         description="Optional Bitwarden organization UUID filter.",
+    ),
+    # OSINT Enrichment APIs (Free Passive Sources & Optional Free-Tier Keys)
+    SettingSpec(
+        key="osint_enabled",
+        category="osint",
+        label="Enable Free OSINT Enrichment",
+        env_vars=("SOCLENS_OSINT_ENABLED",),
+        value_type="bool",
+        default="true",
+        description="Include passive free OSINT feeds alongside Recorded Future in Threat Research.",
+    ),
+    SettingSpec(
+        key="osint_timeout",
+        category="osint",
+        label="OSINT Per-Source Timeout (sec)",
+        env_vars=("SOCLENS_OSINT_TIMEOUT",),
+        value_type="float",
+        default="8.0",
+        description="HTTP timeout in seconds per passive OSINT provider (default 8.0).",
+    ),
+    SettingSpec(
+        key="osint_vt_api_key",
+        category="osint",
+        label="VirusTotal v3 Free API Key",
+        env_vars=("VT_API_KEY", "VIRUSTOTAL_API_KEY", "SOCLENS_VT_API_KEY"),
+        secret=True,
+        description="Optional free VirusTotal v3 API key (4 req/min, 500/day; virustotal.com).",
+    ),
+    SettingSpec(
+        key="osint_abuseipdb_api_key",
+        category="osint",
+        label="AbuseIPDB v2 Free API Key",
+        env_vars=("ABUSEIPDB_API_KEY", "SOCLENS_ABUSEIPDB_API_KEY"),
+        secret=True,
+        description="Optional free AbuseIPDB v2 API key (1,000 checks/day; abuseipdb.com).",
+    ),
+    SettingSpec(
+        key="osint_abusech_api_key",
+        category="osint",
+        label="abuse.ch Free Auth-Key",
+        env_vars=("ABUSECH_AUTH_KEY", "ABUSECH_API_KEY", "SOCLENS_ABUSECH_API_KEY"),
+        secret=True,
+        description="Optional free abuse.ch Auth-Key unlocking ThreatFox, URLhaus & MalwareBazaar (auth.abuse.ch).",
+    ),
+    SettingSpec(
+        key="osint_otx_api_key",
+        category="osint",
+        label="AlienVault OTX Free API Key",
+        env_vars=("OTX_API_KEY", "ALIENVAULT_OTX_API_KEY", "SOCLENS_OTX_API_KEY"),
+        secret=True,
+        description="Optional free LevelBlue/AlienVault OTX API key for higher rate limits (otx.alienvault.com).",
+    ),
+    SettingSpec(
+        key="osint_urlscan_api_key",
+        category="osint",
+        label="URLScan.io Free API Key",
+        env_vars=("URLSCAN_API_KEY", "SOCLENS_URLSCAN_API_KEY"),
+        secret=True,
+        description="Optional free URLScan.io API key for higher search quotas (urlscan.io).",
+    ),
+    SettingSpec(
+        key="osint_greynoise_api_key",
+        category="osint",
+        label="GreyNoise Community Free Key",
+        env_vars=("GREYNOISE_API_KEY", "SOCLENS_GREYNOISE_API_KEY"),
+        secret=True,
+        description="Optional free GreyNoise Community API key (viz.greynoise.io).",
     ),
 )
 

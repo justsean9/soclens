@@ -32,6 +32,9 @@ def _isolate_user_settings(
     isolated_path = tmp_path / "soclens_cfg" / "settings.json"
     monkeypatch.setattr(_settings, "_DEFAULT_SETTINGS_PATH_OVERRIDE", isolated_path)
     monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(isolated_path))
+    # Keep legacy RF-only unit/TUI/E2E tests deterministic and offline by default;
+    # OSINT tests explicitly enable SOCLENS_OSINT_ENABLED or pass an OSINTClient.
+    monkeypatch.setenv("SOCLENS_OSINT_ENABLED", "false")
     _settings.clear_session_overrides()
     _settings.invalidate_settings_cache()
     try:

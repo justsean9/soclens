@@ -1,4 +1,4 @@
-"""Clean search-first Threat Research Workbench pane."""
+"""Unified search-first Recorded Future + Passive OSINT Threat Research Workbench pane."""
 
 from __future__ import annotations
 
@@ -25,13 +25,17 @@ from textual.widgets import (
 )
 
 from soclens.client import RecordedFutureError
+from soclens.config import get_osint_config
+from soclens.osint import OSINT_MODULES, OSINTClient
 from soclens.research import (
     ResearchDossier,
     export_dossier_json,
     export_dossier_markdown,
+    render_dossier_markdown,
     research_target,
 )
 from soclens.tui.filters import SPLUNK_TIME_PRESETS
+from soclens.tui.modals import OSINTSourcesModal
 from soclens.tui.pivot import PivotPayload
 from soclens.tui.research_formatters import (
     build_research_findings,
@@ -68,6 +72,18 @@ _TARGET_TYPE_OPTIONS: list[tuple[str, str]] = [
     ("Free Text", "text"),
 ]
 
+_SOURCE_MODE_OPTIONS: list[tuple[str, str]] = [
+    ("RF + OSINT", "all"),
+    ("OSINT Only", "osint"),
+    ("RF Only", "rf"),
+]
+
+_SOURCE_GROUP_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Source: All", "all"),
+    ("Recorded Future", "rf"),
+    ("Free OSINT", "osint"),
+)
+
 _RES_TIMEFRAME_PRESETS: tuple[tuple[str, str], ...] = tuple(
     item
     for item in SPLUNK_TIME_PRESETS
@@ -77,6 +93,15 @@ _RES_TIMEFRAME_PRESETS: tuple[tuple[str, str], ...] = tuple(
 _RES_CATEGORY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Category: All", "all"),
     ("Summary", "Summary"),
+    ("WHOIS", "WHOIS"),
+    ("DNS", "DNS"),
+    ("Network", "Network"),
+    ("Certificates", "Certificates"),
+    ("Reputation", "Reputation"),
+    ("Web Intel", "Web Intel"),
+    ("Vulnerability", "Vulnerability"),
+    ("File Intel", "File Intel"),
+    ("Sources", "Sources"),
     ("Report", "Report"),
     ("Actor", "Actor"),
     ("Threat Map", "Threat Map"),
@@ -92,31 +117,38 @@ _RES_CATEGORY_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 
 _FINDING_SPECS: tuple[tuple[str, str, float, int], ...] = (
-    ("category", "Category", 0.18, 10),
-    ("finding", "Finding", 0.46, 20),
-    ("detail", "Detail", 0.36, 16),
+    ("category", "Category", 0.16, 10),
+    ("source", "Source", 0.13, 8),
+    ("finding", "Finding", 0.39, 18),
+    ("detail", "Detail", 0.32, 14),
 )
 
 _EXAMPLE_FINDINGS: tuple[dict[str, Any], ...] = (
     {
         "kind": "example",
         "category": "Actor",
+        "source_group": "rf",
+        "source_label": "RF",
         "title": "APT29",
-        "detail": "Threat actor profile, aliases, threat map & reports",
+        "detail": "Threat actor profile, aliases, threat map & Insikt reports",
         "example_query": "APT29",
         "search_blob": "apt29 threat actor",
     },
     {
         "kind": "example",
         "category": "CVE",
+        "source_group": "unified",
+        "source_label": "RF+OSINT",
         "title": "CVE-2021-44228",
-        "detail": "Vulnerability risk, CVSS, exploit reports & rules",
+        "detail": "RF risk/rules + MITRE CVE 5.x, FIRST EPSS & CISA KEV",
         "example_query": "CVE-2021-44228",
-        "search_blob": "cve-2021-44228 vulnerability log4j",
+        "search_blob": "cve-2021-44228 vulnerability log4j kev epss",
     },
     {
         "kind": "example",
         "category": "Malware",
+        "source_group": "rf",
+        "source_label": "RF",
         "title": "Cobalt Strike",
         "detail": "Malware profile, threat map, reports & detection rules",
         "example_query": "Cobalt Strike",
@@ -125,10 +157,12 @@ _EXAMPLE_FINDINGS: tuple[dict[str, Any], ...] = (
     {
         "kind": "example",
         "category": "IP",
+        "source_group": "unified",
+        "source_label": "RF+OSINT",
         "title": "8.8.8.8",
-        "detail": "Risk score, geolocation, linked infrastructure & reports",
+        "detail": "RF risk + WHOIS/RDAP, PTR DNS, GeoIP, BGP, Shodan, DShield & VT",
         "example_query": "8.8.8.8",
-        "search_blob": "8.8.8.8 ip",
+        "search_blob": "8.8.8.8 ip osint whois dns shodan virustotal",
     },
 )
 
@@ -136,12 +170,12 @@ _ALWAYS_RESERVED_KEYS: frozenset[str] = frozenset(
     {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "q", "m", "slash", "space"}
 )
 _DOSSIER_RESERVED_KEYS: frozenset[str] = frozenset(
-    {"j", "p", "left_square_bracket", "right_square_bracket"}
+    {"j", "p", "s", "left_square_bracket", "right_square_bracket"}
 )
 
 
 class ResearchPane(BaseSocPane):
-    """Search-first Recorded Future Threat Research Workbench."""
+    """Unified search-first Recorded Future + Passive OSINT Threat Research Workbench."""
 
     STATUS_ID = "res-status"
     LOG_ID = ""
@@ -152,6 +186,7 @@ class ResearchPane(BaseSocPane):
         Binding("escape", "collapse_filter", "Close Options", show=False),
         Binding("j", "toggle_json_view", "Raw JSON"),
         Binding("p", "pivot_selected", "Search Selected"),
+        Binding("s", "open_sources_modal", "OSINT Sources"),
         Binding("[", "history_back", "Back"),
         Binding("]", "history_forward", "Forward"),
         Binding("m", "open_context_menu", "Menu"),
@@ -163,8 +198,8 @@ class ResearchPane(BaseSocPane):
         self._rendering_table: bool = False
         self._detail_mode: str = "overview"
         self._current_dossier: ResearchDossier | None = None
-        self._dossier_cache: dict[tuple[str, str], ResearchDossier] = {}
-        self._history: list[tuple[str, str]] = []
+        self._dossier_cache: dict[tuple[str, str, str, tuple[str, ...]], ResearchDossier] = {}
+        self._history: list[tuple[str, str, str, tuple[str, ...]]] = []
         self._history_index: int = -1
         self._all_findings: list[dict[str, Any]] = list(_EXAMPLE_FINDINGS)
         self._visible_rows: list[dict[str, Any]] = []
@@ -174,24 +209,36 @@ class ResearchPane(BaseSocPane):
         self._last_submitted_query: str = ""
         self._syncing_timeframe: bool = False
         self._category_filter: str = "all"
+        self._source_group_filter: str = "all"
+        self._source_mode: str = "all"
+        self._enabled_osint_sources: set[str] = set(OSINT_MODULES)
+        self._custom_osint_selection: bool = False
 
     def compose(self) -> ComposeResult:
-        yield Static("Threat Research", classes="pane-title")
+        yield Static("Threat Research (Recorded Future + Passive OSINT)", classes="pane-title")
         yield Static(
-            "Start typing to search any IP, domain, URL, hash, CVE, malware, threat actor, MITRE ID, or topic.",
+            "Start typing to search any domain (badsite.com), IP, URL, hash, CVE, ASN, malware, actor, or topic.",
             id="res-status",
             classes="status-bar",
             markup=False,
         )
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="res-toolbar", classes="action-row toolbar-row"):
             yield Input(
-                placeholder="Search anything (IP, domain, hash, URL, CVE, APT29, Cobalt Strike, T1059, topic)...",
+                placeholder="Search domain (badsite.com), IP, URL, hash, CVE, ASN, APT29, Cobalt Strike...",
                 id="res-target-input",
                 select_on_focus=False,
                 compact=True,
             )
+            yield Select(
+                _SOURCE_MODE_OPTIONS,
+                allow_blank=False,
+                value="all",
+                id="res-source-mode",
+                compact=True,
+            )
             yield Button("Search", id="res-investigate-btn", variant="primary", compact=True)
+            yield Button("Sources", id="res-sources-btn", compact=True)
             yield Button("< Back", id="res-back-btn", compact=True)
             yield Button("Fwd >", id="res-fwd-btn", compact=True)
             yield Button("Export", id="res-export-md-btn", compact=True)
@@ -208,6 +255,13 @@ class ResearchPane(BaseSocPane):
                     placeholder="Filter findings...",
                     id="res-filter-input",
                     select_on_focus=False,
+                    compact=True,
+                )
+                yield Select(
+                    list(_SOURCE_GROUP_FILTER_OPTIONS),
+                    allow_blank=False,
+                    value="all",
+                    id="res-source-group-filter",
                     compact=True,
                 )
                 yield Select(
@@ -264,6 +318,18 @@ class ResearchPane(BaseSocPane):
                     wrap=True,
                 )
 
+    def _get_osint_client(self) -> OSINTClient | None:
+        injected = getattr(self.app, "osint_client", None)
+        if isinstance(injected, OSINTClient) or injected is not None:
+            return injected  # type: ignore[no-any-return]
+        return None
+
+    def _build_osint_inspector_client(self) -> OSINTClient:
+        injected = self._get_osint_client()
+        if isinstance(injected, OSINTClient):
+            return injected
+        return OSINTClient(get_osint_config(), workspace_dir=self.workspace_dir)
+
     def on_mount(self) -> None:
         table = self.query_one("#res-table", DoubleClickDataTable)
         table.cursor_type = "row"
@@ -280,6 +346,12 @@ class ResearchPane(BaseSocPane):
     def on_tab_activated(self) -> None:
         if self._tables_ready:
             self._update_responsive_layout()
+
+    def on_settings_updated(self) -> None:
+        """Refresh OSINT key readiness and clear cached dossiers after Settings updates."""
+        self._dossier_cache.clear()
+        if self._tables_ready and self._current_dossier is None:
+            self._render_detail_panel()
 
     def _update_responsive_layout(self) -> None:
         workspace = self.query_one("#res-workspace", Container)
@@ -319,8 +391,19 @@ class ResearchPane(BaseSocPane):
         except ValueError:
             return default
 
-    def _push_history(self, query: str, explicit_type: str) -> None:
-        entry = (query, explicit_type)
+    def _active_sources_sig(self) -> tuple[str, ...]:
+        if not self._custom_osint_selection:
+            return ("__default__",)
+        return tuple(sorted(self._enabled_osint_sources))
+
+    def _push_history(
+        self,
+        query: str,
+        explicit_type: str,
+        source_mode: str,
+        sources_sig: tuple[str, ...],
+    ) -> None:
+        entry = (query, explicit_type, source_mode, sources_sig)
         if 0 <= self._history_index < len(self._history) and self._history[self._history_index] == entry:
             return
         if self._history_index + 1 < len(self._history):
@@ -329,7 +412,7 @@ class ResearchPane(BaseSocPane):
         self._history_index = len(self._history) - 1
 
     def investigate_external(self, target: str, target_type: str = "auto") -> None:
-        """Populate Research search bar from another tab and run the search."""
+        """Populate Research search bar from another tab and run the unified search."""
         clean = target.strip()
         if not clean:
             return
@@ -344,7 +427,7 @@ class ResearchPane(BaseSocPane):
         self._start_investigation(clean, resolved_type, record_history=True)
 
     def accept_pivot(self, payload: PivotPayload) -> None:
-        """Accept a ``PivotPayload`` and auto-run a scoped Threat Research investigation."""
+        """Accept a ``PivotPayload`` and auto-run a scoped unified Threat Research search."""
         primary = payload.primary_ioc()
         if primary is None:
             self.set_status("Pivot payload contained no IOC or entity to research.")
@@ -485,6 +568,46 @@ class ResearchPane(BaseSocPane):
         )
         self._render_detail_panel()
 
+    def action_open_sources_modal(self) -> None:
+        """Open the interactive passive free OSINT Sources modal."""
+        if self.is_app_shutting_down():
+            return
+        inspector = self._build_osint_inspector_client()
+        avail = inspector.source_availability()
+
+        def _on_close(result: dict[str, Any] | None) -> None:
+            if not isinstance(result, dict):
+                return
+            action = result.get("action")
+            if action == "open_settings":
+                self._open_osint_settings()
+                return
+            if action == "apply":
+                chosen = set(result.get("sources") or [])
+                self._enabled_osint_sources = chosen
+                self._custom_osint_selection = chosen != set(OSINT_MODULES)
+                self.set_status(
+                    f"Active OSINT sources updated: {len(chosen)}/{len(OSINT_MODULES)} enabled."
+                )
+                if self._current_dossier is not None and self._last_submitted_query:
+                    t_type = str(self.query_one("#res-target-type", Select).value or "auto")
+                    self._start_investigation(
+                        self._last_submitted_query, t_type, record_history=False
+                    )
+
+        self.app.push_screen(
+            OSINTSourcesModal(avail, self._enabled_osint_sources),
+            callback=_on_close,
+        )
+
+    def _open_osint_settings(self) -> None:
+        open_fn = getattr(self.app, "open_settings_tab", None)
+        if callable(open_fn):
+            open_fn(category="cat-osint")
+        else:
+            tabs = self.app.query_one("#main-tabs", TabbedContent)
+            tabs.active = "tab-settings"
+
     def action_history_back(self) -> None:
         self._navigate_history(-1)
 
@@ -497,11 +620,15 @@ class ResearchPane(BaseSocPane):
             self.set_status("No further search history in that direction.")
             return
         self._history_index = new_idx
-        query, t_type = self._history[new_idx]
+        query, t_type, mode, src_sig = self._history[new_idx]
         self._last_submitted_query = query.strip()
+        self._source_mode = mode
         self.query_one("#res-target-input", Input).value = query
         self.query_one("#res-target-type", Select).value = t_type
-        cached = self._dossier_cache.get((query, t_type))
+        mode_sel = self.query_one("#res-source-mode", Select)
+        with mode_sel.prevent(Select.Changed):
+            mode_sel.value = mode
+        cached = self._dossier_cache.get((query, t_type, mode, src_sig))
         if cached is not None:
             self._apply_dossier(cached)
             self.set_status(f"Showing results for '{cached.target.canonical_name}'.")
@@ -548,13 +675,31 @@ class ResearchPane(BaseSocPane):
     def handle_investigate(self) -> None:
         query = self.query_one("#res-target-input", Input).value.strip()
         if not query:
-            self.set_status("Enter an IP, domain, hash, URL, CVE, malware, actor, or topic to search.")
+            self.set_status("Enter an IP, domain (badsite.com), hash, URL, CVE, ASN, malware, actor, or topic.")
             return
         t_type = str(self.query_one("#res-target-type", Select).value or "auto")
         self._start_investigation(query, t_type, record_history=True)
         focused = self.app.focused
         if focused is not None and focused.id in ("res-target-input", "res-investigate-btn"):
             self._focus_findings_table()
+
+    @on(Select.Changed, "#res-source-mode")
+    def handle_source_mode_changed(self, event: Select.Changed) -> None:
+        if event.value is Select.BLANK:
+            return
+        new_mode = str(event.value or "all")
+        if new_mode == self._source_mode:
+            return
+        self._source_mode = new_mode
+        mode_lbl = {"all": "RF + OSINT", "osint": "OSINT Only", "rf": "RF Only"}.get(new_mode, new_mode)
+        self.set_status(f"Search mode set to {mode_lbl}.")
+        if self._current_dossier is not None and self._last_submitted_query:
+            t_type = str(self.query_one("#res-target-type", Select).value or "auto")
+            self._start_investigation(self._last_submitted_query, t_type, record_history=True)
+
+    @on(Button.Pressed, "#res-sources-btn")
+    def handle_sources_btn(self) -> None:
+        self.action_open_sources_modal()
 
     @on(Button.Pressed, "#res-back-btn")
     def handle_back(self) -> None:
@@ -610,6 +755,13 @@ class ResearchPane(BaseSocPane):
     def handle_filter_changed(self) -> None:
         self._render_master_table()
 
+    @on(Select.Changed, "#res-source-group-filter")
+    def handle_source_group_filter_changed(self, event: Select.Changed) -> None:
+        if event.value is Select.BLANK:
+            return
+        self._source_group_filter = str(event.value or "all")
+        self._render_master_table()
+
     @on(Select.Changed, "#res-category-filter")
     def handle_category_filter_changed(self, event: Select.Changed) -> None:
         if event.value is Select.BLANK:
@@ -650,11 +802,15 @@ class ResearchPane(BaseSocPane):
     @on(Button.Pressed, "#res-clear-filter-btn")
     def handle_clear_filters(self) -> None:
         self._category_filter = "all"
+        self._source_group_filter = "all"
         try:
             self.query_one("#res-filter-input", Input).value = ""
             sel = self.query_one("#res-category-filter", Select)
             with sel.prevent(Select.Changed):
                 sel.value = "all"
+            src_sel = self.query_one("#res-source-group-filter", Select)
+            with src_sel.prevent(Select.Changed):
+                src_sel.value = "all"
         except Exception:
             pass
         self._render_master_table()
@@ -745,8 +901,13 @@ class ResearchPane(BaseSocPane):
             if bool(getattr(self.app, "is_admin_view", True)):
                 items.append(("send_watchlist", "Send Entity to Watchlists Tab"))
             items.append(("send_rf_intel", "Lookup Entity in RF Intel Tab"))
+            items.append(("send_splunk", "Hunt Entity in Splunk Search"))
+        if self._current_dossier is not None:
+            items.append(("send_llm", "Analyze Unified Brief with Local LLM"))
         items.extend(
             [
+                ("configure_osint", "Configure Free OSINT Sources..."),
+                ("open_osint_settings", "Configure Free OSINT API Keys (Settings)"),
                 (
                     "toggle_json",
                     "Switch to Intelligence View" if self._detail_mode == "json" else "Switch to Raw JSON",
@@ -767,6 +928,14 @@ class ResearchPane(BaseSocPane):
                 self._send_to_watchlists(piv[0], piv[1])
             elif action_id == "send_rf_intel" and piv is not None:
                 self._send_to_rf_intel(piv[0], piv[1])
+            elif action_id == "send_splunk" and piv is not None:
+                self._send_to_splunk(piv[0], piv[1])
+            elif action_id == "send_llm":
+                self._send_to_llm()
+            elif action_id == "configure_osint":
+                self.action_open_sources_modal()
+            elif action_id == "open_osint_settings":
+                self._open_osint_settings()
             elif action_id == "toggle_json":
                 self.action_toggle_json_view()
             elif action_id == "copy_row":
@@ -843,20 +1012,58 @@ class ResearchPane(BaseSocPane):
         rf_pane = self.app.query_one(RFIntelPane)
         self.call_after_refresh(rf_pane.lookup_from_watchlist, kind, entity_value)
 
+    def _send_to_splunk(self, entity_value: str, kind: str) -> None:
+        clean_val = entity_value.strip()
+        for prefix in ("ip:", "idn:", "hash:", "url:", "email:", "asn:", "mitre:"):
+            if clean_val.lower().startswith(prefix):
+                clean_val = clean_val[len(prefix) :].strip()
+                break
+        dispatch = getattr(self.app, "dispatch_pivot", None)
+        if callable(dispatch):
+            dispatch(
+                PivotPayload(
+                    source_tab="tab-research",
+                    target_tab="tab-splunk-search",
+                    entity=clean_val,
+                    entity_type=kind,
+                )
+            )
+
+    def _send_to_llm(self) -> None:
+        if self._current_dossier is None:
+            self.set_status("Run a search before sending to Local LLM.")
+            return
+        open_llm = getattr(self.app, "open_llm_with_context", None)
+        if callable(open_llm):
+            md = render_dossier_markdown(self._current_dossier)
+            open_llm(
+                f"Unified RF + OSINT Brief: {self._current_dossier.target.canonical_name}",
+                md[:8000],
+                template="triage_alert",
+                auto_send=False,
+            )
+
     # ------------------------------------------------------------------
     # Workers
     # ------------------------------------------------------------------
 
     def _start_investigation(self, query: str, explicit_type: str, *, record_history: bool) -> None:
         self._last_submitted_query = query.strip()
+        source_mode = self._source_mode
+        sources_sig = self._active_sources_sig()
         if record_history:
-            self._push_history(query, explicit_type)
+            self._push_history(query, explicit_type, source_mode, sources_sig)
         links_tf = self.query_one("#res-links-timeframe", Input).value.strip() or "-30d"
         limit = self._parse_limit(20)
         deep = bool(self.query_one("#res-deep-check", Checkbox).value)
         self._request_seq += 1
         seq = self._request_seq
-        self.set_status(f"Searching for '{query}'...")
+        mode_desc = {
+            "all": "RF + OSINT",
+            "osint": "Free Passive OSINT",
+            "rf": "Recorded Future",
+        }.get(source_mode, source_mode)
+        self.set_status(f"Searching ({mode_desc}) for '{query}'...")
         self._investigate_worker(
             seq,
             query,
@@ -864,6 +1071,10 @@ class ResearchPane(BaseSocPane):
             deep=deep,
             links_timeframe=links_tf,
             limit=limit,
+            source_mode=source_mode,
+            sources_sig=sources_sig,
+            osint_sources=sorted(self._enabled_osint_sources) if self._custom_osint_selection else None,
+            osint_client=self._get_osint_client(),
         )
 
     @work(thread=True, exit_on_error=False)
@@ -876,21 +1087,34 @@ class ResearchPane(BaseSocPane):
         deep: bool,
         links_timeframe: str,
         limit: int,
+        source_mode: str,
+        sources_sig: tuple[str, ...],
+        osint_sources: list[str] | None,
+        osint_client: OSINTClient | None,
     ) -> None:
         try:
-            self.append_log(f"Research search started: {query} (type={explicit_type}, deep={deep})")
+            include_rf = source_mode in ("all", "rf")
+            include_osint = source_mode in ("all", "osint")
+            self.append_log(
+                f"Research search started: {query} (type={explicit_type}, mode={source_mode}, deep={deep})"
+            )
             with self.log_scope("research"):
                 dossier = research_target(
-                    self.client,
+                    self.client if include_rf else None,
                     query,
                     explicit_type=explicit_type,
                     deep=deep,
                     links_timeframe=links_timeframe,
                     limit=limit,
+                    include_rf=include_rf,
+                    include_osint=include_osint,
+                    osint_sources=osint_sources,
+                    osint_client=osint_client,
+                    workspace_dir=self.workspace_dir,
                 )
             if seq != self._request_seq or self.is_app_shutting_down():
                 return
-            self._dossier_cache[(query, explicit_type)] = dossier
+            self._dossier_cache[(query, explicit_type, source_mode, sources_sig)] = dossier
             self.run_on_ui(self._apply_dossier, dossier)
             self.append_log(f"Research search completed: {dossier.target.canonical_name}")
         except Exception as exc:
@@ -904,9 +1128,15 @@ class ResearchPane(BaseSocPane):
         self._render_master_table()
         self._render_detail_panel()
         findings_cnt = max(0, len(self._all_findings) - 1)
-        risk_note = f" | Risk {dossier.risk_score}/99" if dossier.risk_score is not None else ""
+        notes: list[str] = []
+        if dossier.risk_score is not None:
+            notes.append(f"RF Risk {dossier.risk_score}/99")
+        if dossier.osint_sections:
+            ok_cnt = sum(1 for s in dossier.osint_sections.values() if s.status == "ok")
+            notes.append(f"OSINT {ok_cnt}/{len(dossier.osint_sections)} hit(s)")
+        extra = f" | {' | '.join(notes)}" if notes else ""
         self.set_status(
-            f"Results for '{dossier.target.canonical_name}'{risk_note} ({findings_cnt} finding(s))."
+            f"Results for '{dossier.target.canonical_name}'{extra} ({findings_cnt} finding(s))."
         )
 
     @work(thread=True, exit_on_error=False)
@@ -948,12 +1178,17 @@ class ResearchPane(BaseSocPane):
 
             rows_source = self._all_findings
             cat_filter = self._category_filter.strip().lower()
+            src_filter = self._source_group_filter.strip().lower()
             visible = [
                 row
                 for row in rows_source
                 if (
                     cat_filter == "all"
                     or str(row.get("category") or "").strip().lower() == cat_filter
+                )
+                and (
+                    src_filter == "all"
+                    or str(row.get("source_group") or "rf").strip().lower() in (src_filter, "unified")
                 )
                 and (not filt or filt in str(row.get("search_blob") or row).lower())
             ]
@@ -970,6 +1205,15 @@ class ResearchPane(BaseSocPane):
                 cat = str(item.get("category") or "-")
                 cat_style = {
                     "Summary": "bold cyan",
+                    "WHOIS": "bold green",
+                    "DNS": "bold green",
+                    "Network": "green",
+                    "Certificates": "cyan",
+                    "Reputation": "bold yellow",
+                    "Web Intel": "cyan",
+                    "Vulnerability": "bold red",
+                    "File Intel": "bold green",
+                    "Sources": "dim",
                     "Report": "blue",
                     "Actor": "bold magenta",
                     "Threat Map": "magenta",
@@ -978,10 +1222,17 @@ class ResearchPane(BaseSocPane):
                     "Alert": "bold red",
                     "Sample": "bold yellow",
                 }.get(cat, "white")
+                src_lbl = str(item.get("source_label") or ("OSINT" if item.get("source_group") == "osint" else "RF"))
+                src_style = (
+                    "bold cyan"
+                    if src_lbl in ("Unified", "RF+OSINT")
+                    else ("green" if item.get("source_group") == "osint" else "blue")
+                )
                 table.add_row(
                     Text(cat, style=cat_style),
-                    truncate_text(str(item.get("title") or "-"), 46),
-                    truncate_text(str(item.get("detail") or "-"), 42),
+                    Text(src_lbl, style=src_style),
+                    truncate_text(str(item.get("title") or "-"), 42),
+                    truncate_text(str(item.get("detail") or "-"), 48),
                     key=str(idx),
                 )
 
@@ -1027,8 +1278,8 @@ class ResearchPane(BaseSocPane):
                     else render_finding_detail({"kind": "brief", "payload": self._current_dossier}, self._current_dossier)
                 )
             else:
-                header.update("Threat Research")
-                renderable = render_research_welcome()
+                header.update("Threat Research (RF + Free OSINT)")
+                renderable = render_research_welcome(osint_client=self._build_osint_inspector_client())
             log_widget.write(renderable, width=width, expand=True, scroll_end=False)
             log_widget.scroll_home(animate=False)
             return

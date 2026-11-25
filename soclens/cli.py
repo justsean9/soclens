@@ -66,8 +66,9 @@ from soclens.logos.brand_sync import (
     validate_domain_brand_sync,
 )
 from soclens.logos.extractor import load_domains_file
+from soclens.osint import OSINT_MODULES, OSINTClient
 from soclens.research import (
-    RESEARCH_MODULES,
+    ALL_RESEARCH_MODULES,
     export_dossier_json,
     export_dossier_markdown,
     probe_api_capabilities,
@@ -1208,7 +1209,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--modules",
         action="append",
         default=None,
-        help=f"Comma-separated research modules (available: {', '.join(RESEARCH_MODULES)})",
+        help=f"Comma-separated RF or OSINT modules (available: {', '.join(ALL_RESEARCH_MODULES)})",
+    )
+    res_inv.add_argument("--no-osint", action="store_true", default=False, help="Disable passive free OSINT enrichment (RF only)")
+    res_inv.add_argument("--osint-only", action="store_true", default=False, help="Run passive free OSINT only (no RF API token required)")
+    res_inv.add_argument(
+        "--osint-sources",
+        action="append",
+        default=None,
+        help=f"Comma-separated OSINT sources or aliases (e.g. whois,dns,shodan,vt,otx; available: {', '.join(OSINT_MODULES)})",
     )
     res_inv.add_argument("--deep", action="store_true", default=False, help="Include Connect v2 extensions")
     res_inv.add_argument("--extensions", action="append", default=None, help="Specific v2 extensions to query")
@@ -1231,6 +1240,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     res_caps = res_subparsers.add_parser("capabilities", help="Probe token entitlements across all Recorded Future APIs")
     res_caps.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    res_osint = res_subparsers.add_parser(
+        "osint",
+        help="Run passive free OSINT enrichment (WHOIS/RDAP, DNS/DoH, GeoIP, BGP, Shodan, crt.sh, VT, OTX, etc.) without needing an RF token",
+    )
+    res_osint.add_argument("target", nargs="?", default=None, help="Domain, IP, URL, hash, CVE, ASN, or email to enrich")
+    res_osint.add_argument(
+        "--type",
+        choices=["auto", "ip", "domain", "hash", "url", "vulnerability", "asn", "email"],
+        default="auto",
+        help="Explicit target type override (default: auto-detect)",
+    )
+    res_osint.add_argument(
+        "--sources",
+        action="append",
+        default=None,
+        help="Comma-separated OSINT sources or aliases (e.g. whois,dns,shodan,vt,otx,abuseipdb,abusech)",
+    )
+    res_osint.add_argument(
+        "--list-sources",
+        action="store_true",
+        default=False,
+        help="List all built-in free passive OSINT sources, tiers, and key configuration status",
+    )
+    res_osint.add_argument("-o", "--output", default=None, help="Optional output file path (.md or .json)")
+    res_osint.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default=None,
+        help="Output file format when --output is set (default: infer from suffix or markdown)",
+    )
+    res_osint.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     res_links = res_subparsers.add_parser("links", help="Query the Recorded Future Links relationship graph")
     res_links.add_argument("entities", nargs="*", help="Entity ID(s) or IOCs to query")
@@ -4012,25 +4053,84 @@ def _write_binary_output(data: bytes, output_path: str | None, *, default_label:
         print(f"[*] Received {len(data)} binary bytes ({default_label}); pass -o/--output to save.")
 
 
-def _handle_research(args: argparse.Namespace, client: RecordedFutureClient, *, use_json: bool) -> int:
+def _handle_research(
+    args: argparse.Namespace,
+    client: RecordedFutureClient | None,
+    *,
+    use_json: bool,
+) -> int:
     sub = args.research_subcommand
     if not sub:
         print("Specify a `research` subcommand (run `soclens research --help` for options).", file=sys.stderr)
         return 1
 
+    if sub == "osint":
+        if getattr(args, "list_sources", False):
+            rows = OSINTClient().source_availability()
+            if use_json:
+                _emit_json(rows)
+                return 0
+            print(f"{'Source':<44} | {'Tier':<17} | {'Status':<16} | {'Note'}")
+            print("-" * 116)
+            for row in rows:
+                print(
+                    f"{str(row['title']):<44} | {str(row['tier']):<17} | "
+                    f"{str(row['state']):<16} | {row['note']}"
+                )
+            return 0
+        if not args.target:
+            print("[-] Provide a target or pass `--list-sources` for `research osint`.", file=sys.stderr)
+            return 1
+        osint_srcs = _split_csv_arg(args.sources) or None
+        dossier = research_target(
+            None,
+            args.target,
+            explicit_type=args.type,
+            include_rf=False,
+            include_osint=True,
+            osint_sources=osint_srcs,
+        )
+        if args.output:
+            fmt = args.format or ("json" if str(args.output).lower().endswith(".json") else "markdown")
+            written = (
+                export_dossier_json(dossier, args.output)
+                if fmt == "json"
+                else export_dossier_markdown(dossier, args.output)
+            )
+            if not use_json:
+                print(f"[+] OSINT dossier written to {written}")
+        if use_json:
+            _emit_json(dossier.to_dict())
+        else:
+            print(render_dossier_markdown(dossier))
+        return 0
+
     if sub in ("investigate", "dossier"):
         mods = _split_csv_arg(args.modules) or None
         exts = _split_csv_arg(args.extensions) or None
+        osint_srcs = _split_csv_arg(getattr(args, "osint_sources", None)) or None
+        osint_only = bool(getattr(args, "osint_only", False))
+        no_osint = bool(getattr(args, "no_osint", False))
+        kwargs: dict[str, Any] = {
+            "explicit_type": args.type,
+            "modules": mods,
+            "deep": bool(args.deep),
+            "extensions": exts,
+            "links_scope": args.links_scope,
+            "links_timeframe": args.links_timeframe,
+            "limit": args.limit,
+        }
+        if osint_only:
+            kwargs["include_rf"] = False
+            kwargs["include_osint"] = True
+        elif no_osint:
+            kwargs["include_osint"] = False
+        if osint_srcs is not None:
+            kwargs["osint_sources"] = osint_srcs
         dossier = research_target(
-            client,
+            None if osint_only else client,
             args.target,
-            explicit_type=args.type,
-            modules=mods,
-            deep=bool(args.deep),
-            extensions=exts,
-            links_scope=args.links_scope,
-            links_timeframe=args.links_timeframe,
-            limit=args.limit,
+            **kwargs,
         )
         if args.output:
             fmt = args.format or ("json" if str(args.output).lower().endswith(".json") else "markdown")
@@ -4046,6 +4146,9 @@ def _handle_research(args: argparse.Namespace, client: RecordedFutureClient, *, 
         else:
             print(render_dossier_markdown(dossier))
         return 0
+
+    if client is None:
+        client = RecordedFutureClient()
 
     if sub == "capabilities":
         rows = probe_api_capabilities(client)
@@ -8786,8 +8889,12 @@ def main() -> None:
             client = _build_rf_client(args)
             rc = _handle_rf(args, client, use_json=use_json)
         elif args.command == "research":
-            client = _build_rf_client(args)
-            rc = _handle_research(args, client, use_json=use_json)
+            needs_rf_client = not (
+                getattr(args, "research_subcommand", None) == "osint"
+                or bool(getattr(args, "osint_only", False))
+            )
+            res_client = _build_rf_client(args) if needs_rf_client else None
+            rc = _handle_research(args, res_client, use_json=use_json)
         elif args.command == "sigma":
             client = _build_rf_client(args)
             rc = _handle_sigma(args, client, use_json=use_json)

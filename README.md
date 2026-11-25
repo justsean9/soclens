@@ -7,7 +7,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-blue.svg)](https://mypy-lang.org/)
 
-Cross-platform SOC investigation workbench providing a unified CLI (`soclens`) and interactive Textual Terminal User Interface (`soclens tui`) integrating Recorded Future (Watchlists, Brand Monitoring, Entity Match, Connect v2, SOAR v3, Detection Rules, Playbook Alerts, Alerts v3, Cases, Sandbox v0), Splunk Search & Splunk Enterprise Security triage/enrichment, SentinelOne EDR, Sigma-to-Splunk conversion, Local LLM analysis, per-user settings profiles, and air-gapped offline deployment bundling.
+Cross-platform SOC investigation workbench providing a unified CLI (`soclens`) and interactive Textual Terminal User Interface (`soclens tui`) integrating Recorded Future (Watchlists, Brand Monitoring, Entity Match, Connect v2, SOAR v3, Detection Rules, Playbook Alerts, Alerts v3, Cases, Sandbox v0), **16 built-in free passive OSINT feeds** (WHOIS/RDAP, DoH DNS, GeoIP, BGP/ASN, Shodan InternetDB, crt.sh, URLScan, SANS DShield, Wayback Machine, AlienVault OTX, GreyNoise, CIRCL NSRL, MITRE CVE + FIRST EPSS + CISA KEV, plus optional free-key VirusTotal, AbuseIPDB, and abuse.ch) into a single pane of glass alongside Splunk Search & Splunk Enterprise Security triage/enrichment, SentinelOne EDR, Sigma-to-Splunk conversion, Local LLM analysis, per-user settings profiles, and air-gapped offline deployment bundling.
 
 See [docs/RF_API_REVIEW.md](docs/RF_API_REVIEW.md) for the Recorded Future API reference and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
@@ -18,7 +18,7 @@ See [docs/RF_API_REVIEW.md](docs/RF_API_REVIEW.md) for the Recorded Future API r
 Interactive Textual TUI (`soclens tui`) rendered with sanitized demo data (regenerate anytime with `python scripts/generate_screenshots.py`):
 
 ### Threat Research Workbench (`7`)
-Multi-API dossier investigation with risk scoring, related infrastructure pivots, Insikt Group analyst notes, and detection rules:
+Unified single-pane-of-glass investigation combining Recorded Future risk scoring, Insikt Group notes, and detection rules with 16 built-in free passive OSINT sources (WHOIS/RDAP, DNS/SPF/DMARC, GeoIP, BGP/ASN, Shodan InternetDB, VirusTotal, AbuseIPDB, abuse.ch, OTX, GreyNoise, DShield, URLScan, crt.sh, Wayback, CIRCL NSRL, and MITRE CVE/EPSS/CISA KEV):
 
 ![Threat Research Workbench](docs/screenshots/research.svg)
 
@@ -149,15 +149,17 @@ Every analyst can configure credentials and tool defaults directly inside the **
 
 **Configuration Precedence:** `CLI flags` > `Active TUI Session Override` > `Environment Variables` > `Per-User Saved Profile` > `Built-in Defaults`
 
-**Per-User Settings File Locations** (saved atomically with `0600` owner-only permissions on Linux/macOS):
-- **Windows**: `%APPDATA%\soclens\settings.json`
-- **macOS**: `~/Library/Application Support/soclens/settings.json`
-- **Linux**: `$XDG_CONFIG_HOME/soclens/settings.json` (default `~/.config/soclens/settings.json`)
+**Per-User Settings File Locations** (encrypted at rest with **AES-256-GCM** inside an authenticated JSON envelope and saved atomically with `0600` owner-only permissions on Linux/macOS):
+- **Windows**: `%APPDATA%\soclens\settings.json` (auto-unlocked via Windows DPAPI by default)
+- **macOS**: `~/Library/Application Support/soclens/settings.json` (auto-unlocked via macOS Keychain by default)
+- **Linux**: `$XDG_CONFIG_HOME/soclens/settings.json` (default `~/.config/soclens/settings.json`; auto-unlocked via Linux Secret Service / `secret-tool`, falling back to a separate `0600` keyfile at `$XDG_DATA_HOME/soclens/.settings.key` on headless hosts)
 - **Override**: `SOCLENS_SETTINGS_FILE=/path/to/settings.json` (and `SOCLENS_PROFILE=<name>` for named profiles)
 
+Legacy plaintext `settings.json` files (schema v1) are still read seamlessly and automatically migrated to encrypted schema v2 on the next save.
+
 ### Option 1: In-App Settings UI & CLI (`soclens settings`)
-1. Launch the TUI (`soclens tui` or `.\soclens.ps1 tui`) and press `0` or `F10` (or click **Settings** on the Dashboard) to enter your Recorded Future, Splunk, SentinelOne, SSL/CA/Proxy, and Workspace defaults, test connections live, import existing env vars, or manage named profiles (`default`, `prod`, `lab`).
-2. Or configure via the CLI (never commits credentials; `settings.json` is excluded from git and offline deployment bundles):
+1. Launch the TUI (`soclens tui` or `.\soclens.ps1 tui`) and press `0` or `F10` (or click **Settings** on the Dashboard) to enter your Recorded Future, Splunk, SentinelOne, SSL/CA/Proxy, and Workspace defaults, test connections live, import existing env vars, manage named profiles (`default`, `prod`, `lab`), or manage encryption under **Profiles & Storage**.
+2. Or configure via the CLI (never commits credentials; `settings.json` and `.settings.key` are excluded from git and offline deployment bundles):
 ```bash
 soclens settings path
 soclens settings set rf_api_token "your_api_key"
@@ -165,7 +167,18 @@ soclens settings set splunk_host "https://your-splunk-sh:8089"
 soclens settings set splunk_token "your_bearer_token"
 soclens settings import-env
 soclens settings show
+
+# Optional: switch to Master Passphrase encryption (Scrypt + AES-256-GCM; no key stored on disk/OS keystore)
+soclens settings encrypt --passphrase
+soclens settings unlock
+soclens settings lock
+soclens settings rekey --new-passphrase
+
+# Switch back to OS keystore auto-unlock or rotate the data encryption key
+soclens settings encrypt --mode os_keystore
+soclens settings rekey --rotate-kek
 ```
+For non-interactive automation in Master Passphrase mode, export `SOCLENS_SETTINGS_PASSPHRASE` or `SOCLENS_SETTINGS_PASSPHRASE_FILE=/path/to/0600-passphrase-file`.
 
 ### Option 2: Environment Variables (Optional Overrides / CI / Automation)
 Configure credentials via environment variables if preferred (never commit tokens or `apikey.key` to git):
@@ -194,6 +207,18 @@ $env:SOCLENS_AUTO_APPROVE = "true"
 export SPLUNK_HOST="https://your-splunk-sh:8089"
 export SPLUNK_TOKEN="your_bearer_token"     # recommended (or SPLUNK_USERNAME / SPLUNK_PASSWORD)
 export SPLUNK_APP="SplunkEnterpriseSecuritySuite"
+```
+
+### Free Passive OSINT API Keys (Optional — 13 Sources Require Zero Keys)
+Thirteen passive OSINT feeds (WHOIS/RDAP, DoH DNS, GeoIP, BGP/ASN, Shodan InternetDB, crt.sh, URLScan, DShield, Wayback, OTX, GreyNoise, CIRCL NSRL, MITRE CVE/EPSS/CISA KEV) work immediately with no API keys. You can configure optional free-tier keys either in **Settings (`0`/`F10`) -> OSINT Free API Keys** or via environment variables:
+```bash
+export SOCLENS_OSINT_ENABLED="true"         # set "false" to disable passive OSINT in air-gapped environments
+export VT_API_KEY="your_free_vt_key"        # VirusTotal v3 (virustotal.com/gui/join-us)
+export ABUSEIPDB_API_KEY="your_free_key"    # AbuseIPDB v2 (abuseipdb.com/register)
+export ABUSECH_AUTH_KEY="your_free_key"     # Single key unlocks ThreatFox, URLhaus & MalwareBazaar (auth.abuse.ch)
+export OTX_API_KEY="your_free_otx_key"      # Optional higher AlienVault OTX rate limits
+export URLSCAN_API_KEY="your_free_key"      # Optional higher URLScan.io search quotas
+export GREYNOISE_API_KEY="your_free_key"    # Optional GreyNoise Community key
 ```
 
 ### Corporate / Internal SSL-Inspecting Proxy
@@ -362,16 +387,46 @@ soclens rf extension ip 8.8.8.8 GreyNoiseIntelligence
 
 ## Threat Research (`research` & TUI Research Tab)
 
-Investigate any IP, domain, hash, URL, CVE, malware family, threat actor, MITRE ATT&CK technique, email, ASN, company, or free-text term across all Recorded Future APIs with automatic entity resolution, graceful handling of unlicensed modules (`401`/`403`), pivot extraction, and Markdown/JSON report export:
+Investigate any IP, domain (`badsite.com`), hash, URL, CVE, malware family, threat actor, MITRE ATT&CK technique, email, ASN, company, or free-text term in **one unified pane of glass** combining Recorded Future APIs with **16 built-in, 100% passive free OSINT sources (18 live feeds)**. For domains and URLs, SOCLens automatically resolves the primary public hosting IP via DNS-over-HTTPS and chains IP intelligence (GeoIP, BGP/ASN, Shodan InternetDB, DShield, GreyNoise, AbuseIPDB) alongside domain WHOIS/RDAP, DNS, certificates, and web reputation — without ever initiating direct HTTP/TLS connections to potentially malicious targets.
+
+### Built-In Free Passive OSINT Sources (Zero Additional Dependencies)
+
+13 sources work immediately with **zero API keys**, and 3 additional free-tier API key integrations unlock VirusTotal, AbuseIPDB, and the entire abuse.ch suite (ThreatFox, URLhaus, MalwareBazaar) from **Settings (`0`/`F10`) -> OSINT Free API Keys**:
+
+| Source | Category | Cost / Key | What Analysts Get |
+|---|---|---|---|
+| **WHOIS / RDAP** (`rdap.org`) | WHOIS | Free (No key) | Registrar, registrant, domain age & newly-registered (<= 30d) flag, abuse email, CIDR |
+| **DNS & Email Auth** (Cloudflare / Google DoH) | DNS | Free (No key) | A, AAAA, NS, MX, TXT, CNAME, SOA, CAA, PTR, SPF/DMARC posture, DNSSEC |
+| **IP Geolocation & ISP** (`ipwho.is`) | Network | Free (No key) | Country, city, coordinates, timezone, ASN, ISP/Org (auto-chained for domains) |
+| **BGP Routing & ASN** (RIPEstat) | Network | Free (No key) | Announced BGP prefix, origin ASN(s), holder, abuse contacts (auto-chained) |
+| **Shodan InternetDB** | Network | Free (No key) | Open ports + service hints, CPEs, known CVEs, hostnames, tags (auto-chained) |
+| **Certificate Transparency** (`crt.sh`) | Certificates | Free (No key) | Historical TLS certs, issuers, deduplicated subdomains/SANs |
+| **URLScan.io Public Search** | Web Intel | Free (Optional key) | Historical web scans, malicious/phishing verdicts, page titles, screenshot links |
+| **SANS ISC / DShield** | Reputation | Free (No key) | Global sensor attack counts, distinct targets attacked, threat feeds |
+| **Wayback Machine CDX** | Web Intel | Free (No key) | Historical snapshots & safe passive archive links without touching live sites |
+| **AlienVault / LevelBlue OTX** | Reputation | Free (Optional key) | Community pulses, malware families, adversaries, ATT&CK IDs, passive DNS |
+| **GreyNoise Community** | Reputation | Free (Optional key) | Mass-scanner Noise vs benign RIOT classification (`benign` / `malicious`) |
+| **CIRCL Hashlookup (NSRL)** | File Intel | Free (No key) | Known-good software / OS file verification for MD5, SHA-1, and SHA-256 |
+| **MITRE CVE + FIRST EPSS + CISA KEV** | Vulnerability | Free (No key) | CVSS score/vector, CWEs, exploit probability (EPSS), and CISA KEV active-exploit status |
+| **VirusTotal v3** | Reputation | Free API Key | Multi-engine AV/URL/domain/IP/hash detections, categories, reputation (`VT_API_KEY`) |
+| **AbuseIPDB v2** | Reputation | Free API Key | Abuse confidence %, report count, Tor exit flag, ISP/usage type (`ABUSEIPDB_API_KEY`) |
+| **abuse.ch Suite** | Reputation | Free Auth-Key | Single `ABUSECH_AUTH_KEY` unlocks **ThreatFox** + **URLhaus** + **MalwareBazaar** |
 
 ```bash
+# Unified Recorded Future + Free Passive OSINT dossier (single pane of glass)
+soclens research investigate badsite.com --output report.md
+soclens research investigate 198.51.100.42 --json
+soclens research investigate CVE-2021-44228 --deep
+soclens research investigate 8.8.8.8 --no-osint            # Recorded Future only
+soclens research investigate badsite.com --osint-only      # Free OSINT only (no RF token required)
+
+# Standalone Free Passive OSINT CLI (works even without RF_API_TOKEN)
+soclens research osint --list-sources
+soclens research osint 1.1.1.1
+soclens research osint badsite.com --sources rdap,dns,shodan,virustotal --json
+
 # Probe token entitlements across all 25 Recorded Future API surfaces
 soclens research capabilities
-
-# Full multi-API research dossier with Markdown or JSON report export
-soclens research investigate 8.8.8.8 --output report.md
-soclens research investigate APT29 --json
-soclens research investigate CVE-2021-44228 --deep
 
 # Direct API research surfaces
 soclens research links ip:8.8.8.8 --timeframe -30d --scope medium
@@ -387,7 +442,7 @@ soclens research taxii2 --collections --root default
 soclens research sandbox --list org --limit 10
 ```
 
-In the TUI (`soclens tui`, press `7`), the **Research** tab provides a clean search-first workbench with unified intelligence briefs, clickable findings and threat report drill-down, pivot history (`[` Back / `]` Forward), double-click entity pivoting (`p`), Raw JSON toggle (`j`), Markdown/JSON export, and right-click cross-tab pivoting from **Watchlists** and **RF Intel & Alerts**.
+In the TUI (`soclens tui`, press `7`), the **Research** tab provides a unified search-first workbench with a **Source Mode selector** (`RF + OSINT`, `OSINT Only`, `RF Only`), an **OSINT Sources** modal (`s`) to toggle feeds or jump straight to **Settings -> OSINT Free API Keys**, a **Unified Intelligence Brief** combining RF risk and passive OSINT verdict/signals, a 4-column findings table (`Category | Source | Finding | Detail`) with source-group filtering inside `/`, clickable rich drill-downs for every OSINT and RF section, pivot history (`[` Back / `]` Forward), double-click entity pivoting (`p`), Raw JSON toggle (`j`), Markdown/JSON export, and right-click cross-tab pivoting to **Local LLM**, **Splunk Search**, **Watchlists**, and **RF Intel & Alerts**.
 
 ---
 

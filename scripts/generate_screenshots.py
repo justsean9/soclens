@@ -15,6 +15,8 @@ from textual.widgets import Button, DataTable, Input, RichLog, Select
 
 import soclens.settings as settings_mod
 from soclens.client import RecordedFutureAuthError
+from soclens.config import OSINTConfig
+from soclens.osint import OSINT_SOURCES_BY_KEY, OSINTClient, OSINTSectionOutcome
 from soclens.tui.app import create_app
 from soclens.tui.screens.llm import LocalLLMPane
 from soclens.tui.screens.research import ResearchPane
@@ -48,6 +50,10 @@ def _demo_env(base_env: dict[str, str], settings_path: Path) -> dict[str, str]:
             "RF_LLM_PROVIDER": "ollama",
             "RF_LLM_BASE_URL": "http://127.0.0.1:11434",
             "RF_LLM_MODEL": "qwen2.5:14b",
+            "SOCLENS_OSINT_ENABLED": "true",
+            "VT_API_KEY": "demo-vt-free-key",
+            "ABUSEIPDB_API_KEY": "demo-abuseipdb-free-key",
+            "ABUSECH_AUTH_KEY": "demo-abusech-free-key",
         }
     )
     return env
@@ -345,6 +351,285 @@ def _build_mock_rf_client() -> MagicMock:
     client.search_playbook_alerts.return_value = {"data": [], "counts": {"returned": 0, "total": 0}}
     client.search_cases.return_value = {"data": [], "total_count": 0}
     return client
+
+
+def _build_mock_osint_client() -> OSINTClient:
+    """Offline mock OSINTClient for deterministic unified RF + OSINT screenshots."""
+    cfg = OSINTConfig(
+        enabled=True,
+        timeout=8.0,
+        vt_api_key="demo-vt-free-key",
+        abuseipdb_api_key="demo-abuseipdb-free-key",
+        abusech_api_key="demo-abusech-free-key",
+    )
+
+    class _DemoOSINTClient(OSINTClient):
+        def enrich_target(
+            self,
+            target: str,
+            kind: str,
+            *,
+            extracted_domain: str | None = None,
+            sources: Any = None,
+        ) -> dict[str, OSINTSectionOutcome]:
+            _ = (target, kind, extracted_domain)
+            outcomes: dict[str, OSINTSectionOutcome] = {
+                "osint_rdap": OSINTSectionOutcome(
+                    key="osint_rdap",
+                    title=OSINT_SOURCES_BY_KEY["osint_rdap"].title,
+                    status="ok",
+                    status_code=200,
+                    message="BPH-NET-EU | NL | 198.51.100.0/24",
+                    count=1,
+                    elapsed_ms=215.0,
+                    data={
+                        "queried": "198.51.100.42",
+                        "kind": "ip",
+                        "name": "BPH-NET-EU",
+                        "handle": "NET-198-51-100-0-1",
+                        "registrar": "RIPE NCC",
+                        "registrant": "Bulletproof Hosting BV",
+                        "country": "NL",
+                        "cidrs": ["198.51.100.0/24"],
+                        "created": "2025-10-04T00:00:00Z",
+                        "abuse_email": "abuse@bph-net.example",
+                    },
+                ),
+                "osint_dns": OSINTSectionOutcome(
+                    key="osint_dns",
+                    title=OSINT_SOURCES_BY_KEY["osint_dns"].title,
+                    status="ok",
+                    status_code=200,
+                    message="PTR: c2-edge.example",
+                    count=1,
+                    elapsed_ms=68.0,
+                    data={"queried": "198.51.100.42", "kind": "ip", "ptr": ["c2-edge.example"]},
+                ),
+                "osint_geoip": OSINTSectionOutcome(
+                    key="osint_geoip",
+                    title=OSINT_SOURCES_BY_KEY["osint_geoip"].title,
+                    status="ok",
+                    status_code=200,
+                    message="Amsterdam, North Holland, NL | AS64512 | Bulletproof Hosting BV",
+                    count=1,
+                    elapsed_ms=112.0,
+                    data={
+                        "ip": "198.51.100.42",
+                        "city": "Amsterdam",
+                        "region": "North Holland",
+                        "country": "Netherlands",
+                        "country_code": "NL",
+                        "asn": "AS64512",
+                        "org": "Bulletproof Hosting BV",
+                        "isp": "Bulletproof Hosting BV",
+                        "timezone": "Europe/Amsterdam",
+                    },
+                ),
+                "osint_bgp": OSINTSectionOutcome(
+                    key="osint_bgp",
+                    title=OSINT_SOURCES_BY_KEY["osint_bgp"].title,
+                    status="ok",
+                    status_code=200,
+                    message="198.51.100.0/24 | AS64512 | BPH-NET-AS",
+                    count=1,
+                    elapsed_ms=184.0,
+                    data={
+                        "ip": "198.51.100.42",
+                        "prefix": "198.51.100.0/24",
+                        "asns": ["AS64512"],
+                        "holder": "BPH-NET-AS Bulletproof Hosting BV",
+                        "abuse_contacts": ["abuse@bph-net.example"],
+                    },
+                ),
+                "osint_shodan": OSINTSectionOutcome(
+                    key="osint_shodan",
+                    title=OSINT_SOURCES_BY_KEY["osint_shodan"].title,
+                    status="ok",
+                    status_code=200,
+                    message="3 port(s) (80, 443, 50050) | 1 CVE(s) | tags: c2",
+                    count=3,
+                    elapsed_ms=94.0,
+                    data={
+                        "ip": "198.51.100.42",
+                        "ports": [80, 443, 50050],
+                        "port_services": [
+                            {"port": 80, "service": "HTTP"},
+                            {"port": 443, "service": "HTTPS"},
+                            {"port": 50050, "service": "Cobalt Strike"},
+                        ],
+                        "cpes": ["cpe:/a:nginx:nginx:1.24.0"],
+                        "vulns": ["CVE-2024-3400"],
+                        "hostnames": ["c2-update.example", "cdn-stage.example"],
+                        "tags": ["c2", "cloud"],
+                    },
+                ),
+                "osint_virustotal": OSINTSectionOutcome(
+                    key="osint_virustotal",
+                    title=OSINT_SOURCES_BY_KEY["osint_virustotal"].title,
+                    status="ok",
+                    status_code=200,
+                    message="14/94 malicious, 2 suspicious | rep -62",
+                    count=14,
+                    elapsed_ms=295.0,
+                    data={
+                        "malicious": 14,
+                        "suspicious": 2,
+                        "harmless": 66,
+                        "undetected": 12,
+                        "total_engines": 94,
+                        "reputation": -62,
+                        "suggested_threat_label": "trojan.cobaltstrike/beacon",
+                        "flagged_engines": [
+                            {"engine": "CrowdStrike", "category": "malicious", "result": "malware"},
+                            {"engine": "BitDefender", "category": "malicious", "result": "c2"},
+                            {"engine": "Fortinet", "category": "malicious", "result": "malicious"},
+                        ],
+                        "gui_url": "https://www.virustotal.com/gui/ip-address/198.51.100.42",
+                    },
+                ),
+                "osint_abuseipdb": OSINTSectionOutcome(
+                    key="osint_abuseipdb",
+                    title=OSINT_SOURCES_BY_KEY["osint_abuseipdb"].title,
+                    status="ok",
+                    status_code=200,
+                    message="Abuse Score: 88% | 47 report(s) | TOR EXIT",
+                    count=47,
+                    elapsed_ms=230.0,
+                    data={
+                        "ip": "198.51.100.42",
+                        "abuse_confidence_score": 88,
+                        "total_reports": 47,
+                        "distinct_users": 14,
+                        "is_tor": True,
+                        "is_whitelisted": False,
+                        "country_code": "NL",
+                        "usage_type": "Data Center/Web Hosting/Transit",
+                        "isp": "Bulletproof Hosting BV",
+                        "last_reported_at": "2026-11-25T11:20:00Z",
+                    },
+                ),
+                "osint_abusech": OSINTSectionOutcome(
+                    key="osint_abusech",
+                    title=OSINT_SOURCES_BY_KEY["osint_abusech"].title,
+                    status="ok",
+                    status_code=200,
+                    message="ThreatFox: 2 (Cobalt Strike) | URLhaus: 1 URL(s)",
+                    count=3,
+                    elapsed_ms=340.0,
+                    data={
+                        "threatfox": [
+                            {
+                                "malware_printable": "Cobalt Strike",
+                                "threat_type": "botnet_cc",
+                                "confidence_level": 100,
+                                "first_seen": "2026-11-22 10:00:00 UTC",
+                                "tags": ["c2", "teamserver"],
+                            }
+                        ],
+                        "urlhaus": {"query_status": "ok", "url_status": "online"},
+                        "urlhaus_urls": [
+                            {
+                                "url": "https://198.51.100.42/updates/stage.bin",
+                                "url_status": "online",
+                                "threat": "malware_download",
+                            }
+                        ],
+                        "malwarebazaar": [],
+                        "total_hits": 3,
+                    },
+                ),
+                "osint_otx": OSINTSectionOutcome(
+                    key="osint_otx",
+                    title=OSINT_SOURCES_BY_KEY["osint_otx"].title,
+                    status="ok",
+                    status_code=200,
+                    message="5 pulse(s) | malware: Cobalt Strike | 6 passive DNS",
+                    count=5,
+                    elapsed_ms=390.0,
+                    data={
+                        "pulse_count": 5,
+                        "malware_families": ["Cobalt Strike"],
+                        "adversaries": ["FIN7"],
+                        "tags": ["cobaltstrike", "c2", "https-beacon"],
+                        "pulses": [
+                            {
+                                "name": "Cobalt Strike Malleable C2 Cluster Q4 2026",
+                                "modified": "2026-11-24T08:00:00Z",
+                                "adversary": "FIN7",
+                                "tags": ["c2", "cobaltstrike"],
+                            }
+                        ],
+                        "passive_dns": [
+                            {"hostname": "c2-update.example", "record_type": "A", "last": "2026-11-25"}
+                        ],
+                    },
+                ),
+                "osint_greynoise": OSINTSectionOutcome(
+                    key="osint_greynoise",
+                    title=OSINT_SOURCES_BY_KEY["osint_greynoise"].title,
+                    status="ok",
+                    status_code=200,
+                    message="NOISE (malicious) | Cobalt Strike TeamServer",
+                    count=1,
+                    elapsed_ms=135.0,
+                    data={
+                        "ip": "198.51.100.42",
+                        "noise": True,
+                        "riot": False,
+                        "classification": "malicious",
+                        "name": "Cobalt Strike TeamServer",
+                        "last_seen": "2026-11-25",
+                        "link": "https://viz.greynoise.io/ip/198.51.100.42",
+                    },
+                ),
+                "osint_dshield": OSINTSectionOutcome(
+                    key="osint_dshield",
+                    title=OSINT_SOURCES_BY_KEY["osint_dshield"].title,
+                    status="ok",
+                    status_code=200,
+                    message="240 report(s) | 48 target(s) attacked | feeds: block, cobaltstrike",
+                    count=240,
+                    elapsed_ms=178.0,
+                    data={
+                        "ip": "198.51.100.42",
+                        "count": 240,
+                        "attacks": 48,
+                        "maxdate": "2026-11-25",
+                        "mindate": "2026-11-12",
+                        "threatfeeds": ["block", "cobaltstrike"],
+                    },
+                ),
+                "osint_urlscan": OSINTSectionOutcome(
+                    key="osint_urlscan",
+                    title=OSINT_SOURCES_BY_KEY["osint_urlscan"].title,
+                    status="ok",
+                    status_code=200,
+                    message="12 scan(s) | 3 malicious",
+                    count=12,
+                    elapsed_ms=265.0,
+                    data={
+                        "total": 12,
+                        "malicious_count": 3,
+                        "scans": [
+                            {
+                                "time": "2026-11-24T19:12:00Z",
+                                "url": "https://c2-update.example/login",
+                                "domain": "c2-update.example",
+                                "status": "200",
+                                "server": "nginx",
+                                "malicious": True,
+                                "result_url": "https://urlscan.io/result/demo-scan-1/",
+                            }
+                        ],
+                    },
+                ),
+            }
+            if sources is not None:
+                allowed = set(sources)
+                outcomes = {k: v for k, v in outcomes.items() if k in allowed}
+            return outcomes
+
+    return _DemoOSINTClient(cfg)
 
 
 def _build_mock_es_client() -> MagicMock:
@@ -767,14 +1052,16 @@ def _sanitize_svg(svg_path: Path, workspace_dir: Path, settings_path: Path) -> N
 async def _capture_all(workspace_dir: Path, settings_path: Path) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rf_client = _build_mock_rf_client()
+    osint_client = _build_mock_osint_client()
     s1_client = _build_mock_s1_client()
     es_client = _build_mock_es_client()
     llm_client = _build_mock_llm_client()
     sigma_rules = _build_sample_sigma_rules()
 
-    # 1. Research tab
+    # 1. Research tab (Unified Recorded Future + Free Passive OSINT)
     app = create_app(
         client=rf_client,
+        osint_client=osint_client,
         s1_client=s1_client,
         dry_run=True,
         initial_tab="tab-research",

@@ -116,6 +116,36 @@ class LocalLLMConfig:
 
 
 @dataclass(frozen=True)
+class OSINTConfig:
+    """Resolved free passive OSINT enrichment configuration (secrets hidden from repr)."""
+
+    enabled: bool = True
+    timeout: float = 8.0
+    verify_ssl: bool | str = True
+    vt_api_key: str | None = field(default=None, repr=False)
+    abuseipdb_api_key: str | None = field(default=None, repr=False)
+    abusech_api_key: str | None = field(default=None, repr=False)
+    otx_api_key: str | None = field(default=None, repr=False)
+    urlscan_api_key: str | None = field(default=None, repr=False)
+    greynoise_api_key: str | None = field(default=None, repr=False)
+
+    def configured_key_count(self) -> int:
+        """Return count of configured optional free-tier OSINT API keys."""
+        return sum(
+            1
+            for val in (
+                self.vt_api_key,
+                self.abuseipdb_api_key,
+                self.abusech_api_key,
+                self.otx_api_key,
+                self.urlscan_api_key,
+                self.greynoise_api_key,
+            )
+            if val
+        )
+
+
+@dataclass(frozen=True)
 class SecretStoreConfig:
     """Resolved secret manager / PAM configuration (secret fields excluded from repr)."""
 
@@ -781,6 +811,56 @@ def get_auto_approve() -> bool:
     if raw is None:
         return False
     return raw.strip().lower() in _TRUTHY_VALUES
+
+
+def get_osint_config(
+    *,
+    enabled: bool | None = None,
+    timeout: float | None = None,
+    verify_ssl: bool | str | Path | None = None,
+) -> OSINTConfig:
+    """Resolve passive OSINT enrichment settings (explicit > session > env > saved > defaults)."""
+    if enabled is not None:
+        resolved_enabled = bool(enabled)
+    else:
+        raw_enabled = get_effective_setting("osint_enabled", include_default=True)
+        resolved_enabled = (
+            raw_enabled.strip().lower() not in _FALSY_VALUES
+            if raw_enabled is not None
+            else True
+        )
+
+    if timeout is not None:
+        resolved_timeout = max(1.0, float(timeout))
+    else:
+        raw_timeout = get_effective_setting("osint_timeout", include_default=True)
+        try:
+            parsed_timeout = float(raw_timeout) if raw_timeout is not None else 8.0
+            resolved_timeout = (
+                parsed_timeout
+                if math.isfinite(parsed_timeout) and parsed_timeout > 0
+                else 8.0
+            )
+        except ValueError:
+            resolved_timeout = 8.0
+
+    resolved_verify = (
+        parse_ssl_verify(verify_ssl, default=True)
+        if verify_ssl is not None
+        else get_rf_verify_ssl()
+    )
+
+    return OSINTConfig(
+        enabled=resolved_enabled,
+        timeout=resolved_timeout,
+        verify_ssl=resolved_verify,
+        vt_api_key=_clean_optional_str(get_effective_setting("osint_vt_api_key")),
+        abuseipdb_api_key=_clean_optional_str(get_effective_setting("osint_abuseipdb_api_key")),
+        abusech_api_key=_clean_optional_str(get_effective_setting("osint_abusech_api_key")),
+        otx_api_key=_clean_optional_str(get_effective_setting("osint_otx_api_key")),
+        urlscan_api_key=_clean_optional_str(get_effective_setting("osint_urlscan_api_key")),
+        greynoise_api_key=_clean_optional_str(get_effective_setting("osint_greynoise_api_key")),
+    )
 
 
 def get_sigma_setting(key: str) -> str | None:

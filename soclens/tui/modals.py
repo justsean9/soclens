@@ -13,9 +13,9 @@ from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, OptionList, RichLog, Select, Static, TextArea
+from textual.widgets import Button, Checkbox, Input, OptionList, RichLog, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
 from soclens.config import get_workspace_dir
@@ -2513,11 +2513,156 @@ class SaveFilterPresetModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class OSINTSourcesModal(ModalScreen[dict[str, Any] | None]):
+    """Interactive selector for toggling passive free OSINT sources & opening Settings."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Close", show=False),
+    ]
+
+    DEFAULT_CSS: ClassVar[str] = """
+    OSINTSourcesModal {
+        align: center middle;
+        background: $background 65%;
+    }
+    #osint-modal-dialog {
+        width: 96;
+        max-width: 94%;
+        height: auto;
+        max-height: 88%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #osint-modal-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #osint-modal-intro {
+        color: $text-muted;
+        height: auto;
+        margin-bottom: 1;
+    }
+    #osint-modal-list {
+        height: 1fr;
+        min-height: 10;
+        max-height: 22;
+        border: solid $panel-lighten-1;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #osint-modal-list Checkbox {
+        width: 1fr;
+        margin: 0;
+    }
+    #osint-modal-buttons {
+        height: auto;
+        align-horizontal: right;
+    }
+    #osint-modal-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        sources_info: Sequence[dict[str, Any]],
+        enabled_keys: set[str],
+    ) -> None:
+        super().__init__()
+        self._sources_info = list(sources_info)
+        self._enabled_keys = set(enabled_keys)
+
+    def compose(self) -> ComposeResult:
+        ready_cnt = sum(1 for s in self._sources_info if s.get("configured"))
+        with Vertical(id="osint-modal-dialog"):
+            yield Static(
+                f"Free Passive OSINT Sources ({ready_cnt}/{len(self._sources_info)} Ready)",
+                id="osint-modal-title",
+                markup=False,
+            )
+            yield Static(
+                "All sources are 100% passive (zero direct connections to the target). "
+                "Toggle which free feeds run alongside Recorded Future, or open Settings to add optional free API keys.",
+                id="osint-modal-intro",
+                markup=False,
+            )
+            with VerticalScroll(id="osint-modal-list"):
+                for info in self._sources_info:
+                    key = str(info["key"])
+                    tier_tag = {
+                        "free_no_key": "FREE / No Key",
+                        "free_optional_key": "FREE / Key Opt",
+                        "free_api_key": "FREE Key",
+                    }.get(str(info.get("tier") or ""), "FREE")
+                    state_tag = {
+                        "key_configured": "Ready (Key Set)",
+                        "ready": "Ready",
+                        "needs_free_key": "Add Free Key in Settings",
+                    }.get(str(info.get("state") or ""), "Ready")
+                    label = f"{info['title']}  [{tier_tag} | {state_tag}]"
+                    yield Checkbox(
+                        label,
+                        value=key in self._enabled_keys,
+                        id=f"osint-src-{key.replace('_', '-')}",
+                        compact=True,
+                    )
+            with Horizontal(id="osint-modal-buttons"):
+                yield Button("Enable All", id="osint-modal-all-btn", compact=True)
+                yield Button("No-Key Only", id="osint-modal-nokey-btn", compact=True)
+                yield Button("Free API Keys (Settings)", id="osint-modal-settings-btn", compact=True)
+                yield Button("Cancel", id="osint-modal-cancel-btn", compact=True)
+                yield Button("Apply", id="osint-modal-apply-btn", variant="primary", compact=True)
+
+    def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
+        with contextlib.suppress(Exception):
+            self.query_one("#osint-modal-apply-btn", Button).focus()
+
+    @on(Button.Pressed, "#osint-modal-all-btn")
+    def handle_enable_all(self) -> None:
+        for info in self._sources_info:
+            cid = f"#osint-src-{str(info['key']).replace('_', '-')}"
+            self.query_one(cid, Checkbox).value = True
+
+    @on(Button.Pressed, "#osint-modal-nokey-btn")
+    def handle_nokey_only(self) -> None:
+        for info in self._sources_info:
+            cid = f"#osint-src-{str(info['key']).replace('_', '-')}"
+            is_nokey = str(info.get("tier") or "") in ("free_no_key", "free_optional_key")
+            self.query_one(cid, Checkbox).value = is_nokey
+
+    @on(Button.Pressed, "#osint-modal-settings-btn")
+    def handle_open_settings(self) -> None:
+        self.dismiss({"action": "open_settings"})
+
+    @on(Button.Pressed, "#osint-modal-cancel-btn")
+    def handle_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#osint-modal-apply-btn")
+    def handle_apply(self) -> None:
+        selected: list[str] = []
+        for info in self._sources_info:
+            key = str(info["key"])
+            cid = f"#osint-src-{key.replace('_', '-')}"
+            if self.query_one(cid, Checkbox).value:
+                selected.append(key)
+        self.dismiss({"action": "apply", "sources": selected})
+
+    def action_cancel(self) -> None:
+        """Close the OSINT sources dialog without applying changes."""
+        self.dismiss(None)
+
+
 __all__ = [
     "ConfirmActionModal",
     "ContextMenuModal",
     "CopyTextModal",
     "CreateCaseModal",
+    "OSINTSourcesModal",
     "S1AddBlocklistModal",
     "S1CreateExclusionModal",
     "S1ThreatTriageModal",

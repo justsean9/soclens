@@ -24,8 +24,10 @@ from textual.widgets.option_list import Option
 
 from soclens.client import RecordedFutureClient
 from soclens.config import (
+    OSINTConfig,
     SecretStoreConfig,
     format_ssl_verify_status,
+    get_osint_config,
     get_proxy_summary,
     get_rf_asi_key,
     get_rf_base_url,
@@ -39,6 +41,7 @@ from soclens.config import (
     get_splunk_config,
     hydrate_secrets_from_store,
 )
+from soclens.osint import OSINTClient
 from soclens.secret_stores import build_secret_store_provider
 from soclens.secret_stores.base import SECRET_PROVIDER_LABELS, SecretCatalogEntry
 from soclens.sentinelone import SentinelOneClient
@@ -86,6 +89,7 @@ _CATEGORIES: tuple[tuple[str, str], ...] = (
     ("cat-workspace", "Workspace & Defaults"),
     ("cat-profiles", "Profiles & Storage"),
     ("cat-secrets", "Secret Manager (PAM / Vault)"),
+    ("cat-osint", "OSINT Free API Keys"),
 )
 
 _SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
@@ -201,6 +205,14 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "bw_folder_id": ("cat-secrets", "set-bw-folder-id"),
     "bw_collection_id": ("cat-secrets", "set-bw-collection-id"),
     "bw_organization_id": ("cat-secrets", "set-bw-organization-id"),
+    "osint_enabled": ("cat-osint", "set-osint-enabled"),
+    "osint_timeout": ("cat-osint", "set-osint-timeout"),
+    "osint_vt_api_key": ("cat-osint", "set-osint-vt-key"),
+    "osint_abuseipdb_api_key": ("cat-osint", "set-osint-abuseipdb-key"),
+    "osint_abusech_api_key": ("cat-osint", "set-osint-abusech-key"),
+    "osint_otx_api_key": ("cat-osint", "set-osint-otx-key"),
+    "osint_urlscan_api_key": ("cat-osint", "set-osint-urlscan-key"),
+    "osint_greynoise_api_key": ("cat-osint", "set-osint-greynoise-key"),
 }
 
 _SECRET_INPUT_IDS: tuple[str, ...] = (
@@ -220,6 +232,15 @@ _SECRET_INPUT_IDS: tuple[str, ...] = (
     "set-vault-secret-id",
     "set-op-connect-token",
     "set-bw-master-password",
+)
+
+_OSINT_SECRET_INPUT_IDS: tuple[str, ...] = (
+    "set-osint-vt-key",
+    "set-osint-abuseipdb-key",
+    "set-osint-abusech-key",
+    "set-osint-otx-key",
+    "set-osint-urlscan-key",
+    "set-osint-greynoise-key",
 )
 
 _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
@@ -284,6 +305,13 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
     ("bw_folder_id", "set-bw-folder-id", "Optional Bitwarden folder UUID"),
     ("bw_collection_id", "set-bw-collection-id", "Optional Bitwarden collection UUID"),
     ("bw_organization_id", "set-bw-organization-id", "Optional Bitwarden organization UUID"),
+    ("osint_timeout", "set-osint-timeout", "Default: 8.0"),
+    ("osint_vt_api_key", "set-osint-vt-key", "Optional free key (virustotal.com/gui/join-us)"),
+    ("osint_abuseipdb_api_key", "set-osint-abuseipdb-key", "Optional free key (abuseipdb.com/register)"),
+    ("osint_abusech_api_key", "set-osint-abusech-key", "Optional free Auth-Key (auth.abuse.ch — unlocks ThreatFox/URLhaus/MalwareBazaar)"),
+    ("osint_otx_api_key", "set-osint-otx-key", "Optional free key for higher limits (otx.alienvault.com)"),
+    ("osint_urlscan_api_key", "set-osint-urlscan-key", "Optional free key for higher search quotas (urlscan.io)"),
+    ("osint_greynoise_api_key", "set-osint-greynoise-key", "Optional free Community key (viz.greynoise.io/signup)"),
 )
 
 _SSL_VERIFY_TRUE = frozenset({"1", "true", "yes", "on"})
@@ -1216,6 +1244,100 @@ class SettingsPane(BaseSocPane):
                                 compact=True,
                             )
 
+                    with VerticalScroll(id="cat-osint", classes="settings-cat-scroll"):
+                        yield Static(
+                            "Passive Free OSINT Enrichment & Optional Free-Tier Keys",
+                            classes="section-label",
+                            markup=False,
+                        )
+                        yield Static(
+                            "13 passive OSINT feeds work out-of-the-box with ZERO keys: "
+                            "WHOIS/RDAP, DNS/DoH (SPF/DMARC/DNSSEC), GeoIP, RIPEstat BGP/ASN, "
+                            "Shodan InternetDB (ports/CPEs/CVEs), crt.sh, URLScan Public, "
+                            "SANS DShield, Wayback, AlienVault OTX, GreyNoise, CIRCL NSRL, "
+                            "and MITRE CVE + FIRST EPSS + CISA KEV.\n"
+                            "Add free community keys below to unlock VirusTotal, AbuseIPDB, "
+                            "and abuse.ch (ThreatFox + URLhaus + MalwareBazaar).",
+                            id="settings-osint-info",
+                            classes="info-box",
+                            markup=False,
+                        )
+                        yield self._make_label("osint_enabled")
+                        yield Checkbox(
+                            "Enable Free Passive OSINT in Research Tab (SOCLENS_OSINT_ENABLED)",
+                            value=True,
+                            id="set-osint-enabled",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_timeout")
+                        yield Input(
+                            value="",
+                            placeholder="Default: 8.0",
+                            id="set-osint-timeout",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_vt_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional free key (virustotal.com/gui/join-us)",
+                            id="set-osint-vt-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_abuseipdb_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional free key (abuseipdb.com/register)",
+                            id="set-osint-abuseipdb-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_abusech_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional free Auth-Key (auth.abuse.ch — unlocks ThreatFox/URLhaus/MalwareBazaar)",
+                            id="set-osint-abusech-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_otx_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional free key for higher limits (otx.alienvault.com)",
+                            id="set-osint-otx-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_urlscan_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional free key for higher search quotas (urlscan.io)",
+                            id="set-osint-urlscan-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("osint_greynoise_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional free Community key (viz.greynoise.io/signup)",
+                            id="set-osint-greynoise-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        with Horizontal(classes="action-row toolbar-row"):
+                            yield Button(
+                                "Test Free OSINT Sources",
+                                id="settings-test-osint-btn",
+                                compact=True,
+                            )
+
     def _make_label(self, key: str) -> Static:
         spec = SETTING_SPECS_BY_KEY[key]
         return Static(
@@ -1628,6 +1750,16 @@ class SettingsPane(BaseSocPane):
             with auto_cb.prevent(Checkbox.Changed):
                 auto_cb.value = (auto_val or "").strip().lower() in _SSL_VERIFY_TRUE
 
+            # OSINT enabled (defaults to True when unset)
+            osint_en_val = self._form_value_for_display("osint_enabled", saved_map)
+            osint_cb = self.query_one("#set-osint-enabled", Checkbox)
+            with osint_cb.prevent(Checkbox.Changed):
+                osint_cb.value = (
+                    True
+                    if osint_en_val is None
+                    else osint_en_val.strip().lower() not in _SSL_VERIFY_FALSE
+                )
+
             # Profiles dropdown & vault controls
             self._refresh_profile_selector(active_profile)
             self._populate_vault_dropdowns(
@@ -1762,7 +1894,7 @@ class SettingsPane(BaseSocPane):
     @on(Checkbox.Changed, "#settings-show-secrets")
     def handle_toggle_show_secrets(self, event: Checkbox.Changed) -> None:
         hide = not bool(event.value)
-        for widget_id in _SECRET_INPUT_IDS:
+        for widget_id in (*_SECRET_INPUT_IDS, *_OSINT_SECRET_INPUT_IDS):
             try:
                 self.query_one(f"#{widget_id}", Input).password = hide
             except Exception:
@@ -1802,6 +1934,16 @@ class SettingsPane(BaseSocPane):
     @on(Checkbox.Changed)
     def _handle_setting_checkbox_changed(self, event: Checkbox.Changed) -> None:
         self._update_dirty_from_change(event.checkbox.id, event.value)
+
+    def select_category(self, cat_id: str) -> None:
+        """Select a settings category pane programmatically by its ContentSwitcher ID."""
+        try:
+            cat_ids = [cid for cid, _ in _CATEGORIES]
+            if cat_id in cat_ids:
+                self.query_one("#settings-category-list", OptionList).highlighted = cat_ids.index(cat_id)
+                self.query_one("#settings-category-switcher", ContentSwitcher).current = cat_id
+        except Exception:
+            pass
 
     def _switch_to_widget(self, cat_id: str, widget_id: str, *, key: str = "") -> None:
         try:
@@ -1986,6 +2128,18 @@ class SettingsPane(BaseSocPane):
         else:
             env_auto = get_env_override_for_setting("soclens_auto_approve")
             values["soclens_auto_approve"] = "false" if env_auto is not None else None
+
+        # OSINT enabled (defaults to True; only persist "false" or override env)
+        osint_checked = bool(self.query_one("#set-osint-enabled", Checkbox).value)
+        if not osint_checked:
+            values["osint_enabled"] = "false"
+        else:
+            env_osint = get_env_override_for_setting("osint_enabled")
+            values["osint_enabled"] = (
+                "true"
+                if (env_osint is not None or "osint_enabled" in existing_saved)
+                else None
+            )
 
         return values, None
 
@@ -2235,6 +2389,11 @@ class SettingsPane(BaseSocPane):
             if "soclens_auto_approve" in imported:
                 self.query_one("#set-auto-approve", Checkbox).value = (
                     imported["soclens_auto_approve"].strip().lower() in _SSL_VERIFY_TRUE
+                )
+
+            if "osint_enabled" in imported:
+                self.query_one("#set-osint-enabled", Checkbox).value = (
+                    imported["osint_enabled"].strip().lower() not in _SSL_VERIFY_FALSE
                 )
 
             if "vault_secret_map" in imported:
@@ -2861,6 +3020,53 @@ class SettingsPane(BaseSocPane):
             title="Connection Checks",
             severity="warning" if any_error else "information",
         )
+
+    @on(Button.Pressed, "#settings-test-osint-btn")
+    def handle_test_osint(self) -> None:
+        draft, err = self._snapshot_draft_values()
+        if err:
+            self.set_status(f"Cannot test OSINT: {err}")
+            return
+        self.set_status("Testing free passive OSINT connectivity (DoH + Shodan InternetDB)...")
+        self._test_osint_worker(draft)
+
+    @work(thread=True, exit_on_error=False)
+    def _test_osint_worker(self, draft: dict[str, str | None]) -> None:
+        try:
+            base_cfg = get_osint_config()
+            raw_to = draft.get("osint_timeout")
+            try:
+                timeout_val = float(raw_to) if raw_to else base_cfg.timeout
+            except ValueError:
+                timeout_val = base_cfg.timeout
+            cfg = OSINTConfig(
+                enabled=True,
+                timeout=max(1.0, timeout_val),
+                verify_ssl=self._resolve_draft_rf_ssl(draft),
+                vt_api_key=draft.get("osint_vt_api_key") or base_cfg.vt_api_key,
+                abuseipdb_api_key=draft.get("osint_abuseipdb_api_key") or base_cfg.abuseipdb_api_key,
+                abusech_api_key=draft.get("osint_abusech_api_key") or base_cfg.abusech_api_key,
+                otx_api_key=draft.get("osint_otx_api_key") or base_cfg.otx_api_key,
+                urlscan_api_key=draft.get("osint_urlscan_api_key") or base_cfg.urlscan_api_key,
+                greynoise_api_key=draft.get("osint_greynoise_api_key") or base_cfg.greynoise_api_key,
+            )
+            with self.log_scope("settings"):
+                res = OSINTClient(cfg, workspace_dir=self.workspace_dir).test_connectivity()
+            msg = (
+                f"OSINT {'OK' if res['ok'] else 'UNREACHABLE'} | "
+                f"DoH: {res['doh_status']} | Shodan: {res['shodan_status']} | "
+                f"Ready: {res['ready_sources']}/{res['total_sources']} sources "
+                f"({res['configured_keys']} optional key(s) set)"
+            )
+            self.set_status(msg)
+            self.append_log(msg, level="INFO" if res["ok"] else "WARNING")
+            self.notify_user(
+                msg,
+                title="OSINT Connectivity",
+                severity="information" if res["ok"] else "warning",
+            )
+        except Exception as exc:
+            self.report_error("Test OSINT Sources", exc)
 
     def on_click(self, event: events.Click) -> None:
         if event.button != 3:
