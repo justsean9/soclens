@@ -45,3 +45,6 @@ brand_sync_state.json
 test_locations*
 brands.csv
 watchlist.csv
+
+# OS Metadata
+.DS_Store
