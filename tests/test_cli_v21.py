@@ -19,6 +19,7 @@ from soclens.secret_stores.base import (
 from soclens.settings import (
     get_effective_setting,
     get_settings_path,
+    load_settings_store,
     parse_vault_secret_map,
     save_profile_settings,
     serialize_vault_secret_map,
@@ -429,7 +430,9 @@ def test_cli_secrets_map_unmap_and_pull_no_plaintext_persisted(
     unmap_out = json.loads(capsys.readouterr().out)
     assert unmap_out["was_mapped"] is True
 
-    stored = json.loads(get_settings_path().read_text(encoding="utf-8"))
+    disk_envelope = json.loads(get_settings_path().read_text(encoding="utf-8"))
+    assert disk_envelope["encrypted"] is True
+    stored = load_settings_store()
     saved_map = parse_vault_secret_map(stored["profiles"]["default"]["vault_secret_map"])
     assert "rf_llm_api_key" not in saved_map
     assert saved_map["rf_api_token"] == "secret_server:1001:rf-api-token"

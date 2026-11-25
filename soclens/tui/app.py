@@ -43,7 +43,12 @@ from soclens.config import (
     suppress_insecure_ssl_warnings,
 )
 from soclens.sentinelone import SentinelOneClient
-from soclens.settings import clear_session_overrides, invalidate_settings_cache
+from soclens.settings import (
+    clear_session_overrides,
+    clear_unlocked_keys,
+    invalidate_settings_cache,
+    is_settings_locked,
+)
 from soclens.tui.image_render import (
     get_recommended_image_viewer_mode,
     get_terminal_probe_result,
@@ -1701,8 +1706,39 @@ class SocLensApp(App[None]):
             self._apply_view_mode_to_ui()
             self._sync_responsive_chrome()
             self._focus_main_tabs()
-        if not self.no_secret_store:
+        if is_settings_locked():
+            self._prompt_settings_unlock()
+        elif not self.no_secret_store:
             self._hydrate_secrets_worker()
+
+    def _prompt_settings_unlock(self) -> None:
+        """Open the master passphrase unlock dialog when settings.json is locked."""
+        if self._shutting_down or not self.is_running:
+            return
+        from soclens.tui.modals import SettingsUnlockModal
+
+        def _on_unlock_result(unlocked: bool | None) -> None:
+            if self._shutting_down or not self.is_running:
+                return
+            if unlocked:
+                self.reload_settings()
+                self.record_log(
+                    "Unlocked encrypted settings.json for active TUI session.",
+                    source="settings",
+                    logger_name="SocLensApp",
+                )
+                if not self.no_secret_store:
+                    self._hydrate_secrets_worker()
+            else:
+                self.record_log(
+                    "Continuing with locked settings.json (environment overrides only). "
+                    "Open [0] Settings -> Profiles & Storage to unlock.",
+                    level="WARNING",
+                    source="settings",
+                    logger_name="SocLensApp",
+                )
+
+        self.push_screen(SettingsUnlockModal(), callback=_on_unlock_result)
 
     @work(thread=True, exit_on_error=False)
     def _hydrate_secrets_worker(self) -> None:
@@ -1817,6 +1853,7 @@ class SocLensApp(App[None]):
         self._shutting_down = True
         self._stop_event.set()
         clear_session_overrides()
+        clear_unlocked_keys(mark_locked=False)
         self._logging_bridge.uninstall()
 
     def compose(self) -> ComposeResult:

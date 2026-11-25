@@ -38,6 +38,7 @@ dependencies = [
     "typing-extensions>=4.7.0",
     "textual>=0.80.0",
     "rich>=13.7.0",
+    "cryptography>=44.0.0",
 ]
 
 [project.optional-dependencies]

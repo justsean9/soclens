@@ -67,6 +67,8 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset(
 EXCLUDED_FILE_NAMES: frozenset[str] = frozenset(
     {
         "apikey.key",
+        ".settings.key",
+        ".soclens_settings.key",
         "settings.json",
         ".soclens_settings.json",
         ".soclens_tui_settings.json",

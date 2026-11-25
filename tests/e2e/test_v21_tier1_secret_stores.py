@@ -27,6 +27,7 @@ from soclens.secret_stores.secret_server import SecretServerProvider
 from soclens.settings import (
     SECRET_MANAGED_SETTING_KEYS,
     get_effective_setting,
+    get_profile_settings,
     parse_vault_secret_map,
     save_profile_settings,
     serialize_vault_secret_map,
@@ -566,7 +567,8 @@ def test_v21_f4_settings_persist_vault_map_only_zero_plaintext_secrets_on_disk(
     if os.name == "posix":
         assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
     raw_disk = settings_path.read_text(encoding="utf-8")
-    profile_data = _active_profile_dict(json.loads(raw_disk))
+    assert json.loads(raw_disk)["encrypted"] is True
+    profile_data = get_profile_settings()
     assert "vault_secret_map" in profile_data
     assert profile_data.get("splunk_app") == "CustomES"
     assert "splunk_password" not in profile_data
@@ -785,7 +787,8 @@ def test_v21_f5_cli_secrets_map_pull_and_unmap(
     assert "e2e-tss-s1-api-token" not in pull_proc.stdout
 
     settings_text = _settings_file_path(v21_workspace).read_text(encoding="utf-8")
-    profile_data = _active_profile_dict(json.loads(settings_text))
+    assert json.loads(settings_text)["encrypted"] is True
+    profile_data = get_profile_settings()
     saved_map = parse_vault_secret_map(profile_data.get("vault_secret_map", ""))
     assert saved_map["rf_api_token"] == "secret_server:1001:rf-api-token"
     assert saved_map["s1_api_token"] == "secret_server:1003:s1-api-token"
@@ -794,9 +797,8 @@ def test_v21_f5_cli_secrets_map_pull_and_unmap(
 
     unmap_proc = run_cli(["secrets", "unmap", "s1_api_token", "--json"])
     assert unmap_proc.returncode == 0, f"stdout={unmap_proc.stdout}\nstderr={unmap_proc.stderr}"
-    profile_after = _active_profile_dict(
-        json.loads(_settings_file_path(v21_workspace).read_text(encoding="utf-8"))
-    )
+    assert json.loads(_settings_file_path(v21_workspace).read_text(encoding="utf-8"))["encrypted"] is True
+    profile_after = get_profile_settings()
     after_map = parse_vault_secret_map(profile_after.get("vault_secret_map", ""))
     assert "s1_api_token" not in after_map
     assert after_map["rf_api_token"] == "secret_server:1001:rf-api-token"
@@ -911,7 +913,8 @@ def test_v21_f5_tui_dynamic_input_to_vault_select_swap_and_save(
             await pilot.pause()
 
             raw_disk = _settings_file_path(v21_workspace).read_text(encoding="utf-8")
-            profile_data = _active_profile_dict(json.loads(raw_disk))
+            assert json.loads(raw_disk)["encrypted"] is True
+            profile_data = get_profile_settings()
             saved_map = parse_vault_secret_map(profile_data.get("vault_secret_map", ""))
             assert saved_map["rf_api_token"] == "hashicorp_vault:soclens/rf:api_token"
             assert "e2e-vault-rf-api-token" not in raw_disk

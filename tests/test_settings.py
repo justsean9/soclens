@@ -111,15 +111,36 @@ def test_atomic_save_permissions_unknown_keys_and_corrupt_recovery(tmp_path: Pat
         assert file_mode == 0o600
         assert (dir_mode & 0o077) == 0
 
-    # Inject unknown top-level and profile keys and verify preservation on merge save
-    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-    raw["custom_future_field"] = {"enabled": True}
-    raw["profiles"]["default"]["future_setting"] = "keep-me"
-    cfg_path.write_text(json.dumps(raw), encoding="utf-8")
+    # Verify settings.json is genuinely encrypted on disk (no plaintext credentials)
+    raw_disk = cfg_path.read_text(encoding="utf-8")
+    assert "secret-123" not in raw_disk
+    assert "CustomApp" not in raw_disk
+    envelope = json.loads(raw_disk)
+    assert envelope["encrypted"] is True
+    assert envelope["cipher"] == "AES-256-GCM"
+
+    # Legacy plaintext v1 file with unknown top-level and profile keys migrates seamlessly
+    legacy_payload = {
+        "schema_version": 1,
+        "active_profile": "default",
+        "custom_future_field": {"enabled": True},
+        "profiles": {
+            "default": {
+                "rf_api_token": "secret-123",
+                "splunk_app": "CustomApp",
+                "future_setting": "keep-me",
+            }
+        },
+    }
+    cfg_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
     settings_mod.invalidate_settings_cache()
 
     settings_mod.save_profile_settings({"splunk_host": "https://splunk:8089"}, settings_path=cfg_path)
-    updated = json.loads(cfg_path.read_text(encoding="utf-8"))
+    migrated_disk = cfg_path.read_text(encoding="utf-8")
+    assert json.loads(migrated_disk)["encrypted"] is True
+    assert "secret-123" not in migrated_disk
+    assert "keep-me" not in migrated_disk
+    updated = settings_mod.load_settings_store(settings_path=cfg_path)
     assert updated["custom_future_field"] == {"enabled": True}
     assert updated["profiles"]["default"]["future_setting"] == "keep-me"
     assert updated["profiles"]["default"]["rf_api_token"] == "secret-123"

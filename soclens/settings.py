@@ -18,11 +18,30 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from soclens.settings_crypto import (
+    ENCRYPTED_SETTINGS_CIPHER,
+    ENCRYPTED_SETTINGS_SCHEMA_VERSION,
+    ENCRYPTION_MODE_OS_KEYSTORE,
+    ENCRYPTION_MODE_PASSPHRASE,
+    MIN_PASSPHRASE_LENGTH,
+    SUPPORTED_ENCRYPTION_MODES,
+    SettingsCryptoError,
+    SettingsDecryptionError,
+    SettingsKeystoreError,
+    SettingsLockedError,
+    clear_unlocked_keys,
+    decrypt_settings_envelope,
+    encrypt_settings_payload,
+    get_env_passphrase,
+    inspect_settings_file_encryption,
+    is_encrypted_envelope,
+)
+
 logger = logging.getLogger("soclens.settings")
 
 APP_CONFIG_DIR_NAME = "soclens"
 SETTINGS_FILENAME = "settings.json"
-SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_SCHEMA_VERSION = ENCRYPTED_SETTINGS_SCHEMA_VERSION
 DEFAULT_PROFILE = "default"
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -912,15 +931,46 @@ def _stat_signature(path: Path) -> tuple[int, int] | None:
         return None
 
 
+def _read_raw_settings_json(target: Path) -> Any:
+    raw_text = target.read_text(encoding="utf-8")
+    return json.loads(raw_text) if raw_text.strip() else {}
+
+
+def _load_store_for_mutation(
+    target: Path,
+    *,
+    passphrase: str | None = None,
+) -> dict[str, Any]:
+    """Load the store for mutation, refusing to overwrite locked or undecryptable files."""
+    if not target.is_file():
+        return _default_store()
+
+    try:
+        parsed = _read_raw_settings_json(target)
+    except Exception as exc:
+        logger.warning("Failed to parse non-encrypted settings file '%s' before save: %s", target, exc)
+        return _default_store()
+
+    if is_encrypted_envelope(parsed):
+        decrypted = decrypt_settings_envelope(
+            parsed,
+            settings_path=target,
+            passphrase=passphrase,
+        )
+        return _normalize_store(decrypted)
+
+    return _normalize_store(parsed)
+
+
 def load_settings_store(settings_path: Path | str | None = None) -> dict[str, Any]:
-    """Load the per-user settings store (with mtime caching and corrupt-file resilience)."""
+    """Load the per-user settings store (with mtime caching, decryption, and resilience)."""
     target = get_settings_path(settings_path)
     key = _cache_key(target)
 
     with _STORE_LOCK:
         sig = _stat_signature(target)
         cached = _CACHE.get(key)
-        if cached is not None and cached[0] == sig:
+        if cached is not None and cached[0] == sig and cached[2] is None:
             return copy.deepcopy(cached[1])
 
         if sig is None:
@@ -930,10 +980,23 @@ def load_settings_store(settings_path: Path | str | None = None) -> dict[str, An
             return default_data
 
         load_error: str | None = None
+        cache_result = True
         try:
-            raw_text = target.read_text(encoding="utf-8")
-            parsed = json.loads(raw_text) if raw_text.strip() else {}
-            normalized = _normalize_store(parsed)
+            parsed = _read_raw_settings_json(target)
+            if is_encrypted_envelope(parsed):
+                decrypted = decrypt_settings_envelope(parsed, settings_path=target)
+                normalized = _normalize_store(decrypted)
+            else:
+                normalized = _normalize_store(parsed)
+        except SettingsLockedError as exc:
+            load_error = str(exc)
+            cache_result = False
+            normalized = _default_store()
+        except SettingsCryptoError as exc:
+            load_error = f"Failed to decrypt settings file '{target}': {exc}"
+            logger.warning("%s", load_error)
+            cache_result = False
+            normalized = _default_store()
         except Exception as exc:
             load_error = f"Failed to parse settings file '{target}': {exc}"
             logger.warning("%s", load_error)
@@ -943,12 +1006,23 @@ def load_settings_store(settings_path: Path | str | None = None) -> dict[str, An
             _LAST_ERRORS[key] = load_error
         else:
             _LAST_ERRORS.pop(key, None)
-        _CACHE[key] = (sig, copy.deepcopy(normalized), load_error)
+        if cache_result:
+            _CACHE[key] = (sig, copy.deepcopy(normalized), load_error)
+        else:
+            _CACHE.pop(key, None)
         return normalized
 
 
-def _write_store_atomic(target: Path, store: dict[str, Any]) -> None:
-    """Write ``store`` atomically with owner-only file permissions where supported."""
+def _write_store_atomic(
+    target: Path,
+    store: dict[str, Any],
+    *,
+    mode: str | None = None,
+    passphrase: str | None = None,
+    reuse_existing_dek: bool = True,
+    rotate_kek: bool = False,
+) -> None:
+    """Encrypt and write ``store`` atomically with owner-only file permissions where supported."""
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -957,7 +1031,18 @@ def _write_store_atomic(target: Path, store: dict[str, Any]) -> None:
         except OSError:
             pass
 
-    serialized = json.dumps(store, indent=2, ensure_ascii=False) + "\n"
+    store_to_encrypt = copy.deepcopy(store)
+    store_to_encrypt["schema_version"] = SETTINGS_SCHEMA_VERSION
+    envelope = encrypt_settings_payload(
+        store_to_encrypt,
+        settings_path=target,
+        mode=mode,
+        passphrase=passphrase,
+        reuse_existing_dek=reuse_existing_dek,
+        rotate_kek=rotate_kek,
+    )
+
+    serialized = json.dumps(envelope, indent=2, ensure_ascii=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=str(parent))
     tmp_path = Path(tmp_name)
     try:
@@ -991,7 +1076,143 @@ def _write_store_atomic(target: Path, store: dict[str, Any]) -> None:
     sig = _stat_signature(target)
     with _STORE_LOCK:
         _LAST_ERRORS.pop(key, None)
-        _CACHE[key] = (sig, copy.deepcopy(store), None)
+        _CACHE[key] = (sig, copy.deepcopy(store_to_encrypt), None)
+
+
+def inspect_settings_encryption(settings_path: Path | str | None = None) -> dict[str, Any]:
+    """Inspect encryption mode, backend, and lock state for ``settings_path`` without unlocking."""
+    target = get_settings_path(settings_path)
+    return inspect_settings_file_encryption(target)
+
+
+def is_settings_locked(settings_path: Path | str | None = None) -> bool:
+    """Return True if ``settings_path`` is passphrase-encrypted and currently locked."""
+    info = inspect_settings_encryption(settings_path)
+    return bool(info.get("locked", False))
+
+
+def unlock_settings(
+    passphrase: str | None = None,
+    *,
+    settings_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Unlock a passphrase-protected settings file into process-local memory."""
+    target = get_settings_path(settings_path)
+    key = _cache_key(target)
+    with _STORE_LOCK:
+        if not target.is_file():
+            default_data = _default_store()
+            _LAST_ERRORS.pop(key, None)
+            _CACHE[key] = (None, copy.deepcopy(default_data), None)
+            return default_data
+
+        parsed = _read_raw_settings_json(target)
+        if is_encrypted_envelope(parsed):
+            eff_passphrase = passphrase if passphrase is not None else get_env_passphrase()
+            decrypted = decrypt_settings_envelope(
+                parsed,
+                settings_path=target,
+                passphrase=eff_passphrase,
+                allow_env_passphrase=False,
+            )
+            normalized = _normalize_store(decrypted)
+        else:
+            normalized = _normalize_store(parsed)
+
+        sig = _stat_signature(target)
+        _LAST_ERRORS.pop(key, None)
+        _CACHE[key] = (sig, copy.deepcopy(normalized), None)
+        return normalized
+
+
+def lock_settings(settings_path: Path | str | None = None) -> bool:
+    """Clear in-memory decrypted settings and encryption keys for ``settings_path`` (or all paths)."""
+    with _STORE_LOCK:
+        if settings_path is None:
+            clear_unlocked_keys(None, mark_locked=True)
+            _CACHE.clear()
+            _LAST_ERRORS.clear()
+            return is_settings_locked()
+
+        target = get_settings_path(settings_path)
+        key = _cache_key(target)
+        clear_unlocked_keys(target, mark_locked=True)
+        _CACHE.pop(key, None)
+        _LAST_ERRORS.pop(key, None)
+        return is_settings_locked(target)
+
+
+def encrypt_settings_store(
+    *,
+    mode: str = ENCRYPTION_MODE_OS_KEYSTORE,
+    passphrase: str | None = None,
+    current_passphrase: str | None = None,
+    settings_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Encrypt legacy plaintext settings or switch between ``os_keystore`` and ``passphrase`` mode."""
+    target_mode = mode.strip().lower()
+    if target_mode not in SUPPORTED_ENCRYPTION_MODES:
+        raise ValueError(
+            f"Unsupported encryption mode {mode!r}. Expected one of: {', '.join(SUPPORTED_ENCRYPTION_MODES)}."
+        )
+    if target_mode == ENCRYPTION_MODE_PASSPHRASE:
+        eff_pass = passphrase if passphrase is not None else get_env_passphrase()
+        if not eff_pass or len(eff_pass) < MIN_PASSPHRASE_LENGTH:
+            raise ValueError(
+                f"Master passphrase must be at least {MIN_PASSPHRASE_LENGTH} characters long."
+            )
+    else:
+        eff_pass = None
+
+    target = get_settings_path(settings_path)
+    with _STORE_LOCK:
+        store = _load_store_for_mutation(target, passphrase=current_passphrase)
+        _write_store_atomic(
+            target,
+            store,
+            mode=target_mode,
+            passphrase=eff_pass,
+            reuse_existing_dek=False,
+        )
+    return get_settings_storage_info(target)
+
+
+def rotate_settings_key(
+    *,
+    passphrase: str | None = None,
+    new_passphrase: str | None = None,
+    rotate_kek: bool = False,
+    settings_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Rotate the per-file AES-256-GCM DEK (and optionally passphrase or OS master KEK)."""
+    target = get_settings_path(settings_path)
+    with _STORE_LOCK:
+        enc_info = inspect_settings_file_encryption(target)
+        store = _load_store_for_mutation(target, passphrase=passphrase)
+
+        if new_passphrase is not None:
+            target_mode = ENCRYPTION_MODE_PASSPHRASE
+            eff_new_pass: str | None = new_passphrase
+        elif enc_info.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE:
+            target_mode = ENCRYPTION_MODE_PASSPHRASE
+            eff_new_pass = passphrase if passphrase is not None else get_env_passphrase()
+            if not eff_new_pass:
+                raise ValueError(
+                    "Current or new master passphrase is required to rotate key in passphrase mode."
+                )
+        else:
+            target_mode = ENCRYPTION_MODE_OS_KEYSTORE
+            eff_new_pass = None
+
+        _write_store_atomic(
+            target,
+            store,
+            mode=target_mode,
+            passphrase=eff_new_pass,
+            reuse_existing_dek=False,
+            rotate_kek=rotate_kek,
+        )
+    return get_settings_storage_info(target)
 
 
 def get_active_profile_name(settings_path: Path | str | None = None) -> str:
@@ -1042,12 +1263,17 @@ def save_profile_settings(
     """Merge or replace settings for ``profile`` and persist atomically."""
     target = get_settings_path(settings_path)
     with _STORE_LOCK:
-        store = load_settings_store(target)
-        prof_name = (
-            validate_profile_name(profile)
-            if profile is not None
-            else get_active_profile_name(target)
-        )
+        store = _load_store_for_mutation(target)
+        env_profile = _clean_str(os.environ.get("SOCLENS_PROFILE"))
+        if profile is not None:
+            prof_name = validate_profile_name(profile)
+        elif env_profile:
+            try:
+                prof_name = validate_profile_name(env_profile)
+            except ValueError:
+                prof_name = str(store.get("active_profile") or DEFAULT_PROFILE)
+        else:
+            prof_name = str(store.get("active_profile") or DEFAULT_PROFILE)
         profiles: dict[str, dict[str, str]] = store.setdefault("profiles", {})
         if DEFAULT_PROFILE not in profiles:
             profiles[DEFAULT_PROFILE] = {}
@@ -1085,7 +1311,7 @@ def set_active_profile(
     prof_name = validate_profile_name(profile)
     target = get_settings_path(settings_path)
     with _STORE_LOCK:
-        store = load_settings_store(target)
+        store = _load_store_for_mutation(target)
         profiles: dict[str, dict[str, str]] = store.setdefault("profiles", {})
         if prof_name not in profiles:
             if not create:
@@ -1107,7 +1333,7 @@ def delete_profile(
         raise ValueError("Cannot delete the built-in 'default' profile.")
     target = get_settings_path(settings_path)
     with _STORE_LOCK:
-        store = load_settings_store(target)
+        store = _load_store_for_mutation(target)
         profiles: dict[str, dict[str, str]] = store.setdefault("profiles", {})
         if prof_name not in profiles:
             raise KeyError(f"Profile '{prof_name}' does not exist.")
@@ -1128,11 +1354,18 @@ def clear_profile_settings(
 
 
 def get_settings_storage_info(settings_path: Path | str | None = None) -> dict[str, Any]:
-    """Return path, existence, permission posture, and profile metadata."""
+    """Return path, existence, permission posture, encryption metadata, and profile info."""
     target = get_settings_path(settings_path)
     active = get_active_profile_name(target)
     profiles = list_profiles(target)
+    enc = inspect_settings_file_encryption(target)
+    load_error = get_last_load_error(target)
     exists = target.is_file()
+    is_locked = bool(enc.get("locked", False)) or (
+        enc.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE
+        and load_error is not None
+        and "decrypt" in load_error.lower()
+    )
 
     if exists:
         if os.name == "nt":
@@ -1158,7 +1391,16 @@ def get_settings_storage_info(settings_path: Path | str | None = None) -> dict[s
         "profiles": profiles,
         "profile_count": len(profiles),
         "env_override_profile": _clean_str(os.environ.get("SOCLENS_PROFILE")),
-        "load_error": get_last_load_error(target),
+        "load_error": load_error,
+        "encrypted": bool(enc.get("encrypted", False)),
+        "schema_version": enc.get("schema_version"),
+        "cipher": enc.get("cipher") or (ENCRYPTED_SETTINGS_CIPHER if enc.get("encrypted") else None),
+        "encryption_mode": str(enc.get("encryption_mode") or ENCRYPTION_MODE_OS_KEYSTORE),
+        "key_backend": str(enc.get("key_backend") or "none"),
+        "key_backend_label": str(enc.get("key_backend_label") or ""),
+        "locked": is_locked,
+        "legacy_plaintext": bool(enc.get("legacy_plaintext", False)),
+        "encryption_summary": str(enc.get("encryption_summary") or ""),
     }
 
 
@@ -1700,21 +1942,33 @@ def describe_all_settings(
 __all__ = [
     "APP_CONFIG_DIR_NAME",
     "DEFAULT_PROFILE",
+    "ENCRYPTED_SETTINGS_CIPHER",
+    "ENCRYPTED_SETTINGS_SCHEMA_VERSION",
+    "ENCRYPTION_MODE_OS_KEYSTORE",
+    "ENCRYPTION_MODE_PASSPHRASE",
+    "MIN_PASSPHRASE_LENGTH",
     "SECRET_MANAGED_SETTING_KEYS",
     "SETTING_CATEGORIES",
     "SETTING_SPECS",
     "SETTING_SPECS_BY_KEY",
     "SETTINGS_FILENAME",
     "SETTINGS_SCHEMA_VERSION",
+    "SUPPORTED_ENCRYPTION_MODES",
     "SUPPORTED_SECRET_PROVIDERS",
     "SettingSpec",
+    "SettingsCryptoError",
+    "SettingsDecryptionError",
+    "SettingsKeystoreError",
+    "SettingsLockedError",
     "TSS_AUTH_MODES",
     "VAULT_AUTH_MODES",
     "clear_profile_settings",
     "clear_session_overrides",
+    "clear_unlocked_keys",
     "collect_env_importable_settings",
     "delete_profile",
     "describe_all_settings",
+    "encrypt_settings_store",
     "format_setting_display",
     "get_active_profile_name",
     "get_effective_setting",
@@ -1725,19 +1979,24 @@ __all__ = [
     "get_setting_with_source",
     "get_settings_path",
     "get_settings_storage_info",
+    "inspect_settings_encryption",
     "invalidate_settings_cache",
+    "is_settings_locked",
     "is_vault_hydrated_setting",
     "list_profiles",
     "load_settings_store",
+    "lock_settings",
     "mask_secret",
     "parse_s1_site_tenant_map",
     "parse_s1_tier_rules",
     "parse_vault_secret_map",
     "resolve_setting_key",
+    "rotate_settings_key",
     "save_profile_settings",
     "serialize_vault_secret_map",
     "set_active_profile",
     "set_session_overrides",
+    "unlock_settings",
     "validate_profile_name",
     "validate_settings_values",
 ]

@@ -690,8 +690,11 @@ def test_t3_v21_06_es_notes_rf_dual_post_and_saved_views_persistence(
             await pilot.click("#es-saved-view-save-btn")
             await pilot.pause()
 
+            from soclens.settings import get_profile_settings
+
             saved_raw = _settings_path().read_text(encoding="utf-8")
-            assert "Tenant 1001 Queue" in saved_raw
+            assert json.loads(saved_raw)["encrypted"] is True
+            assert "Tenant 1001 Queue" in (get_profile_settings().get("splunk_es_saved_views") or "")
 
             table = pane.query_one("#es-table", DoubleClickDataTable)
             _select_table_row_containing(table, pane._displayed_rows, "fnd-1001-b")
@@ -1059,9 +1062,13 @@ def test_t3_v21_10_settings_pane_cat_secrets_dynamic_swap_and_offline_fallback(
             await app.workers.wait_for_complete()
             await pilot.pause()
 
+            from soclens.settings import get_profile_settings
+
             saved_text = _settings_path().read_text(encoding="utf-8")
-            assert "hashicorp_vault:soclens/splunk:token" in saved_text
-            assert "hashicorp_vault:soclens/edr:s1_api_token" in saved_text
+            assert json.loads(saved_text)["encrypted"] is True
+            saved_vault_map = get_profile_settings().get("vault_secret_map") or ""
+            assert "hashicorp_vault:soclens/splunk:token" in saved_vault_map
+            assert "hashicorp_vault:soclens/edr:s1_api_token" in saved_vault_map
             _assert_settings_0600_and_secret_free(
                 ["e2e-vault-rf-api-token", "e2e-vault-splunk-token", "e2e-vault-s1-api-token"]
             )

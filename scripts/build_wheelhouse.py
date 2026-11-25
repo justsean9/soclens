@@ -32,6 +32,8 @@ MANIFEST_FILENAME = "WHEELHOUSE_MANIFEST.json"
 REQUIREMENTS_FILENAME = "requirements.txt"
 
 _MACOSX_VERSION_RE = re.compile(r"macosx_(\d+)_(\d+)")
+_MANYLINUX_VERSION_RE = re.compile(r"manylinux_(\d+)_(\d+)")
+_ABI3_CP_RE = re.compile(r"-cp(\d)(\d+)-abi3-")
 _EXTRA_MARKER_RE = re.compile(r";\s*.*\bextra\s*==", re.IGNORECASE)
 
 
@@ -168,11 +170,30 @@ def _py_tag_for_version(py_ver: str) -> str:
     return f"cp{parts[0]}{parts[1]}"
 
 
-def _macosx_version_key(filename: str) -> tuple[int, int, str]:
+def _macosx_version_key(filename: str) -> tuple[int, int, int, str]:
+    arch_rank = 0 if filename.endswith("_arm64.whl") else 1
     match = _MACOSX_VERSION_RE.search(filename)
     if match:
-        return (int(match.group(1)), int(match.group(2)), filename)
+        return (arch_rank, int(match.group(1)), int(match.group(2)), filename)
+    return (arch_rank, 999, 999, filename)
+
+
+def _manylinux_compat_key(filename: str) -> tuple[int, int, str]:
+    """Sort Linux wheels with the broadest glibc compatibility (lowest floor) first."""
+    if "manylinux2014" in filename:
+        return (2, 17, filename)
+    matches = _MANYLINUX_VERSION_RE.findall(filename)
+    if matches:
+        maj, minor = min((int(a), int(b)) for a, b in matches)
+        return (maj, minor, filename)
     return (999, 999, filename)
+
+
+def _abi3_min_version(filename: str) -> tuple[int, int] | None:
+    match = _ABI3_CP_RE.search(filename)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
 
 
 def _match_native_wheel(
@@ -182,28 +203,41 @@ def _match_native_wheel(
     platform_tag: str,
 ) -> dict[str, Any]:
     cp_tag = _py_tag_for_version(py_ver)
+    target_py = tuple(int(p) for p in py_ver.split("."))
     exact_cp = f"-{cp_tag}-{cp_tag}-"
     free_thread_marker = f"-{cp_tag}t-"
 
-    candidates: list[dict[str, Any]] = []
+    def _matches_platform(filename: str) -> bool:
+        if platform_tag == "win_amd64":
+            return filename.endswith("-win_amd64.whl")
+        if platform_tag == "linux_x86_64":
+            return "manylinux" in filename and filename.endswith("_x86_64.whl")
+        if platform_tag == "macosx_arm64":
+            return "macosx_" in filename and (
+                filename.endswith("_arm64.whl") or filename.endswith("_universal2.whl")
+            )
+        raise ValueError(f"Unsupported target platform tag: {platform_tag!r}")
+
+    exact_candidates: list[dict[str, Any]] = []
+    abi3_candidates: list[tuple[tuple[int, int], dict[str, Any]]] = []
     for entry in wheels:
         url = str(entry.get("url") or "")
         filename = url.rsplit("/", 1)[-1]
         if free_thread_marker in filename or "abi3t" in filename:
             continue
-        if exact_cp not in filename:
+        if not _matches_platform(filename):
             continue
-        if platform_tag == "win_amd64":
-            if filename.endswith("-win_amd64.whl"):
-                candidates.append(entry)
-        elif platform_tag == "linux_x86_64":
-            if "manylinux" in filename and filename.endswith("_x86_64.whl"):
-                candidates.append(entry)
-        elif platform_tag == "macosx_arm64":
-            if "macosx_" in filename and filename.endswith("_arm64.whl"):
-                candidates.append(entry)
-        else:
-            raise ValueError(f"Unsupported target platform tag: {platform_tag!r}")
+        if exact_cp in filename:
+            exact_candidates.append(entry)
+            continue
+        abi3_ver = _abi3_min_version(filename)
+        if abi3_ver is not None and abi3_ver <= target_py:
+            abi3_candidates.append((abi3_ver, entry))
+
+    candidates = exact_candidates
+    if not candidates and abi3_candidates:
+        highest_abi3 = max(ver for ver, _ in abi3_candidates)
+        candidates = [entry for ver, entry in abi3_candidates if ver == highest_abi3]
 
     if not candidates:
         raise RuntimeError(
@@ -213,6 +247,10 @@ def _match_native_wheel(
 
     if platform_tag == "macosx_arm64" and len(candidates) > 1:
         candidates.sort(key=lambda w: _macosx_version_key(str(w["url"]).rsplit("/", 1)[-1]))
+        return candidates[0]
+
+    if platform_tag == "linux_x86_64" and len(candidates) > 1:
+        candidates.sort(key=lambda w: _manylinux_compat_key(str(w["url"]).rsplit("/", 1)[-1]))
         return candidates[0]
 
     if len(candidates) > 1:

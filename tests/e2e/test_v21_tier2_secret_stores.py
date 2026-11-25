@@ -33,6 +33,7 @@ from soclens.settings import (
     SETTING_SPECS_BY_KEY,
     clear_session_overrides,
     get_effective_setting,
+    get_profile_settings,
     get_setting_with_source,
     mask_secret,
     parse_vault_secret_map,
@@ -719,9 +720,10 @@ def test_v21_f4_zero_disk_token_persistence_on_save_and_hydration(
         }
     )
     raw_disk = settings_path.read_text(encoding="utf-8")
+    assert json.loads(raw_disk)["encrypted"] is True
     for secret_val in plaintext_vals:
         assert secret_val and secret_val not in raw_disk
-    assert "vault_secret_map" in raw_disk
+    assert "vault_secret_map" in get_profile_settings()
 
 
 @pytest.mark.feature("V21-F4")

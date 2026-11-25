@@ -19,6 +19,8 @@ from soclens.tui.modals import (
     CreateCaseModal,
     SaveFilterPresetModal,
     ScreenshotViewerModal,
+    SettingsPassphraseModal,
+    SettingsUnlockModal,
     SplunkNotableTriageModal,
     TriageItemModal,
 )
@@ -35,6 +37,8 @@ __all__ = [
     "SocLensApp",
     "SaveFilterPresetModal",
     "ScreenshotViewerModal",
+    "SettingsPassphraseModal",
+    "SettingsUnlockModal",
     "SplunkNotableTriageModal",
     "TriageItemModal",
     "USER_VIEW_TABS",

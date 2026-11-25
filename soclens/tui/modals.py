@@ -2657,6 +2657,287 @@ class OSINTSourcesModal(ModalScreen[dict[str, Any] | None]):
         self.dismiss(None)
 
 
+class SettingsUnlockModal(ModalScreen[bool]):
+    """Modal dialog to unlock a master-passphrase-encrypted settings.json file."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS: ClassVar[str] = """
+    SettingsUnlockModal {
+        align: center middle;
+        background: $background 65%;
+    }
+    #unlock-modal-box {
+        width: 72;
+        max-width: 92%;
+        height: auto;
+        border: solid $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #unlock-modal-title {
+        text-style: bold;
+        color: $text;
+        margin-bottom: 1;
+    }
+    #unlock-modal-info {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #unlock-modal-error {
+        color: $error;
+        margin-top: 1;
+        display: none;
+    }
+    #unlock-modal-error.visible {
+        display: block;
+    }
+    #unlock-modal-buttons {
+        height: auto;
+        align-horizontal: right;
+        margin-top: 1;
+    }
+    #unlock-modal-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, *, settings_path: Path | str | None = None) -> None:
+        super().__init__()
+        self._settings_path = settings_path
+
+    def compose(self) -> ComposeResult:
+        from soclens.settings import get_settings_path
+
+        resolved = get_settings_path(self._settings_path)
+        with Vertical(id="unlock-modal-box"):
+            yield Static("Unlock Encrypted Settings (AES-256-GCM)", id="unlock-modal-title", markup=False)
+            yield Static(
+                f"Settings file: {resolved}\n"
+                "Enter your master passphrase to decrypt saved profiles and credentials "
+                "for this TUI session.",
+                id="unlock-modal-info",
+                markup=False,
+            )
+            yield Input(
+                value="",
+                password=True,
+                placeholder="Master passphrase...",
+                id="unlock-passphrase-input",
+                compact=True,
+            )
+            yield Static("", id="unlock-modal-error", markup=False)
+            with Horizontal(id="unlock-modal-buttons"):
+                yield Button("Continue Locked (Env Only)", id="unlock-cancel-btn", compact=True)
+                yield Button("Unlock", id="unlock-submit-btn", variant="primary", compact=True)
+
+    def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
+        with contextlib.suppress(Exception):
+            self.query_one("#unlock-passphrase-input", Input).focus()
+
+    def _show_error(self, message: str) -> None:
+        err_lbl = self.query_one("#unlock-modal-error", Static)
+        err_lbl.update(message)
+        err_lbl.add_class("visible")
+
+    def _attempt_unlock(self) -> None:
+        from soclens.settings import SettingsCryptoError, unlock_settings
+
+        inp = self.query_one("#unlock-passphrase-input", Input)
+        passphrase = inp.value
+        if not passphrase:
+            self._show_error("Please enter your master passphrase.")
+            inp.focus()
+            return
+        try:
+            unlock_settings(passphrase=passphrase, settings_path=self._settings_path)
+        except SettingsCryptoError as exc:
+            self._show_error(str(exc))
+            inp.value = ""
+            inp.focus()
+            return
+        self.dismiss(True)
+
+    @on(Input.Submitted, "#unlock-passphrase-input")
+    def handle_passphrase_submitted(self) -> None:
+        self._attempt_unlock()
+
+    @on(Button.Pressed, "#unlock-submit-btn")
+    def handle_submit_pressed(self) -> None:
+        self._attempt_unlock()
+
+    @on(Button.Pressed, "#unlock-cancel-btn")
+    def handle_cancel_pressed(self) -> None:
+        self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        """Dismiss the unlock dialog and continue with environment variables only."""
+        self.dismiss(False)
+
+
+class SettingsPassphraseModal(ModalScreen[dict[str, str] | None]):
+    """Modal dialog to enable or change the settings.json Master Passphrase."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS: ClassVar[str] = """
+    SettingsPassphraseModal {
+        align: center middle;
+        background: $background 65%;
+    }
+    #passphrase-modal-box {
+        width: 76;
+        max-width: 92%;
+        height: auto;
+        border: solid $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #passphrase-modal-title {
+        text-style: bold;
+        color: $text;
+        margin-bottom: 1;
+    }
+    #passphrase-modal-info {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    .passphrase-field-label {
+        margin-top: 1;
+        text-style: bold;
+        color: $text;
+    }
+    #passphrase-modal-error {
+        color: $error;
+        margin-top: 1;
+        display: none;
+    }
+    #passphrase-modal-error.visible {
+        display: block;
+    }
+    #passphrase-modal-buttons {
+        height: auto;
+        align-horizontal: right;
+        margin-top: 1;
+    }
+    #passphrase-modal-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        require_current: bool = False,
+        title: str = "Set Master Passphrase",
+    ) -> None:
+        super().__init__()
+        self._require_current = require_current
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        from soclens.settings import MIN_PASSPHRASE_LENGTH
+
+        with Vertical(id="passphrase-modal-box"):
+            yield Static(self._title, id="passphrase-modal-title", markup=False)
+            yield Static(
+                f"Encrypts all profiles and settings with AES-256-GCM + Scrypt.\n"
+                f"Minimum length: {MIN_PASSPHRASE_LENGTH} characters. No recovery key is stored — "
+                "store your passphrase safely (or export SOCLENS_SETTINGS_PASSPHRASE for automation).",
+                id="passphrase-modal-info",
+                markup=False,
+            )
+            if self._require_current:
+                yield Static("Current Master Passphrase", classes="passphrase-field-label", markup=False)
+                yield Input(
+                    value="",
+                    password=True,
+                    placeholder="Enter current master passphrase...",
+                    id="passphrase-current-input",
+                    compact=True,
+                )
+            yield Static("New Master Passphrase", classes="passphrase-field-label", markup=False)
+            yield Input(
+                value="",
+                password=True,
+                placeholder=f"At least {MIN_PASSPHRASE_LENGTH} characters...",
+                id="passphrase-new-input",
+                compact=True,
+            )
+            yield Static("Confirm New Passphrase", classes="passphrase-field-label", markup=False)
+            yield Input(
+                value="",
+                password=True,
+                placeholder="Re-enter new master passphrase...",
+                id="passphrase-confirm-input",
+                compact=True,
+            )
+            yield Static("", id="passphrase-modal-error", markup=False)
+            with Horizontal(id="passphrase-modal-buttons"):
+                yield Button("Cancel", id="passphrase-cancel-btn", compact=True)
+                yield Button("Encrypt & Save", id="passphrase-submit-btn", variant="primary", compact=True)
+
+    def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
+        first_id = "#passphrase-current-input" if self._require_current else "#passphrase-new-input"
+        with contextlib.suppress(Exception):
+            self.query_one(first_id, Input).focus()
+
+    def _show_error(self, message: str) -> None:
+        err_lbl = self.query_one("#passphrase-modal-error", Static)
+        err_lbl.update(message)
+        err_lbl.add_class("visible")
+
+    def _submit(self) -> None:
+        from soclens.settings import MIN_PASSPHRASE_LENGTH
+
+        current = ""
+        if self._require_current:
+            current = self.query_one("#passphrase-current-input", Input).value
+            if not current:
+                self._show_error("Current master passphrase is required.")
+                self.query_one("#passphrase-current-input", Input).focus()
+                return
+
+        new_pw = self.query_one("#passphrase-new-input", Input).value
+        confirm_pw = self.query_one("#passphrase-confirm-input", Input).value
+        if len(new_pw) < MIN_PASSPHRASE_LENGTH:
+            self._show_error(
+                f"Master passphrase must be at least {MIN_PASSPHRASE_LENGTH} characters long."
+            )
+            self.query_one("#passphrase-new-input", Input).focus()
+            return
+        if new_pw != confirm_pw:
+            self._show_error("New passphrases do not match.")
+            self.query_one("#passphrase-confirm-input", Input).value = ""
+            self.query_one("#passphrase-confirm-input", Input).focus()
+            return
+        self.dismiss({"current_passphrase": current, "new_passphrase": new_pw})
+
+    @on(Input.Submitted, "#passphrase-confirm-input")
+    def handle_confirm_submitted(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#passphrase-submit-btn")
+    def handle_submit_pressed(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#passphrase-cancel-btn")
+    def handle_cancel_pressed(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        """Close the passphrase dialog without modifying encryption settings."""
+        self.dismiss(None)
+
+
 __all__ = [
     "ConfirmActionModal",
     "ContextMenuModal",
@@ -2668,6 +2949,8 @@ __all__ = [
     "S1ThreatTriageModal",
     "SaveFilterPresetModal",
     "ScreenshotViewerModal",
+    "SettingsPassphraseModal",
+    "SettingsUnlockModal",
     "SplunkNotableTriageModal",
     "TimezoneModal",
     "TriageItemModal",

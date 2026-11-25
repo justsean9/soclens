@@ -47,26 +47,34 @@ from soclens.secret_stores.base import SECRET_PROVIDER_LABELS, SecretCatalogEntr
 from soclens.sentinelone import SentinelOneClient
 from soclens.settings import (
     DEFAULT_PROFILE,
+    ENCRYPTION_MODE_OS_KEYSTORE,
+    ENCRYPTION_MODE_PASSPHRASE,
     SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS,
     SETTING_SPECS_BY_KEY,
     SUPPORTED_SECRET_PROVIDERS,
     TSS_AUTH_MODES,
     VAULT_AUTH_MODES,
+    SettingsCryptoError,
+    SettingsLockedError,
     clear_profile_settings,
     clear_session_overrides,
     collect_env_importable_settings,
     delete_profile,
+    encrypt_settings_store,
     get_active_profile_name,
     get_env_override_for_setting,
     get_profile_settings,
     get_session_override,
     get_setting_with_source,
     get_settings_storage_info,
+    is_settings_locked,
     is_vault_hydrated_setting,
     list_profiles,
+    lock_settings,
     mask_secret,
     parse_vault_secret_map,
+    rotate_settings_key,
     save_profile_settings,
     serialize_vault_secret_map,
     set_active_profile,
@@ -914,6 +922,45 @@ class SettingsPane(BaseSocPane):
                             classes="info-box",
                             markup=False,
                         )
+                        yield Static(
+                            "Storage Encryption (AES-256-GCM)",
+                            classes="section-label",
+                            markup=False,
+                        )
+                        yield Static(
+                            "",
+                            id="settings-encryption-status",
+                            classes="info-box",
+                            markup=False,
+                        )
+                        with Horizontal(classes="action-row toolbar-row"):
+                            yield Button(
+                                "Unlock Settings",
+                                id="settings-unlock-btn",
+                                variant="primary",
+                                compact=True,
+                            )
+                            yield Button(
+                                "Lock Now",
+                                id="settings-lock-btn",
+                                compact=True,
+                            )
+                            yield Button(
+                                "Rotate Key",
+                                id="settings-rekey-btn",
+                                compact=True,
+                            )
+                        with Horizontal(classes="action-row toolbar-row"):
+                            yield Button(
+                                "Set / Change Passphrase",
+                                id="settings-set-passphrase-btn",
+                                compact=True,
+                            )
+                            yield Button(
+                                "Use OS Keystore",
+                                id="settings-use-os-keystore-btn",
+                                compact=True,
+                            )
 
                     with VerticalScroll(id="cat-secrets", classes="settings-cat-scroll"):
                         yield Static(
@@ -1824,9 +1871,11 @@ class SettingsPane(BaseSocPane):
             if env_hits
             else "Shell Env Overrides: None"
         )
+        enc_summary = str(info.get("encryption_summary") or "Unknown")
         summary = (
             f"Active Profile: {info['active_profile']} ({info['profile_count']} total) | "
             f"File: {info['path']} [{info['permissions']}]\n"
+            f"Storage: {enc_summary}\n"
             f"RF Token: {'Set (' + rf_src + ')' if rf_val else 'Missing'} | "
             f"Splunk: {'Configured' if sp_cfg.has_auth else 'Missing'} | "
             f"SentinelOne: {'Configured' if s1_cfg.has_auth else 'Missing'} | "
@@ -1840,10 +1889,13 @@ class SettingsPane(BaseSocPane):
         except Exception:
             pass
 
+        lock_label = "LOCKED (Passphrase Required)" if info.get("locked") else "Unlocked"
         details = (
             f"Settings File : {info['path']}\n"
             f"File Exists   : {'Yes' if info['exists'] else 'No (will be created on first save)'}\n"
             f"Permissions   : {info['permissions']}\n"
+            f"Encryption    : {enc_summary}\n"
+            f"Lock State    : {lock_label}\n"
             f"Active Profile: {info['active_profile']}\n"
             f"All Profiles  : {', '.join(info['profiles'])}\n"
             f"Env Profile   : {info['env_override_profile'] or 'None (SOCLENS_PROFILE unset)'}\n"
@@ -1851,6 +1903,30 @@ class SettingsPane(BaseSocPane):
         )
         try:
             self.query_one("#settings-storage-details", Static).update(details)
+        except Exception:
+            pass
+
+        enc_mode = str(info.get("encryption_mode") or ENCRYPTION_MODE_OS_KEYSTORE)
+        is_locked = bool(info.get("locked", False))
+        is_passphrase = enc_mode == ENCRYPTION_MODE_PASSPHRASE
+        enc_details = (
+            f"Status  : {enc_summary}\n"
+            f"Cipher  : {info.get('cipher') or 'AES-256-GCM (on save)'}\n"
+            f"Mode    : {enc_mode} ({info.get('key_backend_label') or 'auto'})\n"
+            f"CLI/Env : Set SOCLENS_SETTINGS_PASSPHRASE (or SOCLENS_SETTINGS_PASSPHRASE_FILE) "
+            "for non-interactive unlock in Master Passphrase mode."
+        )
+        try:
+            self.query_one("#settings-encryption-status", Static).update(enc_details)
+        except Exception:
+            pass
+        try:
+            self.query_one("#settings-unlock-btn", Button).disabled = not is_locked
+            self.query_one("#settings-lock-btn", Button).disabled = not (is_passphrase and not is_locked)
+            self.query_one("#settings-use-os-keystore-btn", Button).disabled = (
+                enc_mode == ENCRYPTION_MODE_OS_KEYSTORE and bool(info.get("encrypted", False))
+            )
+            self.query_one("#settings-rekey-btn", Button).disabled = not bool(info.get("exists", False))
         except Exception:
             pass
 
@@ -2222,7 +2298,16 @@ class SettingsPane(BaseSocPane):
             self.notify_user(err_msg, title="Invalid Setting", severity="error")
             return False
 
-        target_path = save_profile_settings(values, profile=active_profile, replace=False)
+        try:
+            target_path = save_profile_settings(values, profile=active_profile, replace=False)
+        except SettingsLockedError as exc:
+            self.set_status(f"Settings locked: {exc}")
+            self.notify_user(str(exc), title="Settings Locked", severity="warning")
+            self._open_unlock_modal()
+            return False
+        except SettingsCryptoError as exc:
+            self.report_error("Save Settings", exc)
+            return False
         conflicts = self._apply_session_conflicts(values)
 
         if (values.get("secret_provider") or "none").strip().lower() != "none":
@@ -2480,7 +2565,16 @@ class SettingsPane(BaseSocPane):
             self.set_status(f"Invalid profile name: {exc}")
             self.query_one("#set-new-profile-input", Input).focus()
             return
-        set_active_profile(prof_name, create=True)
+        try:
+            set_active_profile(prof_name, create=True)
+        except SettingsLockedError as exc:
+            self.set_status(f"Settings locked: {exc}")
+            self.notify_user(str(exc), title="Settings Locked", severity="warning")
+            self._open_unlock_modal()
+            return
+        except SettingsCryptoError as exc:
+            self.report_error("Create Profile", exc)
+            return
         new_prof_inp = self.query_one("#set-new-profile-input", Input)
         with new_prof_inp.prevent(Input.Changed):
             new_prof_inp.value = ""
@@ -2543,6 +2637,145 @@ class SettingsPane(BaseSocPane):
             confirm_label="Delete Profile",
             on_approved=_do_delete,
         )
+
+    def _open_unlock_modal(self, *, on_unlocked: Any = None) -> None:
+        from soclens.tui.modals import SettingsUnlockModal
+
+        def _after_unlock(unlocked: bool | None) -> None:
+            if not unlocked:
+                self._refresh_storage_banners()
+                return
+            self._reload_app_after_session_update()
+            self._load_form_from_store()
+            msg = "Unlocked encrypted settings.json."
+            self.set_status(msg)
+            self.append_log(msg)
+            self.notify_user(msg, title="Settings Unlocked")
+            if callable(on_unlocked):
+                on_unlocked()
+
+        self.app.push_screen(SettingsUnlockModal(), callback=_after_unlock)
+
+    @on(Button.Pressed, "#settings-unlock-btn")
+    def handle_unlock_settings(self) -> None:
+        if not is_settings_locked():
+            self._refresh_storage_banners()
+            self.set_status("Settings are already unlocked.")
+            return
+        self._open_unlock_modal()
+
+    @on(Button.Pressed, "#settings-lock-btn")
+    def handle_lock_settings(self) -> None:
+        locked = lock_settings()
+        clear_session_overrides()
+        self._reload_app_after_session_update()
+        self._load_form_from_store()
+        if locked:
+            msg = "Locked encrypted settings.json and cleared in-memory decryption keys."
+            self.set_status(msg)
+            self.append_log(msg)
+            self.notify_user(msg, title="Settings Locked")
+        else:
+            msg = "Cleared in-memory cache (settings use OS keystore auto-unlock)."
+            self.set_status(msg)
+            self.notify_user(msg, title="Settings Storage")
+
+    @on(Button.Pressed, "#settings-set-passphrase-btn")
+    def handle_set_or_change_passphrase(self) -> None:
+        from soclens.tui.modals import SettingsPassphraseModal
+
+        info = get_settings_storage_info()
+        currently_passphrase = info.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE
+        require_current = bool(currently_passphrase)
+        modal_title = (
+            "Change Master Passphrase" if currently_passphrase else "Enable Master Passphrase Encryption"
+        )
+
+        def _on_modal_done(result: dict[str, str] | None) -> None:
+            if not result:
+                return
+            new_pw = result.get("new_passphrase", "")
+            cur_pw = result.get("current_passphrase") or None
+            try:
+                if currently_passphrase:
+                    updated = rotate_settings_key(passphrase=cur_pw, new_passphrase=new_pw)
+                else:
+                    updated = encrypt_settings_store(
+                        mode=ENCRYPTION_MODE_PASSPHRASE,
+                        passphrase=new_pw,
+                        current_passphrase=cur_pw,
+                    )
+            except (SettingsCryptoError, ValueError) as exc:
+                self.report_error("Master Passphrase Encryption", exc)
+                return
+            self._reload_app_after_session_update()
+            self._load_form_from_store()
+            msg = f"Updated encryption: {updated['encryption_summary']}."
+            self.set_status(msg)
+            self.append_log(msg)
+            self.notify_user(msg, title="Encryption Updated")
+
+        self.app.push_screen(
+            SettingsPassphraseModal(require_current=require_current, title=modal_title),
+            callback=_on_modal_done,
+        )
+
+    @on(Button.Pressed, "#settings-use-os-keystore-btn")
+    def handle_use_os_keystore(self) -> None:
+        info = get_settings_storage_info()
+
+        def _switch() -> None:
+            try:
+                updated = encrypt_settings_store(mode=ENCRYPTION_MODE_OS_KEYSTORE)
+            except (SettingsCryptoError, ValueError) as exc:
+                self.report_error("OS Keystore Encryption", exc)
+                return
+            self._reload_app_after_session_update()
+            self._load_form_from_store()
+            msg = f"Switched encryption to: {updated['encryption_summary']}."
+            self.set_status(msg)
+            self.append_log(msg)
+            self.notify_user(msg, title="Encryption Updated")
+
+        if info.get("locked"):
+            self._open_unlock_modal(on_unlocked=_switch)
+            return
+
+        if info.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE:
+            self.confirm_destructive_action(
+                title="Switch to OS Keystore Auto-Unlock",
+                message="Replace Master Passphrase protection with automatic OS keystore unlock?",
+                details=(
+                    "Your settings.json file remains encrypted with AES-256-GCM, "
+                    "but will unlock automatically under your OS user account without prompting."
+                ),
+                confirm_label="Switch to OS Keystore",
+                on_approved=_switch,
+            )
+            return
+
+        _switch()
+
+    @on(Button.Pressed, "#settings-rekey-btn")
+    def handle_rotate_key(self) -> None:
+        info = get_settings_storage_info()
+        if not info.get("exists"):
+            self.set_status("No settings.json file exists yet to rotate.")
+            return
+        if info.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE:
+            self.handle_set_or_change_passphrase()
+            return
+        try:
+            updated = rotate_settings_key(rotate_kek=False)
+        except (SettingsCryptoError, ValueError) as exc:
+            self.report_error("Rotate Encryption Key", exc)
+            return
+        self._reload_app_after_session_update()
+        self._refresh_storage_banners()
+        msg = f"Rotated AES-256-GCM data encryption key ({updated['encryption_summary']})."
+        self.set_status(msg)
+        self.append_log(msg)
+        self.notify_user(msg, title="Key Rotated")
 
     def _snapshot_draft_values(self) -> tuple[dict[str, str | None], str | None]:
         """Collect current draft form values cleanly on the UI thread for connection tests."""

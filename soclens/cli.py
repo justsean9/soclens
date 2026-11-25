@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import csv
+import getpass
 import inspect
 import io
 import json
@@ -103,30 +104,43 @@ from soclens.sentinelone import (
     SentinelOneRateLimitError,
 )
 from soclens.settings import (
+    ENCRYPTION_MODE_OS_KEYSTORE,
+    ENCRYPTION_MODE_PASSPHRASE,
+    MIN_PASSPHRASE_LENGTH,
     SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS_BY_KEY,
+    SUPPORTED_ENCRYPTION_MODES,
     SUPPORTED_SECRET_PROVIDERS,
+    SettingsCryptoError,
+    SettingsLockedError,
     clear_profile_settings,
     collect_env_importable_settings,
     delete_profile,
     describe_all_settings,
+    encrypt_settings_store,
     format_setting_display,
     get_active_profile_name,
     get_env_override_for_setting,
     get_saved_setting,
     get_session_override,
     get_settings_storage_info,
+    inspect_settings_encryption,
+    is_settings_locked,
     list_profiles,
+    lock_settings,
     mask_secret,
     parse_vault_secret_map,
     resolve_setting_key,
+    rotate_settings_key,
     save_profile_settings,
     serialize_vault_secret_map,
     set_active_profile,
     set_session_overrides,
+    unlock_settings,
     validate_profile_name,
     validate_settings_values,
 )
+from soclens.settings_crypto import get_env_passphrase
 from soclens.sigma import (
     SIGMA_OUTPUT_FORMATS,
     SIGMA_PIPELINES,
@@ -3171,6 +3185,81 @@ def build_parser() -> argparse.ArgumentParser:
     p_set_reset.add_argument("--yes", action="store_true", default=False, help="Approve clearing saved profile values")
     p_set_reset.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without modifying")
     p_set_reset.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_set_enc = settings_sub.add_parser(
+        "encrypt",
+        help="Encrypt plaintext settings.json or switch between OS keystore and master passphrase mode",
+    )
+    p_set_enc.add_argument(
+        "--mode",
+        choices=list(SUPPORTED_ENCRYPTION_MODES),
+        default=None,
+        help="Encryption mode: 'os_keystore' (auto-unlock) or 'passphrase' (Master Passphrase)",
+    )
+    p_set_enc.add_argument(
+        "--passphrase",
+        action="store_true",
+        default=False,
+        help="Shortcut for --mode passphrase (prompts interactively or reads SOCLENS_SETTINGS_PASSPHRASE)",
+    )
+    p_set_enc.add_argument(
+        "--passphrase-env",
+        default=None,
+        help="Environment variable holding the target master passphrase (for non-interactive use)",
+    )
+    p_set_enc.add_argument(
+        "--current-passphrase-env",
+        default=None,
+        help="Environment variable holding the current master passphrase when switching from passphrase mode",
+    )
+    p_set_enc.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without modifying")
+    p_set_enc.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_set_unlock = settings_sub.add_parser(
+        "unlock",
+        help="Verify and unlock a passphrase-encrypted settings.json file",
+    )
+    p_set_unlock.add_argument(
+        "--passphrase-env",
+        default=None,
+        help="Environment variable holding the master passphrase",
+    )
+    p_set_unlock.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_set_lock = settings_sub.add_parser(
+        "lock",
+        help="Clear cached decryption keys from memory and report settings lock status",
+    )
+    p_set_lock.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+
+    p_set_rekey = settings_sub.add_parser(
+        "rekey",
+        help="Rotate the AES-256-GCM data encryption key (and optionally passphrase or OS master KEK)",
+    )
+    p_set_rekey.add_argument(
+        "--new-passphrase",
+        action="store_true",
+        default=False,
+        help="Prompt for a new master passphrase (or read --new-passphrase-env)",
+    )
+    p_set_rekey.add_argument(
+        "--rotate-kek",
+        action="store_true",
+        default=False,
+        help="Also generate a brand-new OS keystore / keyfile master key-wrapping key",
+    )
+    p_set_rekey.add_argument(
+        "--passphrase-env",
+        default=None,
+        help="Environment variable holding the current master passphrase",
+    )
+    p_set_rekey.add_argument(
+        "--new-passphrase-env",
+        default=None,
+        help="Environment variable holding the new master passphrase",
+    )
+    p_set_rekey.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Preview without modifying")
+    p_set_rekey.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     # 9. Secret manager / PAM integration subcommands
     secrets_parser = subparsers.add_parser(
@@ -8067,6 +8156,76 @@ def _handle_s1(
     return 1
 
 
+def _read_cli_passphrase(
+    prompt: str,
+    *,
+    env_var: str | None = None,
+    allow_default_env: bool = True,
+    confirm: bool = False,
+) -> str:
+    """Resolve a master passphrase securely via env var or interactive TTY ``getpass``."""
+    if env_var:
+        val = os.environ.get(env_var)
+        if not val:
+            raise ValueError(f"Environment variable '{env_var}' is unset or empty.")
+        return val
+
+    if allow_default_env:
+        env_val = get_env_passphrase()
+        if env_val:
+            return env_val
+
+    if not sys.stdin.isatty():
+        raise SettingsLockedError(
+            "Master passphrase is required in non-interactive mode. "
+            "Set SOCLENS_SETTINGS_PASSPHRASE (or SOCLENS_SETTINGS_PASSPHRASE_FILE) or pass --passphrase-env."
+        )
+
+    entered = getpass.getpass(prompt, stream=sys.stderr)
+    if not entered:
+        raise ValueError("Master passphrase cannot be empty.")
+    if confirm:
+        if len(entered) < MIN_PASSPHRASE_LENGTH:
+            raise ValueError(
+                f"Master passphrase must be at least {MIN_PASSPHRASE_LENGTH} characters long."
+            )
+        again = getpass.getpass("Confirm master passphrase: ", stream=sys.stderr)
+        if entered != again:
+            raise ValueError("Passphrases do not match.")
+    return entered
+
+
+def _ensure_cli_settings_unlocked(args: argparse.Namespace) -> None:
+    """Unlock passphrase-protected settings via env var or interactive TTY prompt when needed."""
+    cmd = getattr(args, "command", None)
+    if cmd == "bundle":
+        return
+    if cmd == "settings":
+        subcmd = getattr(args, "settings_command", None)
+        if subcmd in (None, "path", "lock", "encrypt", "unlock", "rekey"):
+            return
+
+    if not is_settings_locked():
+        return
+
+    try:
+        unlock_settings()
+        return
+    except SettingsLockedError:
+        pass
+
+    if sys.stdin.isatty():
+        pw = _read_cli_passphrase("Enter SOCLens settings master passphrase: ", allow_default_env=False)
+        unlock_settings(passphrase=pw)
+        return
+
+    if cmd in ("settings", "secrets"):
+        raise SettingsLockedError(
+            "Settings file is encrypted with a master passphrase and is locked. "
+            "Set SOCLENS_SETTINGS_PASSPHRASE (or SOCLENS_SETTINGS_PASSPHRASE_FILE) or run interactively."
+        )
+
+
 def _handle_settings(
     args: argparse.Namespace,
     *,
@@ -8075,7 +8234,10 @@ def _handle_settings(
 ) -> int:
     subcmd = getattr(args, "settings_command", None)
     if not subcmd:
-        msg = "Usage: soclens settings {path,show,set,unset,import-env,profiles,use,delete-profile,reset}"
+        msg = (
+            "Usage: soclens settings "
+            "{path,show,set,unset,import-env,profiles,use,delete-profile,reset,encrypt,unlock,lock,rekey}"
+        )
         if use_json:
             print(json.dumps({"error": msg}, indent=2), file=sys.stderr)
         else:
@@ -8092,6 +8254,7 @@ def _handle_settings(
             print(f"Settings File : {info['path']}")
             print(f"Exists        : {'Yes' if info['exists'] else 'No'}")
             print(f"Permissions   : {info['permissions']}")
+            print(f"Encryption    : {info.get('encryption_summary') or 'Unknown'}")
             print(f"Active Profile: {info['active_profile']} ({info['profile_count']} total)")
             if info.get("load_error"):
                 print(f"Load Warning  : {info['load_error']}")
@@ -8349,6 +8512,160 @@ def _handle_settings(
             _emit_json({"reset": True, "profile": target_profile, "path": str(path)})
         else:
             print(f"[+] Cleared all saved settings in profile '{target_profile}' ({path}).")
+        return 0
+
+    if subcmd == "encrypt":
+        raw_mode = getattr(args, "mode", None)
+        if bool(getattr(args, "passphrase", False)):
+            if raw_mode and raw_mode != ENCRYPTION_MODE_PASSPHRASE:
+                raise ValueError("Cannot combine --passphrase with --mode os_keystore.")
+            target_mode = ENCRYPTION_MODE_PASSPHRASE
+        else:
+            target_mode = raw_mode or ENCRYPTION_MODE_OS_KEYSTORE
+
+        enc_before = inspect_settings_encryption()
+        if is_dry:
+            payload = {
+                "dry_run": True,
+                "action": "encrypt",
+                "target_mode": target_mode,
+                "current_mode": enc_before.get("encryption_mode"),
+                "encrypted": bool(enc_before.get("encrypted", False)),
+            }
+            if use_json:
+                _emit_json(payload)
+            else:
+                print(
+                    f"[DRY-RUN] Would encrypt settings store with AES-256-GCM "
+                    f"(mode={target_mode}, current={enc_before.get('encryption_mode')})."
+                )
+            return 0
+
+        current_pw: str | None = None
+        cur_env: str | None = getattr(args, "current_passphrase_env", None)
+        if enc_before.get("locked"):
+            current_pw = _read_cli_passphrase(
+                "Enter current SOCLens settings master passphrase: ",
+                env_var=cur_env,
+                allow_default_env=True,
+                confirm=False,
+            )
+
+        enc_new_pw: str | None = None
+        if target_mode == ENCRYPTION_MODE_PASSPHRASE:
+            pw_env = getattr(args, "passphrase_env", None)
+            enc_new_pw = _read_cli_passphrase(
+                "Enter new SOCLens settings master passphrase: ",
+                env_var=pw_env,
+                allow_default_env=not bool(enc_before.get("locked")),
+                confirm=True,
+            )
+
+        info = encrypt_settings_store(
+            mode=target_mode,
+            passphrase=enc_new_pw,
+            current_passphrase=current_pw,
+        )
+        if use_json:
+            _emit_json({"encrypted": True, "storage": info})
+        else:
+            print(f"[+] Settings encrypted ({info['encryption_summary']}) at {info['path']}.")
+        return 0
+
+    if subcmd == "unlock":
+        enc_before = inspect_settings_encryption()
+        pw_env = getattr(args, "passphrase_env", None)
+        passphrase: str | None = None
+        if enc_before.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE:
+            if pw_env:
+                passphrase = _read_cli_passphrase(
+                    "Enter SOCLens settings master passphrase: ",
+                    env_var=pw_env,
+                    allow_default_env=False,
+                )
+            elif enc_before.get("locked"):
+                passphrase = _read_cli_passphrase(
+                    "Enter SOCLens settings master passphrase: ",
+                    allow_default_env=True,
+                )
+        unlock_settings(passphrase=passphrase)
+        info = get_settings_storage_info()
+        if use_json:
+            _emit_json({"unlocked": True, "storage": info})
+        else:
+            print(
+                f"[+] Settings unlocked ({info['encryption_summary']}) — "
+                f"active profile '{info['active_profile']}' ({info['profile_count']} profile(s))."
+            )
+        return 0
+
+    if subcmd == "lock":
+        locked = lock_settings()
+        info = get_settings_storage_info()
+        if use_json:
+            _emit_json({"locked": locked, "storage": info})
+        else:
+            if locked:
+                print(f"[+] Settings locked ({info['path']}).")
+            else:
+                print(
+                    f"[*] Cleared in-memory settings cache. Note: '{info['path']}' uses "
+                    f"{info['key_backend_label']} (auto-unlock). Run 'soclens settings encrypt --passphrase' "
+                    "to require a master passphrase."
+                )
+        return 0
+
+    if subcmd == "rekey":
+        enc_before = inspect_settings_encryption()
+        want_new_pw = bool(getattr(args, "new_passphrase", False) or getattr(args, "new_passphrase_env", None))
+        rotate_kek = bool(getattr(args, "rotate_kek", False))
+        if is_dry:
+            payload = {
+                "dry_run": True,
+                "action": "rekey",
+                "current_mode": enc_before.get("encryption_mode"),
+                "new_passphrase": want_new_pw,
+                "rotate_kek": rotate_kek,
+            }
+            if use_json:
+                _emit_json(payload)
+            else:
+                print(
+                    f"[DRY-RUN] Would rotate settings AES-256-GCM encryption key "
+                    f"(mode={enc_before.get('encryption_mode')}, rotate_kek={rotate_kek}, "
+                    f"new_passphrase={want_new_pw})."
+                )
+            return 0
+
+        cur_pw: str | None = None
+        if enc_before.get("encryption_mode") == ENCRYPTION_MODE_PASSPHRASE:
+            pw_env = getattr(args, "passphrase_env", None)
+            if enc_before.get("locked") or not want_new_pw or pw_env:
+                cur_pw = _read_cli_passphrase(
+                    "Enter current SOCLens settings master passphrase: ",
+                    env_var=pw_env,
+                    allow_default_env=True,
+                )
+
+        new_pw: str | None = None
+        if want_new_pw:
+            new_pw_env = getattr(args, "new_passphrase_env", None)
+            new_pw = _read_cli_passphrase(
+                "Enter new SOCLens settings master passphrase: ",
+                env_var=new_pw_env,
+                allow_default_env=False,
+                confirm=True,
+            )
+
+        info = rotate_settings_key(
+            passphrase=cur_pw,
+            new_passphrase=new_pw,
+            rotate_kek=rotate_kek,
+        )
+        if use_json:
+            _emit_json({"rekeyed": True, "rotate_kek": rotate_kek, "storage": info})
+        else:
+            print(f"[+] Rotated settings encryption key ({info['encryption_summary']}) at {info['path']}.")
         return 0
 
     return 1
@@ -8789,6 +9106,23 @@ def _emit_cli_error(exc: Exception, *, use_json: bool) -> None:
             print(f"[-] SentinelOne API error: {exc}", file=sys.stderr)
         return
 
+    if isinstance(exc, SettingsCryptoError):
+        crypto_payload: dict[str, Any] = {
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "locked": isinstance(exc, SettingsLockedError),
+        }
+        if isinstance(exc, SettingsLockedError):
+            crypto_payload["hint"] = (
+                "Set SOCLENS_SETTINGS_PASSPHRASE (or SOCLENS_SETTINGS_PASSPHRASE_FILE) "
+                "or run interactively to unlock."
+            )
+        if use_json:
+            print(json.dumps(crypto_payload, indent=2), file=sys.stderr)
+        else:
+            print(f"[-] Settings encryption error: {exc}", file=sys.stderr)
+        return
+
     if use_json:
         print(json.dumps({"error": str(exc), "type": type(exc).__name__}), file=sys.stderr)
     else:
@@ -8869,6 +9203,8 @@ def main() -> None:
             else:
                 run_unified_tui(client, dry_run=global_dry_run, **tui_kwargs)
             return
+
+        _ensure_cli_settings_unlocked(args)
 
         if args.command in (
             "watchlist",

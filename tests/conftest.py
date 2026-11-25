@@ -21,6 +21,7 @@ from textual.app import REPLACED_KEYS, _character_to_key, _get_unicode_name_from
 from textual.widgets import Button
 
 import soclens.settings as _settings
+import soclens.settings_crypto as _settings_crypto
 
 
 @pytest.fixture(autouse=True)
@@ -28,19 +29,28 @@ def _isolate_user_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
-    """Ensure unit and TUI tests never read or write a user's real settings file."""
+    """Ensure unit and TUI tests never read or write a user's real settings file or OS keychain."""
     isolated_path = tmp_path / "soclens_cfg" / "settings.json"
+    isolated_keyfile = tmp_path / "soclens_cfg" / ".test_settings.key"
     monkeypatch.setattr(_settings, "_DEFAULT_SETTINGS_PATH_OVERRIDE", isolated_path)
+    monkeypatch.setattr(_settings_crypto, "_DEFAULT_KEYFILE_PATH_OVERRIDE", isolated_keyfile)
     monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(isolated_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_KEY_FILE", str(isolated_keyfile))
+    monkeypatch.setenv("SOCLENS_SETTINGS_KEYSTORE", _settings_crypto.KEY_PROTECTION_LOCAL_KEYFILE)
+    monkeypatch.delenv("SOCLENS_SETTINGS_PASSPHRASE", raising=False)
+    monkeypatch.delenv("SOCLENS_SETTINGS_PASSPHRASE_FILE", raising=False)
+    monkeypatch.delenv("SOCLENS_SETTINGS_ENCRYPTION_MODE", raising=False)
     # Keep legacy RF-only unit/TUI/E2E tests deterministic and offline by default;
     # OSINT tests explicitly enable SOCLENS_OSINT_ENABLED or pass an OSINTClient.
     monkeypatch.setenv("SOCLENS_OSINT_ENABLED", "false")
     _settings.clear_session_overrides()
+    _settings_crypto.clear_unlocked_keys(mark_locked=False)
     _settings.invalidate_settings_cache()
     try:
         yield
     finally:
         _settings.clear_session_overrides()
+        _settings_crypto.clear_unlocked_keys(mark_locked=False)
         _settings.invalidate_settings_cache()
 
 

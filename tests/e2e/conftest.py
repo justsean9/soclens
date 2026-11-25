@@ -1930,6 +1930,8 @@ def e2e_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
     monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "soclens_cfg" / "settings.json"))
+    monkeypatch.setenv("SOCLENS_SETTINGS_KEY_FILE", str(tmp_path / "soclens_cfg" / ".test_settings.key"))
+    monkeypatch.setenv("SOCLENS_SETTINGS_KEYSTORE", "local_keyfile")
     monkeypatch.setenv("RF_BASE_URL", "http://127.0.0.1:0")
     monkeypatch.setenv("RF_SANDBOX_BASE_URL", "http://127.0.0.1:0/api/v0")
     monkeypatch.setenv("RF_API_TOKEN", "test-rf-token")

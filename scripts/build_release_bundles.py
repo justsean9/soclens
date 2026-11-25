@@ -55,6 +55,8 @@ REQUIRED_BUNDLE_MEMBERS: tuple[str, ...] = (
 FORBIDDEN_EXACT_NAMES: frozenset[str] = frozenset(
     {
         "apikey.key",
+        ".settings.key",
+        ".soclens_settings.key",
         "sigma_rules_cache.json",
         "brands.csv",
         "watchlist.csv",

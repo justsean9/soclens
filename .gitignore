@@ -29,6 +29,8 @@ logs/
 reports/
 scratch/
 apikey.key
+.settings.key
+.soclens_settings.key
 settings.json
 .soclens_settings.json
 .soclens_tui_settings.json

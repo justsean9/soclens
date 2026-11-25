@@ -44,6 +44,7 @@ from soclens.secret_stores.onepassword_connect import OnePasswordConnectProvider
 from soclens.secret_stores.secret_server import SecretServerProvider
 from soclens.settings import (
     get_effective_setting,
+    get_profile_settings,
     get_settings_path,
     save_profile_settings,
     serialize_vault_secret_map,
@@ -1442,9 +1443,13 @@ def test_hydrate_secrets_from_store_end_to_end_all_providers(
             }
         )
         disk_text = get_settings_path().read_text(encoding="utf-8")
+        assert json.loads(disk_text)["encrypted"] is True
         for pulled_secret in secrets.values():
             assert pulled_secret not in disk_text
-        assert "vault_secret_map" in disk_text
+        saved_profile = get_profile_settings()
+        assert "vault_secret_map" in saved_profile
+        assert "splunk_password" not in saved_profile
+        assert "rf_llm_api_key" not in saved_profile
 
         # force=True + overwrite_existing=True overrides env var in memory
         forced = hydrate_secrets_from_store(force=True, overwrite_existing=True)

@@ -561,8 +561,11 @@ def test_v21_f8_tui_saved_views_pagination_multiselect_bulk_bar_and_autorefresh_
             app.screen.query_one("#es-saved-view-name-input", Input).value = "My Tenant View"
             await pilot.click("#es-saved-view-save-btn")
             await pilot.pause()
+            from soclens.settings import get_profile_settings
+
             raw_settings = _settings_file_path(v21_workspace).read_text(encoding="utf-8")
-            assert "My Tenant View" in raw_settings
+            assert json.loads(raw_settings)["encrypted"] is True
+            assert "My Tenant View" in (get_profile_settings().get("splunk_es_saved_views") or "")
 
             await pilot.click("#es-del-view-btn")
             await pilot.pause()
