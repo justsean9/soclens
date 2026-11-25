@@ -179,14 +179,14 @@ pip install -e ".[dev]"
 
 ### Air-Gapped Offline Install (Windows)
 ```powershell
-Expand-Archive .\soclens-v2.2.0-offline-win_amd64.zip -DestinationPath .\soclens
+Expand-Archive .\soclens-v2.3.0-offline-win_amd64.zip -DestinationPath .\soclens
 cd .\soclens
 .\install_offline.ps1 -LaunchTui
 ```
 
 ### Air-Gapped Offline Install (Linux)
 ```bash
-unzip soclens-v2.2.0-offline-linux_x86_64.zip -d soclens
+unzip soclens-v2.3.0-offline-linux_x86_64.zip -d soclens
 cd soclens
 ./install_offline.sh --launch-tui
 ```

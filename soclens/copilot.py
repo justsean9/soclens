@@ -43,7 +43,7 @@ __all__ = [
 logger = logging.getLogger("soclens.copilot")
 
 _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
-_USER_AGENT = "SOCLens/2.2"
+_USER_AGENT = "SOCLens/2.3"
 
 
 def inspect_jwt_expiry(token: str) -> dict[str, Any]:

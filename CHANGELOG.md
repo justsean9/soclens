@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-25
+
+### Added
+- **Microsoft Enterprise Copilot Chat, Copilot Studio & Security Copilot Integration (`soclens.copilot`, `soclens.llm`, `soclens llm`)**:
+  - Added token-first transports requiring **no Entra ID App Registration**, supporting **Enterprise M365 Copilot Chat** (`m365_copilot` via Microsoft Graph Beta `/copilot/conversations`, `/chat`, and `/chatOverStream` SSE streaming with direct Bearer token or automatic `az_cli` token refresh), **Copilot Studio custom agents** (`copilot_directline` via Mobile/Web Channel Token Endpoint or Direct Line v3 secret with watermark polling and Adaptive Card/citation rendering), and **Microsoft Security Copilot** (`security_copilot` via Graph Beta `workspaces/{id}/sessions` → `prompts` → `evaluations`).
+  - Added named multi-agent preset configuration (`ms_copilot_agents_json` / `SOCLENS_MS_COPILOT_AGENTS`), PAM/Vault secret hydration support for `ms_copilot_bearer_token`, `ms_copilot_token_endpoint`, and `ms_copilot_directline_secret`, and CLI support for `--provider m365_copilot|copilot_directline|security_copilot`, `--agent`, `--conversation-id`, and `soclens llm agents`.
+- **Multi-Window Concurrent AI Chat Tabs in the TUI (`soclens.tui.screens.llm`, `F7`)**:
+  - Upgraded the AI Analyst pane with a **Multi-Chat Session Bar** (`+ New Chat`, `Close Chat`, session switcher) where each chat window maintains independent provider, agent/model, server-side `conversation_id`, scrollback transcript, attached Splunk/S1/RF pivot context, and background worker — enabling concurrent chats with multiple Copilot agents and local LLMs simultaneously.
+- **Microsoft Copilot & Offline Install KB Guide (`docs/MICROSOFT_COPILOT_GUIDE.md`)**:
+  - Added comprehensive documentation covering licensing/cost selection, obtaining Graph/Copilot tokens without Entra ID App Registration (Azure CLI `az_cli`, Graph Explorer, Azure PowerShell, Copilot Studio Token Endpoint), multi-agent JSON setup, Security Copilot readiness, PAM/Vault storage, air-gapped offline installation, and troubleshooting.
+
+### Removed
+- Removed legacy `docs/ignore/SOCLENS_MEGA_PROMPT.md`.
+
 ## [2.2.0] - 2026-11-25
 
 ### Added

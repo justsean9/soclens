@@ -67,7 +67,7 @@ Pre-packaged air-gapped deployment archives (source + installers + verified offl
 **Air-gapped quick install after downloading:**
 ```powershell
 # Windows PowerShell
-Expand-Archive .\soclens-v2.2.0-offline-win_amd64.zip -DestinationPath .\soclens
+Expand-Archive .\soclens-v2.3.0-offline-win_amd64.zip -DestinationPath .\soclens
 cd .\soclens
 .\install_offline.ps1 -LaunchTui
 
@@ -76,7 +76,7 @@ cd .\soclens
 ```
 ```bash
 # Linux / macOS
-unzip soclens-v2.2.0-offline-linux_x86_64.zip -d soclens
+unzip soclens-v2.3.0-offline-linux_x86_64.zip -d soclens
 cd soclens
 ./install_offline.sh --launch-tui
 ```
@@ -522,7 +522,7 @@ soclens bundle --target-platform pure --output soclens_pure.zip
 # Verify bundled wheelhouse SHA-256 checksums, ZIP integrity, and lockfile completeness offline
 python scripts/build_wheelhouse.py --verify
 
-# Build and verify all pre-packaged offline release bundles (bundles/v2.2.0/)
+# Build and verify all pre-packaged offline release bundles (bundles/v2.3.0/)
 python scripts/build_release_bundles.py
 python scripts/build_release_bundles.py --verify
 ```
