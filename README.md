@@ -68,7 +68,7 @@ Pre-packaged air-gapped deployment archives (source + installers + verified offl
 **Air-gapped quick install after downloading:**
 ```powershell
 # Windows PowerShell
-Expand-Archive .\soclens-v2.0.0-offline-win_amd64.zip -DestinationPath .\soclens
+Expand-Archive .\soclens-v2.1.0-offline-win_amd64.zip -DestinationPath .\soclens
 cd .\soclens
 .\install_offline.ps1 -LaunchTui
 
@@ -77,7 +77,7 @@ cd .\soclens
 ```
 ```bash
 # Linux / macOS
-unzip soclens-v2.0.0-offline-linux_x86_64.zip -d soclens
+unzip soclens-v2.1.0-offline-linux_x86_64.zip -d soclens
 cd soclens
 ./install_offline.sh --launch-tui
 ```
@@ -106,7 +106,7 @@ Ensure Python 3.12+ (3.12, 3.13, or 3.14) is installed on Windows, Linux, or mac
 
 ### Offline / Air-Gapped Installation (Included Packages)
 
-This repository includes a self-contained `wheelhouse/` directory containing all 28 runtime packages, platform-compiled native wheels (`win_amd64`, `manylinux*_x86_64`, `macosx_*_arm64` for Python 3.12–3.14), and PEP 517 build backend wheels (`setuptools`, `wheel`) so installation requires zero internet access.
+This repository includes a self-contained `wheelhouse/` directory containing all 31 runtime packages, platform-compiled native wheels (`win_amd64`, `manylinux*_x86_64`, `macosx_*_arm64` for Python 3.12–3.14), and PEP 517 build backend wheels (`setuptools`, `wheel`) so installation requires zero internet access.
 
 On Windows, `install_offline.ps1` creates `.venv` and installs the PowerShell launcher shim (`.venv\Scripts\soclens.ps1` alongside the root `.\soclens.ps1` launcher) invoking `python.exe -m soclens.cli`:
 
@@ -523,7 +523,7 @@ soclens bundle --target-platform pure --output soclens_pure.zip
 # Verify bundled wheelhouse SHA-256 checksums, ZIP integrity, and lockfile completeness offline
 python scripts/build_wheelhouse.py --verify
 
-# Build and verify all pre-packaged offline release bundles (bundles/v2.0.0/)
+# Build and verify all pre-packaged offline release bundles (bundles/v2.1.0/)
 python scripts/build_release_bundles.py
 python scripts/build_release_bundles.py --verify
 ```

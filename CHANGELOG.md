@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-25
+
+### Added
+- **Unified Recorded Future + 16 Free Passive OSINT Feeds (`soclens.osint`, `soclens.research`, `soclens research osint`)**:
+  - Integrated 16 passive, zero-extra-dependency free OSINT modules (18 live feeds) alongside Recorded Future in a single pane of glass across both the **Research** TUI tab (`7`) and CLI:
+    - **13 zero-key public feeds**: WHOIS/RDAP (with Newly Registered Domain `<= 30d` alerting), DNS-over-HTTPS (DNS/SPF/DMARC/DNSSEC/PTR), ipwho.is GeoIP, RIPEstat BGP/ASN, Shodan InternetDB, crt.sh Certificate Transparency logs, URLScan.io, SANS DShield, Wayback Machine CDX, AlienVault OTX, GreyNoise Community, CIRCL NSRL Hashlookup, and MITRE CVE + FIRST EPSS + CISA KEV.
+    - **3 optional free-tier API key integrations** configurable in **Settings** (`OSINT Free API Keys`): VirusTotal v3, AbuseIPDB v2, and abuse.ch (ThreatFox, URLhaus, MalwareBazaar).
+  - Added automatic domain/URL → resolved public hosting IP chaining, Unified Verdict synthesis, Source Coverage badge strip, `OSINTSourcesModal` (`s`), `RF + OSINT` / `OSINT Only` / `RF Only` mode selector, and standalone `soclens research osint` CLI (works even without an RF API token).
+- **Encrypted `settings.json` at Rest with AES-256-GCM & Hybrid Keystore (`soclens.settings_crypto`)**:
+  - Added authenticated AES-256-GCM encryption (schema v2) for per-user `settings.json` with two key-management modes:
+    - `os_keystore` (default, auto-unlock): Windows DPAPI (`CryptProtectData`), macOS Keychain (`/usr/bin/security`), and Linux Secret Service (`secret-tool`) with automatic `0600` keyfile fallback on headless servers/containers.
+    - `passphrase` (Master Passphrase): Scrypt KDF (RFC 7914) wrapping a per-file random 256-bit DEK with zero key material stored on disk, supporting interactive TUI unlock modals, CLI prompts, and non-interactive `SOCLENS_SETTINGS_PASSPHRASE` / `SOCLENS_SETTINGS_PASSPHRASE_FILE`.
+  - Added CLI encryption management commands, TUI **Settings** encryption controls and unlock modal, updated `SECURITY.md`, and bundled verified offline `cryptography`, `cffi`, and `pycparser` wheels across Python 3.12–3.14 for Windows, Linux, and macOS (75 verified offline wheels total).
+- **TUI Screenshots & Headless Screenshot Generator (`scripts/generate_screenshots.py`, `docs/screenshots/`)**:
+  - Added SVG screenshots for Threat Research, RF Intel & Alerts, Splunk ES, SentinelOne, Sigma Rules, Local LLM Copilot, and the Admin Dashboard in `README.md`, along with a reproducible headless screenshot generator using sanitized demo data.
+
+### Fixed
+- **ProxySG / Edge SWG Compatibility & Proxy 403 Diagnostics (`soclens.client`, `soclens.osint`)**:
+  - Appended a ProxySG-safe trailing `/` to Recorded Future Connect v2 domain (`/v2/domain/{id}/`), company-by-domain (`/v2/company/by_domain/{domain}/`), and file/TLD-extension URL and Entity Match lookups (`/v2/url/.../`, `/entity-match/entity/.../`) so Broadcom/Symantec ProxySG does not misclassify `.com`/`.exe`/`.bat`/`.sh` paths as executable downloads (`HTTP 403`).
+  - Normalized user-supplied trailing slashes on domain inputs so they are never double-slashed or percent-encoded as `%2F`.
+  - Added HTML/ProxySG `403` detection in `classify_403_permission` (`proxy_blocked`) and `OSINTClient._request_json` to clearly distinguish proxy policy blocks from upstream API authentication errors.
+
 ## [2.0.0] - 2026-11-25
 
 ### Breaking / Behavioral Changes
