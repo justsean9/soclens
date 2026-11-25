@@ -11,6 +11,18 @@ from textual.timer import Timer
 from textual.widgets import Static
 
 from soclens.research import ResearchDossier, compute_unified_verdict
+from soclens.settings import get_setting_with_source
+
+ASCII_ART_AUTO_HIDE_SECONDS: float = 10.0
+_TRUTHY_STRINGS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+def is_ascii_art_enabled() -> bool:
+    """Return True when the user has unlocked the ASCII art banner in Settings."""
+    raw, _src = get_setting_with_source("soclens_ascii_art_enabled")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in _TRUTHY_STRINGS
 
 MoodKind = Literal[
     "idle",
@@ -334,13 +346,21 @@ def render_mood_caption(mood: ResearchMood, frame_index: int) -> Text:
 
 
 class ResearchMoodBanner(Horizontal):
-    """Compact 4-line animated art + status banner for the Research pane."""
+    """Compact 4-line animated art + status banner for the Research pane.
+
+    Hidden by default unless ``soclens_ascii_art_enabled`` is unlocked in Settings,
+    and automatically hides itself after ``AUTO_HIDE_SECONDS`` (10s) each time it appears.
+    """
+
+    AUTO_HIDE_SECONDS: float = ASCII_ART_AUTO_HIDE_SECONDS
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._mood: ResearchMood = determine_research_mood(None)
         self._frame_index: int = 0
         self._timer: Timer | None = None
+        self._hide_timer: Timer | None = None
+        self.display = False
 
     @property
     def mood(self) -> ResearchMood:
@@ -356,23 +376,60 @@ class ResearchMoodBanner(Horizontal):
 
     def on_mount(self) -> None:
         self._render_current()
-        self._timer = self.set_interval(0.35, self._on_tick)
+        if is_ascii_art_enabled():
+            self._show_temporarily()
+        else:
+            self._hide_now()
 
     def on_unmount(self) -> None:
+        self._stop_timers()
+
+    def _stop_timers(self) -> None:
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
+        if self._hide_timer is not None:
+            self._hide_timer.stop()
+            self._hide_timer = None
+
+    def _hide_now(self) -> None:
+        self._stop_timers()
+        self.display = False
+
+    def _show_temporarily(self) -> None:
+        if not self.is_mounted:
+            return
+        self.display = True
+        self._render_current()
+        if self._timer is None:
+            self._timer = self.set_interval(0.35, self._on_tick)
+        if self._hide_timer is not None:
+            self._hide_timer.stop()
+        self._hide_timer = self.set_timer(self.AUTO_HIDE_SECONDS, self._hide_now)
+
+    def sync_ascii_art_setting(self) -> None:
+        """Apply live changes to the Settings ASCII art toggle."""
+        if not self.is_mounted:
+            return
+        if is_ascii_art_enabled():
+            self._show_temporarily()
+        else:
+            self._hide_now()
 
     def set_mood(self, mood: ResearchMood) -> None:
-        """Update the displayed mood and immediately re-render."""
+        """Update the displayed mood; show for 10s only when ASCII art is unlocked."""
         if mood.kind != self._mood.kind:
             self._frame_index = 0
         self._mood = mood
-        if self.is_mounted:
-            self._render_current()
+        if not self.is_mounted:
+            return
+        if is_ascii_art_enabled():
+            self._show_temporarily()
+        else:
+            self._hide_now()
 
     def _on_tick(self) -> None:
-        if not self.is_mounted:
+        if not self.is_mounted or not self.display:
             return
         self._frame_index = (self._frame_index + 1) % 120
         self._render_current()

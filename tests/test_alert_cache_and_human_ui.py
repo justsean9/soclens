@@ -574,3 +574,57 @@ def test_playbook_alerts_precache_details_and_images_without_enter(tmp_path: Pat
             assert img_entry.get("decoded") is not None
 
     asyncio.run(_run())
+
+
+def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from textual.widgets import Checkbox
+
+    from soclens.tui.research_art import (
+        ASCII_ART_AUTO_HIDE_SECONDS,
+        ResearchMoodBanner,
+        determine_research_mood,
+    )
+    from soclens.tui.screens.settings import SettingsPane
+
+    assert ASCII_ART_AUTO_HIDE_SECONDS == 10.0
+    monkeypatch.delenv("SOCLENS_ASCII_ART", raising=False)
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            banner = app.query_one("#res-mood-strip", ResearchMoodBanner)
+            # Off by default -> banner stays hidden even on mood updates
+            assert banner.display is False
+            banner.set_mood(determine_research_mood(None, searching=True, query="example.com"))
+            await pilot.pause()
+            assert banner.display is False
+
+            # Settings checkbox exists and defaults to False
+            app.activate_tab("tab-settings")
+            await pilot.pause()
+            await pilot.pause()
+            settings_pane = app.query_one(SettingsPane)
+            cb = settings_pane.query_one("#set-ascii-art-enabled", Checkbox)
+            assert cb.value is False
+
+            # Unlock via env/setting -> banner appears with a 10s auto-hide timer and re-hides
+            monkeypatch.setenv("SOCLENS_ASCII_ART", "true")
+            banner.AUTO_HIDE_SECONDS = 0.05
+            banner.set_mood(determine_research_mood(None, searching=True, query="evil.test"))
+            await pilot.pause()
+            assert banner.display is True
+            assert banner._hide_timer is not None
+            await asyncio.sleep(0.12)
+            await pilot.pause()
+            assert banner.display is False
+
+    asyncio.run(_run())

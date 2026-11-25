@@ -181,6 +181,7 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "rf_ignored_hashes_file": ("cat-workspace", "set-ignored-hashes-file"),
     "rf_ignored_hashes": ("cat-workspace", "set-ignored-hashes"),
     "soclens_auto_approve": ("cat-workspace", "set-auto-approve"),
+    "soclens_ascii_art_enabled": ("cat-workspace", "set-ascii-art-enabled"),
     "rf_llm_api_key": ("cat-workspace", "set-rf-llm-api-key"),
     "secret_provider": ("cat-secrets", "set-secret-provider"),
     "secret_store_verify_ssl": ("cat-secrets", "set-secret-store-verify-ssl"),
@@ -867,6 +868,13 @@ class SettingsPane(BaseSocPane):
                             "Auto-Approve CLI Writes (SOCLENS_AUTO_APPROVE)",
                             value=False,
                             id="set-auto-approve",
+                            compact=True,
+                        )
+                        yield self._make_label("soclens_ascii_art_enabled")
+                        yield Checkbox(
+                            "Unlock ASCII Art Banner (auto-hides after 10s)",
+                            value=False,
+                            id="set-ascii-art-enabled",
                             compact=True,
                         )
                         yield self._make_label("rf_llm_api_key")
@@ -1797,6 +1805,12 @@ class SettingsPane(BaseSocPane):
             with auto_cb.prevent(Checkbox.Changed):
                 auto_cb.value = (auto_val or "").strip().lower() in _SSL_VERIFY_TRUE
 
+            # Unlock ASCII art (defaults to False)
+            ascii_val = self._form_value_for_display("soclens_ascii_art_enabled", saved_map)
+            ascii_cb = self.query_one("#set-ascii-art-enabled", Checkbox)
+            with ascii_cb.prevent(Checkbox.Changed):
+                ascii_cb.value = (ascii_val or "").strip().lower() in _SSL_VERIFY_TRUE
+
             # OSINT enabled (defaults to True when unset)
             osint_en_val = self._form_value_for_display("osint_enabled", saved_map)
             osint_cb = self.query_one("#set-osint-enabled", Checkbox)
@@ -2205,6 +2219,14 @@ class SettingsPane(BaseSocPane):
             env_auto = get_env_override_for_setting("soclens_auto_approve")
             values["soclens_auto_approve"] = "false" if env_auto is not None else None
 
+        # Unlock ASCII art (defaults to False)
+        ascii_checked = bool(self.query_one("#set-ascii-art-enabled", Checkbox).value)
+        if ascii_checked:
+            values["soclens_ascii_art_enabled"] = "true"
+        else:
+            env_ascii = get_env_override_for_setting("soclens_ascii_art_enabled")
+            values["soclens_ascii_art_enabled"] = "false" if env_ascii is not None else None
+
         # OSINT enabled (defaults to True; only persist "false" or override env)
         osint_checked = bool(self.query_one("#set-osint-enabled", Checkbox).value)
         if not osint_checked:
@@ -2474,6 +2496,11 @@ class SettingsPane(BaseSocPane):
             if "soclens_auto_approve" in imported:
                 self.query_one("#set-auto-approve", Checkbox).value = (
                     imported["soclens_auto_approve"].strip().lower() in _SSL_VERIFY_TRUE
+                )
+
+            if "soclens_ascii_art_enabled" in imported:
+                self.query_one("#set-ascii-art-enabled", Checkbox).value = (
+                    imported["soclens_ascii_art_enabled"].strip().lower() in _SSL_VERIFY_TRUE
                 )
 
             if "osint_enabled" in imported:

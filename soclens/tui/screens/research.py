@@ -351,8 +351,12 @@ class ResearchPane(BaseSocPane):
             self._update_responsive_layout()
 
     def on_settings_updated(self) -> None:
-        """Refresh OSINT key readiness and clear cached dossiers after Settings updates."""
+        """Refresh OSINT key readiness, ASCII art toggle, and clear cached dossiers after Settings updates."""
         self._dossier_cache.clear()
+        try:
+            self.query_one("#res-mood-strip", ResearchMoodBanner).sync_ascii_art_setting()
+        except Exception:
+            pass
         if self._tables_ready and self._current_dossier is None:
             self._render_detail_panel()
 

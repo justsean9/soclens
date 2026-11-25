@@ -452,6 +452,15 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         description="Permit non-interactive CLI mutations without --yes (true/false).",
     ),
     SettingSpec(
+        key="soclens_ascii_art_enabled",
+        category="workspace",
+        label="Unlock ASCII Art Banner",
+        env_vars=("SOCLENS_ASCII_ART",),
+        value_type="bool",
+        default="false",
+        description="Show animated ASCII art in Research (auto-hides after 10 seconds).",
+    ),
+    SettingSpec(
         key="rf_llm_api_key",
         category="workspace",
         label="Local LLM API Key",
