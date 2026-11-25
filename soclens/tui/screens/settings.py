@@ -46,6 +46,7 @@ from soclens.secret_stores import build_secret_store_provider
 from soclens.secret_stores.base import SECRET_PROVIDER_LABELS, SecretCatalogEntry
 from soclens.sentinelone import SentinelOneClient
 from soclens.settings import (
+    AKEYLESS_AUTH_MODES,
     DEFAULT_PROFILE,
     ENCRYPTION_MODE_OS_KEYSTORE,
     ENCRYPTION_MODE_PASSPHRASE,
@@ -214,6 +215,12 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "bw_folder_id": ("cat-secrets", "set-bw-folder-id"),
     "bw_collection_id": ("cat-secrets", "set-bw-collection-id"),
     "bw_organization_id": ("cat-secrets", "set-bw-organization-id"),
+    "akeyless_api_url": ("cat-secrets", "set-akeyless-api-url"),
+    "akeyless_auth_mode": ("cat-secrets", "set-akeyless-auth-mode"),
+    "akeyless_access_id": ("cat-secrets", "set-akeyless-access-id"),
+    "akeyless_access_key": ("cat-secrets", "set-akeyless-access-key"),
+    "akeyless_token": ("cat-secrets", "set-akeyless-token"),
+    "akeyless_prefix": ("cat-secrets", "set-akeyless-prefix"),
     "osint_enabled": ("cat-osint", "set-osint-enabled"),
     "osint_timeout": ("cat-osint", "set-osint-timeout"),
     "osint_vt_api_key": ("cat-osint", "set-osint-vt-key"),
@@ -241,6 +248,8 @@ _SECRET_INPUT_IDS: tuple[str, ...] = (
     "set-vault-secret-id",
     "set-op-connect-token",
     "set-bw-master-password",
+    "set-akeyless-access-key",
+    "set-akeyless-token",
 )
 
 _OSINT_SECRET_INPUT_IDS: tuple[str, ...] = (
@@ -314,6 +323,11 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
     ("bw_folder_id", "set-bw-folder-id", "Optional Bitwarden folder UUID"),
     ("bw_collection_id", "set-bw-collection-id", "Optional Bitwarden collection UUID"),
     ("bw_organization_id", "set-bw-organization-id", "Optional Bitwarden organization UUID"),
+    ("akeyless_api_url", "set-akeyless-api-url", "Default: https://api.akeyless.io"),
+    ("akeyless_access_id", "set-akeyless-access-id", "Akeyless Access ID (e.g. p-...)"),
+    ("akeyless_access_key", "set-akeyless-access-key", "Akeyless Access Key"),
+    ("akeyless_token", "set-akeyless-token", "Pre-issued Akeyless token"),
+    ("akeyless_prefix", "set-akeyless-prefix", "Optional folder prefix (e.g. /soclens)"),
     ("osint_timeout", "set-osint-timeout", "Default: 8.0"),
     ("osint_vt_api_key", "set-osint-vt-key", "Optional free key (virustotal.com/gui/join-us)"),
     ("osint_abuseipdb_api_key", "set-osint-abuseipdb-key", "Optional free key (abuseipdb.com/register)"),
@@ -1299,6 +1313,67 @@ class SettingsPane(BaseSocPane):
                                 compact=True,
                             )
 
+                        with Vertical(id="akeyless-fields-group", classes="secret-provider-group"):
+                            yield Static(
+                                "Akeyless Vault",
+                                classes="section-label",
+                                markup=False,
+                            )
+                            yield self._make_label("akeyless_api_url")
+                            yield Input(
+                                value="",
+                                placeholder="Default: https://api.akeyless.io",
+                                id="set-akeyless-api-url",
+                                classes="setting-field",
+                                compact=True,
+                            )
+                            yield self._make_label("akeyless_auth_mode")
+                            yield Select(
+                                [
+                                    ("API Key (Access ID + Access Key)", "access_key"),
+                                    ("Pre-issued Auth Token", "token"),
+                                ],
+                                allow_blank=False,
+                                value="access_key",
+                                id="set-akeyless-auth-mode",
+                                classes="setting-field",
+                                compact=True,
+                            )
+                            yield self._make_label("akeyless_access_id")
+                            yield Input(
+                                value="",
+                                placeholder="Akeyless Access ID (e.g. p-...)",
+                                id="set-akeyless-access-id",
+                                classes="setting-field",
+                                compact=True,
+                            )
+                            yield self._make_label("akeyless_access_key")
+                            yield Input(
+                                value="",
+                                password=True,
+                                placeholder="Akeyless Access Key",
+                                id="set-akeyless-access-key",
+                                classes="setting-field",
+                                compact=True,
+                            )
+                            yield self._make_label("akeyless_token")
+                            yield Input(
+                                value="",
+                                password=True,
+                                placeholder="Pre-issued Akeyless token",
+                                id="set-akeyless-token",
+                                classes="setting-field",
+                                compact=True,
+                            )
+                            yield self._make_label("akeyless_prefix")
+                            yield Input(
+                                value="",
+                                placeholder="Optional folder prefix (e.g. /soclens)",
+                                id="set-akeyless-prefix",
+                                classes="setting-field",
+                                compact=True,
+                            )
+
                     with VerticalScroll(id="cat-osint", classes="settings-cat-scroll"):
                         yield Static(
                             "Passive Free OSINT Enrichment & Optional Free-Tier Keys",
@@ -1515,6 +1590,7 @@ class SettingsPane(BaseSocPane):
             ("#vault-fields-group", "hashicorp_vault"),
             ("#op-fields-group", "onepassword_connect"),
             ("#bw-fields-group", "bitwarden"),
+            ("#akeyless-fields-group", "akeyless"),
         ):
             try:
                 self.query_one(grp_id).display = provider == target_prov
@@ -1705,6 +1781,17 @@ class SettingsPane(BaseSocPane):
             with vault_mode_sel.prevent(Select.Changed):
                 vault_mode_sel.value = (
                     raw_vault_mode if raw_vault_mode in VAULT_AUTH_MODES else "token"
+                )
+
+            raw_akeyless_mode = (
+                self._form_value_for_display("akeyless_auth_mode", saved_map) or "access_key"
+            ).strip().lower()
+            akeyless_mode_sel = self.query_one("#set-akeyless-auth-mode", Select)
+            with akeyless_mode_sel.prevent(Select.Changed):
+                akeyless_mode_sel.value = (
+                    raw_akeyless_mode
+                    if raw_akeyless_mode in AKEYLESS_AUTH_MODES
+                    else "access_key"
                 )
 
             ss_verify_val = self._form_value_for_display("secret_store_verify_ssl", saved_map)
@@ -2092,6 +2179,20 @@ class SettingsPane(BaseSocPane):
             else None
         )
 
+        akeyless_mode = str(
+            self.query_one("#set-akeyless-auth-mode", Select).value or "access_key"
+        ).strip().lower()
+        env_akeyless_mode = get_env_override_for_setting("akeyless_auth_mode")
+        values["akeyless_auth_mode"] = (
+            akeyless_mode
+            if (
+                akeyless_mode != "access_key"
+                or "akeyless_auth_mode" in existing_saved
+                or env_akeyless_mode is not None
+            )
+            else None
+        )
+
         ss_sel = str(self.query_one("#set-secret-store-verify-ssl", Select).value or "")
         ss_ca_raw = self.query_one("#set-pam-ca-bundle", Input).value
         if "\n" in ss_ca_raw or "\r" in ss_ca_raw:
@@ -2422,6 +2523,16 @@ class SettingsPane(BaseSocPane):
                 vault_sel = self.query_one("#set-vault-auth-mode", Select)
                 with vault_sel.prevent(Select.Changed):
                     vault_sel.value = vault_mode if vault_mode in VAULT_AUTH_MODES else "token"
+
+            if "akeyless_auth_mode" in imported:
+                akeyless_mode = imported["akeyless_auth_mode"].strip().lower()
+                akeyless_sel = self.query_one("#set-akeyless-auth-mode", Select)
+                with akeyless_sel.prevent(Select.Changed):
+                    akeyless_sel.value = (
+                        akeyless_mode
+                        if akeyless_mode in AKEYLESS_AUTH_MODES
+                        else "access_key"
+                    )
 
             if "secret_store_verify_ssl" in imported:
                 low = imported["secret_store_verify_ssl"].strip().lower()
@@ -2870,6 +2981,12 @@ class SettingsPane(BaseSocPane):
             bw_folder_id=draft.get("bw_folder_id"),
             bw_collection_id=draft.get("bw_collection_id"),
             bw_organization_id=draft.get("bw_organization_id"),
+            akeyless_api_url=draft.get("akeyless_api_url"),
+            akeyless_auth_mode=draft.get("akeyless_auth_mode"),
+            akeyless_access_id=draft.get("akeyless_access_id"),
+            akeyless_access_key=draft.get("akeyless_access_key"),
+            akeyless_token=draft.get("akeyless_token"),
+            akeyless_prefix=draft.get("akeyless_prefix"),
         )
 
     @on(Button.Pressed, "#settings-test-secrets-btn")
@@ -3327,4 +3444,3 @@ class SettingsPane(BaseSocPane):
             )
         except Exception as exc:
             self.report_error("Test OSINT Sources", exc)
-

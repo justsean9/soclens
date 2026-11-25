@@ -83,9 +83,11 @@ SUPPORTED_SECRET_PROVIDERS: tuple[str, ...] = (
     "hashicorp_vault",
     "onepassword_connect",
     "bitwarden",
+    "akeyless",
 )
 TSS_AUTH_MODES: tuple[str, ...] = ("password", "platform", "token")
 VAULT_AUTH_MODES: tuple[str, ...] = ("token", "approle")
+AKEYLESS_AUTH_MODES: tuple[str, ...] = ("access_key", "token")
 SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
     "rf_api_token",
     "rf_sandbox_token",
@@ -476,7 +478,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         env_vars=("SOCLENS_SECRET_PROVIDER",),
         default="none",
         choices=SUPPORTED_SECRET_PROVIDERS,
-        description="Active PAM / Secret Manager backend (none, secret_server, hashicorp_vault, onepassword_connect, bitwarden).",
+        description="Active PAM / Secret Manager backend (none, secret_server, hashicorp_vault, onepassword_connect, bitwarden, akeyless).",
     ),
     SettingSpec(
         key="secret_store_verify_ssl",
@@ -709,6 +711,54 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         label="Bitwarden Organization ID",
         env_vars=("BW_ORGANIZATION_ID", "SOCLENS_BW_ORGANIZATION_ID"),
         description="Optional Bitwarden organization UUID filter.",
+    ),
+    SettingSpec(
+        key="akeyless_api_url",
+        category="secret_manager",
+        label="Akeyless API / Gateway URL",
+        env_vars=("AKEYLESS_API_URL", "AKEYLESS_GATEWAY_URL", "SOCLENS_AKEYLESS_API_URL"),
+        value_type="url",
+        default="https://api.akeyless.io",
+        description="Akeyless SaaS API or self-hosted Gateway base URL.",
+    ),
+    SettingSpec(
+        key="akeyless_auth_mode",
+        category="secret_manager",
+        label="Akeyless Auth Mode",
+        env_vars=("AKEYLESS_AUTH_MODE", "SOCLENS_AKEYLESS_AUTH_MODE"),
+        default="access_key",
+        choices=AKEYLESS_AUTH_MODES,
+        description="Akeyless authentication mode: access_key or token.",
+    ),
+    SettingSpec(
+        key="akeyless_access_id",
+        category="secret_manager",
+        label="Akeyless Access ID",
+        env_vars=("AKEYLESS_ACCESS_ID", "SOCLENS_AKEYLESS_ACCESS_ID"),
+        description="Akeyless API Key access_id (e.g. p-...).",
+    ),
+    SettingSpec(
+        key="akeyless_access_key",
+        category="secret_manager",
+        label="Akeyless Access Key",
+        env_vars=("AKEYLESS_ACCESS_KEY", "SOCLENS_AKEYLESS_ACCESS_KEY"),
+        secret=True,
+        description="Akeyless API Key access_key.",
+    ),
+    SettingSpec(
+        key="akeyless_token",
+        category="secret_manager",
+        label="Akeyless Auth Token",
+        env_vars=("AKEYLESS_TOKEN", "SOCLENS_AKEYLESS_TOKEN"),
+        secret=True,
+        description="Pre-issued Akeyless authentication token.",
+    ),
+    SettingSpec(
+        key="akeyless_prefix",
+        category="secret_manager",
+        label="Akeyless Path Prefix",
+        env_vars=("AKEYLESS_PREFIX", "SOCLENS_AKEYLESS_PREFIX"),
+        description="Optional Akeyless folder path prefix for catalog discovery (e.g. /soclens).",
     ),
     # OSINT Enrichment APIs (Free Passive Sources & Optional Free-Tier Keys)
     SettingSpec(
@@ -1969,6 +2019,7 @@ __all__ = [
     "SettingsDecryptionError",
     "SettingsKeystoreError",
     "SettingsLockedError",
+    "AKEYLESS_AUTH_MODES",
     "TSS_AUTH_MODES",
     "VAULT_AUTH_MODES",
     "clear_profile_settings",

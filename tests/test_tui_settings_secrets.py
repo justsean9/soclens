@@ -225,7 +225,7 @@ def test_tui_settings_cat_secrets_masked_inputs_bw_optional_and_show_secrets(
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
             pane = app.query_one(SettingsPane)
-            assert len(_SECRET_INPUT_IDS) == 16
+            assert len(_SECRET_INPUT_IDS) == 18
             for widget_id in _SECRET_INPUT_IDS:
                 assert pane.query_one(f"#{widget_id}", Input).password is True
 
@@ -481,6 +481,7 @@ def test_tui_settings_offline_saved_ref_fallback_and_80x24_layout(
                 ("hashicorp_vault", "#vault-fields-group"),
                 ("onepassword_connect", "#op-fields-group"),
                 ("bitwarden", "#bw-fields-group"),
+                ("akeyless", "#akeyless-fields-group"),
             ):
                 prov_sel.value = provider
                 await pilot.pause()

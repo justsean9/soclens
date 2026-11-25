@@ -28,6 +28,7 @@ _PROVIDER_REGISTRY: dict[str, tuple[str, str]] = {
         "OnePasswordConnectProvider",
     ),
     "bitwarden": ("soclens.secret_stores.bitwarden", "BitwardenProvider"),
+    "akeyless": ("soclens.secret_stores.akeyless", "AkeylessProvider"),
 }
 
 

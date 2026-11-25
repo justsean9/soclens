@@ -21,6 +21,7 @@ import urllib3
 from requests.utils import should_bypass_proxies
 
 from soclens.settings import (
+    AKEYLESS_AUTH_MODES,
     SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS_BY_KEY,
     SUPPORTED_SECRET_PROVIDERS,
@@ -190,6 +191,14 @@ class SecretStoreConfig:
     bw_folder_id: str | None = None
     bw_collection_id: str | None = None
     bw_organization_id: str | None = None
+
+    # Akeyless Vault
+    akeyless_api_url: str = "https://api.akeyless.io"
+    akeyless_auth_mode: str = "access_key"
+    akeyless_access_id: str | None = None
+    akeyless_access_key: str | None = field(default=None, repr=False)
+    akeyless_token: str | None = field(default=None, repr=False)
+    akeyless_prefix: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -1225,6 +1234,12 @@ def get_secret_store_config(
     bw_folder_id: str | None = None,
     bw_collection_id: str | None = None,
     bw_organization_id: str | None = None,
+    akeyless_api_url: str | None = None,
+    akeyless_auth_mode: str | None = None,
+    akeyless_access_id: str | None = None,
+    akeyless_access_key: str | None = None,
+    akeyless_token: str | None = None,
+    akeyless_prefix: str | None = None,
 ) -> SecretStoreConfig:
     """Resolve Secret Manager / PAM configuration from args, session, env, or saved settings."""
     raw_provider = (
@@ -1308,6 +1323,18 @@ def get_secret_store_config(
             f"Invalid Vault auth mode {raw_vault_auth_mode!r}. Expected one of: {valid}."
         )
 
+    raw_akeyless_auth_mode = (
+        _clean_optional_str(akeyless_auth_mode)
+        if akeyless_auth_mode is not None
+        else get_effective_setting("akeyless_auth_mode", include_default=True)
+    )
+    resolved_akeyless_auth_mode = (raw_akeyless_auth_mode or "access_key").strip().lower()
+    if resolved_akeyless_auth_mode not in AKEYLESS_AUTH_MODES:
+        valid = ", ".join(AKEYLESS_AUTH_MODES)
+        raise ConfigurationError(
+            f"Invalid Akeyless auth mode {raw_akeyless_auth_mode!r}. Expected one of: {valid}."
+        )
+
     def _opt(explicit_val: str | None, key: str, *, include_default: bool = False) -> str | None:
         if explicit_val is not None:
             return _clean_optional_str(explicit_val)
@@ -1350,6 +1377,15 @@ def get_secret_store_config(
         bw_folder_id=_opt(bw_folder_id, "bw_folder_id"),
         bw_collection_id=_opt(bw_collection_id, "bw_collection_id"),
         bw_organization_id=_opt(bw_organization_id, "bw_organization_id"),
+        akeyless_api_url=_normalize_optional_url(
+            _opt(akeyless_api_url, "akeyless_api_url", include_default=True),
+            default="https://api.akeyless.io",
+        ),
+        akeyless_auth_mode=resolved_akeyless_auth_mode,
+        akeyless_access_id=_opt(akeyless_access_id, "akeyless_access_id"),
+        akeyless_access_key=_opt(akeyless_access_key, "akeyless_access_key"),
+        akeyless_token=_opt(akeyless_token, "akeyless_token"),
+        akeyless_prefix=_opt(akeyless_prefix, "akeyless_prefix"),
     )
 
 

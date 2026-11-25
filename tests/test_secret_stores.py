@@ -11,6 +11,7 @@ import types
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -37,6 +38,7 @@ from soclens.secret_stores import (
     format_secret_ref,
     parse_secret_ref,
 )
+from soclens.secret_stores.akeyless import AkeylessProvider
 from soclens.secret_stores.base import SecretStoreConfig as BaseSecretStoreConfig
 from soclens.secret_stores.bitwarden import BitwardenProvider
 from soclens.secret_stores.hashicorp_vault import HashiCorpVaultProvider
@@ -1775,3 +1777,198 @@ def test_secret_server_is_password_null_defaults_to_is_secret_true(
                 "explicit-false": False,
                 "explicit-true": True,
             }
+
+
+def test_akeyless_access_key_auth_static_dynamic_rotated_and_batch_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    state = {"auth_count": 0, "active_token": "ak-tok-1"}
+
+    def handler(
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[int, dict[str, str] | None, Any]:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+        calls.append((path, payload))
+
+        if method == "POST" and path == "/auth":
+            if payload.get("access-type") != "access_key" or payload.get("access-key") != "sec-key":
+                return 401, None, {"error": "invalid credentials"}
+            state["auth_count"] += 1
+            state["active_token"] = f"ak-tok-{state['auth_count']}"
+            return 200, None, {"token": state["active_token"]}
+
+        if payload.get("token") != state["active_token"]:
+            return 401, None, {"error": "expired token"}
+
+        if method == "POST" and path == "/list-items":
+            req_path = payload.get("path")
+            if req_path == "/soclens":
+                return 200, None, {
+                    "folders": ["/soclens/nested"],
+                    "items": [
+                        {"item_name": "/soclens/rf", "item_type": "STATIC_SECRET"},
+                        {"item_name": "/soclens/plain_s1", "item_type": "static-secret"},
+                        {"item_name": "/soclens/dyn_db", "item_type": "DYNAMIC_SECRET"},
+                    ],
+                }
+            if req_path == "/soclens/nested":
+                return 200, None, {
+                    "items": [
+                        {"item_name": "/soclens/nested/rot_splunk", "item_type": "ROTATED_SECRET"},
+                        {"item_name": "/soclens/nested/enc_key", "item_type": "AES128GCM"},
+                    ],
+                }
+            return 200, None, {"items": []}
+
+        if method == "POST" and path == "/describe-item":
+            name = payload.get("name")
+            types_map = {
+                "/soclens/rf": "STATIC_SECRET",
+                "/soclens/plain_s1": "STATIC_SECRET",
+                "/soclens/dyn_db": "DYNAMIC_SECRET",
+                "/soclens/nested/rot_splunk": "ROTATED_SECRET",
+            }
+            if name in types_map:
+                return 200, None, {"item_name": name, "item_type": types_map[name]}
+            return 404, None, {"error": "item not found"}
+
+        if method == "POST" and path == "/get-secret-value":
+            names = payload.get("names") or []
+            if names == ["/soclens/rf"]:
+                return 200, None, {
+                    "/soclens/rf": json.dumps({"api_token": "rf-tok-123", "llm_key": "llm-456"})
+                }
+            if names == ["/soclens/plain_s1"]:
+                return 200, None, {"/soclens/plain_s1": "s1-plain-789"}
+            return 404, None, {"error": "not found"}
+
+        if method == "POST" and path == "/get-dynamic-secret-value":
+            if payload.get("name") == "/soclens/dyn_db":
+                return 200, None, {"user": "dyn_user_1", "password": "dyn_pw_1"}
+            return 404, None, {"error": "not found"}
+
+        if method == "POST" and path == "/get-rotated-secret-value":
+            if payload.get("names") == "/soclens/nested/rot_splunk":
+                return 200, None, {
+                    "value": json.dumps({"username": "rot_user", "password": "rot_pw_999"})
+                }
+            return 404, None, {"error": "not found"}
+
+        return 404, None, {"error": "unknown endpoint"}
+
+    with _local_http_server(handler, monkeypatch) as base_url:
+        cfg = SecretStoreConfig(
+            provider="akeyless",
+            akeyless_api_url=base_url,
+            akeyless_auth_mode="access_key",
+            akeyless_access_id="p-test-123",
+            akeyless_access_key="sec-key",
+            akeyless_prefix="/soclens",
+        )
+        assert "sec-key" not in repr(cfg)
+
+        with build_secret_store_provider(cfg) as prov:
+            assert isinstance(prov, AkeylessProvider)
+            conn = prov.test_connection()
+            assert conn["ok"] is True
+            assert conn["provider"] == "akeyless"
+            assert conn["item_count"] == 3
+
+            catalog = prov.list_secrets()
+            refs = {e.ref for e in catalog}
+            assert "akeyless:/soclens/rf:api_token" in refs
+            assert "akeyless:/soclens/rf:llm_key" in refs
+            assert "akeyless:/soclens/plain_s1:value" in refs
+            assert "akeyless:/soclens/dyn_db:user" in refs
+            assert "akeyless:/soclens/dyn_db:password" in refs
+            assert "akeyless:/soclens/nested/rot_splunk:username" in refs
+            assert "akeyless:/soclens/nested/rot_splunk:password" in refs
+            assert all("enc_key" not in r for r in refs)
+
+            # Force token rotation / 401 retry
+            state["active_token"] = "ak-tok-expired"
+            val = prov.get_secret_value("akeyless:/soclens/plain_s1:value")
+            assert val == "s1-plain-789"
+            assert state["auth_count"] == 2
+
+            # Batch deduplication across static + dynamic + rotated
+            calls.clear()
+            resolved = prov.resolve_mapped_settings(
+                {
+                    "rf_api_token": "akeyless:/soclens/rf:api_token",
+                    "rf_llm_api_key": "akeyless:/soclens/rf:llm_key",
+                    "splunk_username": "akeyless:/soclens/dyn_db:user",
+                    "splunk_password": "akeyless:/soclens/dyn_db:password",
+                    "s1_api_token": "akeyless:/soclens/nested/rot_splunk:password",
+                }
+            )
+            assert resolved == {
+                "rf_api_token": "rf-tok-123",
+                "rf_llm_api_key": "llm-456",
+                "splunk_username": "dyn_user_1",
+                "splunk_password": "dyn_pw_1",
+                "s1_api_token": "rot_pw_999",
+            }
+            dyn_calls = [c for c in calls if c[0] == "/get-dynamic-secret-value"]
+            static_calls = [c for c in calls if c[0] == "/get-secret-value"]
+            rot_calls = [c for c in calls if c[0] == "/get-rotated-secret-value"]
+            assert len(dyn_calls) == 1
+            assert len(static_calls) == 1
+            assert len(rot_calls) == 1
+
+
+def test_akeyless_token_auth_errors_and_hydration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+
+    def handler(
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[int, dict[str, str] | None, Any]:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+        if payload.get("token") != "t-valid":
+            return 401, None, {"error": "unauthorized"}
+        if path == "/describe-item":
+            return 200, None, {"item_name": "/app/rf", "item_type": "STATIC_SECRET"}
+        if path == "/get-secret-value":
+            return 200, None, {"/app/rf": json.dumps({"token": "hydrated-rf-secret"})}
+        return 404, None, {"error": "not found"}
+
+    with _local_http_server(handler, monkeypatch) as base_url:
+        bad_cfg = SecretStoreConfig(
+            provider="akeyless",
+            akeyless_api_url=base_url,
+            akeyless_auth_mode="token",
+            akeyless_token="t-bad",
+        )
+        assert "t-bad" not in repr(bad_cfg)
+        with AkeylessProvider(bad_cfg) as bad_prov:
+            with pytest.raises(SecretStoreAuthError):
+                bad_prov.test_connection()
+
+        save_profile_settings(
+            {
+                "secret_provider": "akeyless",
+                "akeyless_api_url": base_url,
+                "akeyless_auth_mode": "token",
+                "akeyless_token": "t-valid",
+                "vault_secret_map": serialize_vault_secret_map(
+                    {"rf_api_token": "akeyless:/app/rf:token"}
+                ),
+            }
+        )
+        masked = hydrate_secrets_from_store(force=True)
+        assert "rf_api_token" in masked
+        assert get_effective_setting("rf_api_token") == "hydrated-rf-secret"
+        settings_disk = get_settings_path().read_text(encoding="utf-8")
+        assert "hydrated-rf-secret" not in settings_disk

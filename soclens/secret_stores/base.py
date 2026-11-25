@@ -26,6 +26,7 @@ SECRET_PROVIDER_LABELS: dict[str, str] = {
     "hashicorp_vault": "HashiCorp Vault (KV v2)",
     "onepassword_connect": "1Password Connect Server",
     "bitwarden": "Bitwarden (bw serve)",
+    "akeyless": "Akeyless Vault",
 }
 
 

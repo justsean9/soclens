@@ -496,6 +496,7 @@ def test_wave0_categories_specs_and_aliases(monkeypatch: pytest.MonkeyPatch) -> 
         "hashicorp_vault",
         "onepassword_connect",
         "bitwarden",
+        "akeyless",
     )
     assert len(settings_mod.SECRET_MANAGED_SETTING_KEYS) == 10
     assert "rf_llm_api_key" in settings_mod.SECRET_MANAGED_SETTING_KEYS
@@ -505,6 +506,10 @@ def test_wave0_categories_specs_and_aliases(monkeypatch: pytest.MonkeyPatch) -> 
     assert bw_pw.secret is True
     assert bw_pw.default is None
     assert settings_mod.SETTING_SPECS_BY_KEY["bw_serve_url"].default == "http://127.0.0.1:8087"
+    assert settings_mod.SETTING_SPECS_BY_KEY["akeyless_api_url"].default == "https://api.akeyless.io"
+    assert settings_mod.SETTING_SPECS_BY_KEY["akeyless_auth_mode"].default == "access_key"
+    assert settings_mod.SETTING_SPECS_BY_KEY["akeyless_access_key"].secret is True
+    assert settings_mod.SETTING_SPECS_BY_KEY["akeyless_token"].secret is True
     assert settings_mod.SETTING_SPECS_BY_KEY["vault_kv_mount"].default == "secret"
     assert settings_mod.SETTING_SPECS_BY_KEY["vault_auth_mount"].default == "approle"
     assert settings_mod.SETTING_SPECS_BY_KEY["splunk_es_tenant_field"].default == "tenant_id"
