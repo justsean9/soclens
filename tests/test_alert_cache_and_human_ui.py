@@ -648,6 +648,7 @@ def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
 
 
 def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Path) -> None:
+    from textual.strip import Strip
     from textual.widgets import Input, OptionList, TextArea
 
     from soclens.tui.modals import ContextMenuModal
@@ -664,7 +665,23 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
                 return idx, col
         raise AssertionError(f"Could not find {needle!r} in SelectableRichLog")
 
-    # 1. SentinelOne bottom detail panel: real drag highlight + known field right-click vs free text
+    def _strip_bgcolors_for_text(strip: Strip, needle: str) -> list[str]:
+        """Return hex bgcolor names for every segment overlapping ``needle`` in ``strip``."""
+        text = strip.text
+        start = text.find(needle)
+        if start == -1:
+            return []
+        end = start + len(needle)
+        pos = 0
+        bgs: list[str] = []
+        for seg in strip._segments:
+            seg_end = pos + len(seg.text)
+            if seg_end > start and pos < end and seg.style and seg.style.bgcolor:
+                bgs.append(str(seg.style.bgcolor.name))
+            pos = seg_end
+        return bgs
+
+    # 1. SentinelOne bottom detail panel: visible drag highlight + button-like known field clicks
     s1_app = create_app(
         client=MagicMock(),
         s1_client=MagicMock(),
@@ -683,8 +700,8 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
                 "threatInfo": {
                     "threatName": "evil_dropper.exe",
                     "classification": "Suspicious binary execution from user temp directory",
-                    "originatorProcess": "powershell.exe",
-                    "commandLine": "powershell.exe -enc SQBFAFgA",
+                    "originatorProcess": "services.exe",
+                    "commandLine": "services.exe -enc SQBFAFgA",
                     "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
                 },
                 "agentRealtimeInfo": {"agentComputerName": "WKSTN-042"},
@@ -692,17 +709,20 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             s1_log.write(render_s1_record_detail("threats", rec))
             await pilot.pause()
 
-            # A. Free-text field (Classification) without highlight -> right-click opens NO menu
+            # A. Free-text field (Classification) without highlight -> left or right click opens NO menu
             cls_line, cls_col = await _find_line_and_col(s1_log, "Suspicious binary")
             s1_log.scroll_to(y=max(0, cls_line - 1), animate=False)
             await pilot.pause()
             sy = s1_log.content_region.y + (cls_line - int(round(s1_log.scroll_y)))
             sx = s1_log.content_region.x + cls_col + 2
+            await pilot.click(offset=(sx, sy), button=1)
+            await pilot.pause()
+            assert not isinstance(s1_app.screen, ContextMenuModal)
             await pilot.click(offset=(sx, sy), button=3)
             await pilot.pause()
             assert not isinstance(s1_app.screen, ContextMenuModal)
 
-            # B. Real mouse-drag highlight inside free-text Classification -> right-click searches exact substring!
+            # B. Real mouse-drag highlight inside free-text Classification -> bright #f2cc60 highlight + search!
             drag_start_x = s1_log.content_region.x + cls_col
             drag_end_x = drag_start_x + len("Suspicious binary") - 1
             await pilot.mouse_down(offset=(drag_start_x, sy))
@@ -710,6 +730,10 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             await pilot.mouse_up(offset=(drag_end_x, sy))
             await pilot.pause()
             assert s1_app.get_selected_text() == "Suspicious binary"
+            vis_y = cls_line - s1_log.scroll_offset.y
+            assert "#f2cc60" in _strip_bgcolors_for_text(
+                s1_log.render_line(vis_y), "Suspicious binary"
+            )
 
             await pilot.click(offset=(drag_start_x + 3, sy), button=3)
             await pilot.pause()
@@ -725,33 +749,59 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             s1_app.screen.clear_selection()
             await pilot.pause()
 
-            # C. Known field (Process -> powershell.exe) without highlighting -> right-click opens RF/Splunk menu directly!
-            proc_line, proc_col = await _find_line_and_col(s1_log, "powershell.exe")
+            # C. Hovering over known field (Process -> services.exe) highlights it like a button (#1f6feb)
+            proc_line, proc_col = await _find_line_and_col(s1_log, "services.exe")
             s1_log.scroll_to(y=max(0, proc_line - 1), animate=False)
             await pilot.pause()
             psy = s1_log.content_region.y + (proc_line - int(round(s1_log.scroll_y)))
             psx = s1_log.content_region.x + proc_col + 2
-            await pilot.click(offset=(psx, psy), button=3)
+            await pilot.hover(offset=(psx, psy))
+            await pilot.pause()
+            assert s1_log._hovered_pivot == ("Process", "services.exe")
+            proc_vis_y = proc_line - s1_log.scroll_offset.y
+            assert "#1f6feb" in _strip_bgcolors_for_text(
+                s1_log.render_line(proc_vis_y), "services.exe"
+            )
+
+            # D. Drag-highlighting a substring of services.exe does NOT auto-popup on release, highlights #f2cc60
+            p_start_x = s1_log.content_region.x + proc_col
+            p_end_x = p_start_x + len("services") - 1
+            await pilot.mouse_down(offset=(p_start_x, psy))
+            await pilot.hover(offset=(p_end_x, psy))
+            await pilot.mouse_up(offset=(p_end_x, psy))
+            await pilot.pause()
+            assert not isinstance(s1_app.screen, ContextMenuModal)
+            assert s1_app.get_selected_text() == "services"
+            assert "#f2cc60" in _strip_bgcolors_for_text(
+                s1_log.render_line(proc_vis_y), "services"
+            )
+            s1_app.screen.clear_selection()
+            await pilot.pause()
+
+            # E. Single left-click (button=1) on known field services.exe auto-pops up RF/Splunk search!
+            await pilot.click(offset=(psx, psy), button=1)
             await pilot.pause()
             assert isinstance(s1_app.screen, ContextMenuModal)
+            assert s1_log._active_pivot == ("Process", "services.exe")
             opts = s1_app.screen.query_one("#ctx-menu-options", OptionList)
             assert [str(opts.get_option_at_index(i).id) for i in range(opts.option_count)] == [
                 "research",
                 "rf_intel",
                 "splunk_keyword",
             ]
-            assert "powershell.exe" in str(opts.get_option_at_index(0).prompt)
+            assert "services.exe" in str(opts.get_option_at_index(0).prompt)
             s1_app.screen.dismiss("splunk_keyword")
             await pilot.pause()
             await pilot.pause()
+            assert s1_log._active_pivot is None
             assert (
                 s1_app.query_one("#splunk-search-spl", TextArea).text
-                == 'index=* "powershell.exe"'
+                == 'index=* "services.exe"'
             )
 
     asyncio.run(_run_s1())
 
-    # 2. RF Playbook Alert bottom detail panel: real drag highlight + known field right-click
+    # 2. RF Playbook Alert bottom detail panel: visible drag highlight + button-like known field click
     rf_app = create_app(
         client=MagicMock(),
         dry_run=True,
@@ -788,17 +838,20 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             rf_log.write(render_playbook_alert_detail(norm))
             await pilot.pause()
 
-            # A. Free-text Explanation without highlight -> right-click opens NO menu
+            # A. Free-text Explanation without highlight -> left or right click opens NO menu
             exp_line, exp_col = await _find_line_and_col(rf_log, "credential form")
             rf_log.scroll_to(y=max(0, exp_line - 1), animate=False)
             await pilot.pause()
             esy = rf_log.content_region.y + (exp_line - int(round(rf_log.scroll_y)))
             esx = rf_log.content_region.x + exp_col
+            await pilot.click(offset=(esx + 2, esy), button=1)
+            await pilot.pause()
+            assert not isinstance(rf_app.screen, ContextMenuModal)
             await pilot.click(offset=(esx + 2, esy), button=3)
             await pilot.pause()
             assert not isinstance(rf_app.screen, ContextMenuModal)
 
-            # B. Drag highlight "observed" in free-text Explanation -> right-click opens RF/Splunk-only menu
+            # B. Drag highlight "observed" in free-text Explanation -> visible #f2cc60 + right-click opens search
             obs_line, obs_col = await _find_line_and_col(rf_log, "observed")
             rf_log.scroll_to(y=max(0, obs_line - 1), animate=False)
             await pilot.pause()
@@ -809,6 +862,10 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             await pilot.mouse_up(offset=(osx + len("observed") - 1, osy))
             await pilot.pause()
             assert rf_app.get_selected_text() == "observed"
+            obs_vis_y = obs_line - rf_log.scroll_offset.y
+            assert "#f2cc60" in _strip_bgcolors_for_text(
+                rf_log.render_line(obs_vis_y), "observed"
+            )
             await pilot.click(offset=(osx + 2, osy), button=3)
             await pilot.pause()
             assert isinstance(rf_app.screen, ContextMenuModal)
@@ -823,13 +880,13 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             rf_app.screen.clear_selection()
             await pilot.pause()
 
-            # C. Known field DNS IP (203.0.113.77) without highlighting -> right-click searches RF/Splunk!
+            # C. Known field DNS IP (203.0.113.77) -> left-click auto-pops up RF/Splunk search!
             ip_line, ip_col = await _find_line_and_col(rf_log, "203.0.113.77")
             rf_log.scroll_to(y=max(0, ip_line - 1), animate=False)
             await pilot.pause()
             isy = rf_log.content_region.y + (ip_line - int(round(rf_log.scroll_y)))
             isx = rf_log.content_region.x + ip_col + 2
-            await pilot.click(offset=(isx, isy), button=3)
+            await pilot.click(offset=(isx, isy), button=1)
             await pilot.pause()
             assert isinstance(rf_app.screen, ContextMenuModal)
             rf_app.screen.dismiss("research")
@@ -888,7 +945,7 @@ def test_datatable_highlight_and_known_cell_right_click(tmp_path: Path) -> None:
             app.screen.dismiss(None)
             await pilot.pause()
 
-            # 3. Mouse-drag highlight substring inside table cell -> extracts exact text
+            # 3. Mouse-drag highlight substring inside table cell -> extracts exact text + #f2cc60 style
             sha_col = line_txt.index(sha1)
             sx1 = table.content_region.x + sha_col
             sx2 = sx1 + 11
@@ -897,6 +954,15 @@ def test_datatable_highlight_and_known_cell_right_click(tmp_path: Path) -> None:
             await pilot.mouse_up(offset=(sx2, row_y))
             await pilot.pause()
             assert app.get_selected_text() == sha1[:12]
+            sel_strip = table.render_line(1)
+            pos = 0
+            bgs: list[str] = []
+            for seg in sel_strip._segments:
+                seg_end = pos + len(seg.text)
+                if seg_end > sha_col and pos < sha_col + 12 and seg.style and seg.style.bgcolor:
+                    bgs.append(str(seg.style.bgcolor.name))
+                pos = seg_end
+            assert "#f2cc60" in bgs
 
     asyncio.run(_run())
 

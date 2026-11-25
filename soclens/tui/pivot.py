@@ -124,6 +124,12 @@ _FREE_TEXT_OR_NON_SEARCH_FIELDS: frozenset[str] = frozenset(
         "mitigation mode",
         "is up to date",
         "is decommissioned",
+        "operating system",
+        "os name",
+        "os revision",
+        "os type",
+        "os arch",
+        "agent version",
         "api family",
         "endpoint base",
         "auth header",
@@ -166,13 +172,17 @@ def build_keyword_spl(keyword: str) -> str:
 
 
 def make_pivot_text(value: str | Text, *, field: str = "") -> Text:
-    """Attach right-click search metadata (``pivot_field``/``pivot_value``) to known fields."""
+    """Attach clickable button style and search metadata (``pivot_field``/``pivot_value``) to known fields."""
     text = value.copy() if isinstance(value, Text) else Text(str(value))
     if _has_pivot_spans(text):
         return text
     plain = text.plain.strip()
     if is_clickable_known_field(field, plain):
-        text.stylize(Style(meta={"pivot_field": field, "pivot_value": plain}))
+        meta = {"pivot_field": field, "pivot_value": plain}
+        if not text.spans and not text.style:
+            text.stylize(Style(color="#79c0ff", underline=True, meta=meta))
+        else:
+            text.stylize(Style(underline=True, meta=meta))
     return text
 
 

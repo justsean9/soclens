@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.cells import cell_len, get_character_cell_size
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -75,6 +76,17 @@ def extract_richlog_text(log_widget: RichLog) -> str:
     return "\n".join(extracted).strip()
 
 
+_DEFAULT_SELECTION_STYLE = Style(bgcolor="#f2cc60", color="#0b0f17", bold=True)
+
+
+def _apply_post_style(strip: Strip, post_style: Style) -> Strip:
+    """Apply ``post_style`` on top of existing segment styles while preserving metadata."""
+    return Strip(
+        Segment.apply_style(strip._segments, post_style=post_style),
+        strip.cell_length,
+    )
+
+
 def _apply_selection_highlight(
     widget: Any,
     strip: Strip,
@@ -82,7 +94,7 @@ def _apply_selection_highlight(
     line_text: str,
     scroll_x: int,
 ) -> Strip:
-    """Apply Textual selection highlight styling to a rendered ``Strip`` line."""
+    """Apply high-contrast selection highlight styling to a rendered ``Strip`` line."""
     selection = getattr(widget, "text_selection", None)
     if selection is None:
         return strip
@@ -104,20 +116,122 @@ def _apply_selection_highlight(
     try:
         sel_style = widget.screen.get_component_rich_style("screen--selection")
     except Exception:
-        sel_style = Style(bgcolor="#264f78", color="#ffffff")
-    if not sel_style:
-        sel_style = Style(bgcolor="#264f78", color="#ffffff")
+        sel_style = _DEFAULT_SELECTION_STYLE
+    if (
+        not sel_style
+        or sel_style.bgcolor is None
+        or sel_style.color == sel_style.bgcolor
+    ):
+        sel_style = _DEFAULT_SELECTION_STYLE
+    else:
+        sel_style = sel_style + Style(bold=True)
     parts = strip.divide([vis_start, vis_end])
     if len(parts) == 3:
         before, middle, after = parts
-        return Strip.join([before, middle.apply_style(sel_style), after])
-    return strip.apply_style(sel_style)
+        return Strip.join([before, _apply_post_style(middle, sel_style), after])
+    return _apply_post_style(strip, sel_style)
 
 
 class SelectableRichLog(RichLog):
-    """``RichLog`` subclass with native mouse-drag text highlighting and selection extraction."""
+    """``RichLog`` subclass with bright drag selection and button-like clickable known fields."""
 
     ALLOW_SELECT = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._hovered_pivot: tuple[str, str] | None = None
+        self._active_pivot: tuple[str, str] | None = None
+        self._left_down_screen_pos: tuple[int, int] | None = None
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        """Highlight hovered clickable known fields like buttons."""
+        hit = extract_pivot_from_click(event)
+        if hit != self._hovered_pivot:
+            self._hovered_pivot = hit
+            self.refresh()
+
+    def on_leave(self, _event: events.Leave) -> None:
+        """Clear hovered field highlight when the pointer leaves the log."""
+        if self._hovered_pivot is not None:
+            self._hovered_pivot = None
+            self.refresh()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        """Track left-press coordinates so drag-highlighting does not trigger button-click popup."""
+        if event.button == 1:
+            self._left_down_screen_pos = (event.screen_x, event.screen_y)
+
+    def on_click(self, event: events.Click) -> None:
+        """Left-clicking a known clickable field auto-opens the RF / Splunk search popup."""
+        if event.button != 1:
+            return
+        down_pos = self._left_down_screen_pos
+        self._left_down_screen_pos = None
+        if down_pos is not None and down_pos != (event.screen_x, event.screen_y):
+            return
+        get_sel = getattr(self.app, "get_selected_text", None)
+        if callable(get_sel) and str(get_sel() or "").strip():
+            return
+        hit = extract_pivot_from_click(event)
+        if hit is None:
+            return
+        field_label, value = hit
+        self._active_pivot = (field_label, value)
+        self.refresh()
+
+        def _clear_active() -> None:
+            self._active_pivot = None
+            self.refresh()
+
+        open_menu = getattr(self.app, "open_selection_pivot_menu", None)
+        if callable(open_menu):
+            event.stop()
+            open_menu(
+                value,
+                origin=(event.screen_x, event.screen_y),
+                field_label=field_label,
+                on_close=_clear_active,
+            )
+
+    def _apply_pivot_button_style(self, strip: Strip) -> Strip:
+        if self._active_pivot is None and self._hovered_pivot is None:
+            return strip
+        active = self._active_pivot
+        hovered = self._hovered_pivot
+        active_style = Style(bgcolor="#f2cc60", color="#0b0f17", bold=True, underline=True)
+        hover_style = Style(bgcolor="#1f6feb", color="#ffffff", bold=True, underline=True)
+        changed = False
+        new_segments: list[Segment] = []
+        for seg in strip._segments:
+            style = seg.style
+            meta = style.meta if style is not None and style._meta is not None else None
+            if isinstance(meta, dict):
+                pv = str(meta.get("pivot_value") or "").strip()
+                pf = str(meta.get("pivot_field") or "Value").strip() or "Value"
+                if pv:
+                    pair = (pf, pv)
+                    if active is not None and pair == active:
+                        new_segments.append(
+                            Segment(
+                                seg.text,
+                                (style + active_style) if style else active_style,
+                                seg.control,
+                            )
+                        )
+                        changed = True
+                        continue
+                    if hovered is not None and pair == hovered:
+                        new_segments.append(
+                            Segment(
+                                seg.text,
+                                (style + hover_style) if style else hover_style,
+                                seg.control,
+                            )
+                        )
+                        changed = True
+                        continue
+            new_segments.append(seg)
+        return Strip(new_segments, strip.cell_length) if changed else strip
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
         """Extract the exact highlighted text across rendered ``RichLog`` lines."""
@@ -138,7 +252,7 @@ class SelectableRichLog(RichLog):
         self.refresh()
 
     def render_line(self, y: int) -> Strip:
-        """Render a viewport line with selection offset metadata and highlight styling."""
+        """Render a viewport line with selection offset metadata, button hover/active, and highlight."""
         strip = super().render_line(y)
         scroll_x, scroll_y = self.scroll_offset
         line_index = scroll_y + y
@@ -154,6 +268,7 @@ class SelectableRichLog(RichLog):
                 cells += get_character_cell_size(ch)
                 char_x += 1
         strip = strip.apply_offsets(char_x, line_index)
+        strip = self._apply_pivot_button_style(strip)
         return _apply_selection_highlight(self, strip, line_index, line_text, scroll_x)
 
 

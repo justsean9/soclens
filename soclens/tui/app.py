@@ -221,6 +221,11 @@ class SocLensApp(App[None]):
         background: #0f131c;
         color: #e6edf7;
     }
+    Screen > .screen--selection {
+        background: #f2cc60;
+        color: #0b0f17;
+        text-style: bold;
+    }
     ModalScreen {
         background: rgba(15, 19, 28, 0.55);
     }
@@ -1650,10 +1655,14 @@ class SocLensApp(App[None]):
         *,
         origin: tuple[int, int] = (4, 4),
         field_label: str = "Selection",
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         """Open a floating RF / Splunk search menu for highlighted text or a clicked field."""
         clean_val = " ".join(str(selected_text or "").strip().splitlines()).strip()
         if not clean_val:
+            if on_close is not None:
+                with contextlib.suppress(Exception):
+                    on_close()
             return
         from soclens.tui.modals import ContextMenuModal
 
@@ -1670,6 +1679,9 @@ class SocLensApp(App[None]):
             active_tab = str(self.query_one("#main-tabs", TabbedContent).active or "")
 
         def _on_select(action_id: str | None) -> None:
+            if on_close is not None:
+                with contextlib.suppress(Exception):
+                    on_close()
             if not action_id:
                 return
             if action_id == "splunk_keyword":
