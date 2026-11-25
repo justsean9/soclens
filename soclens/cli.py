@@ -3167,6 +3167,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "ollama",
                 "openai",
                 "m365_copilot",
+                "copilot_studio",
                 "copilot_directline",
                 "security_copilot",
             ],

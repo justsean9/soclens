@@ -103,10 +103,10 @@ DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_M365_COPILOT_GRAPH_URL = "https://graph.microsoft.com/beta"
 DEFAULT_COPILOT_DIRECTLINE_URL = "https://directline.botframework.com/v3/directline"
 COPILOT_LLM_PROVIDERS: frozenset[str] = frozenset(
-    {"m365_copilot", "copilot_directline", "security_copilot"}
+    {"m365_copilot", "copilot_studio", "copilot_directline", "security_copilot"}
 )
 SUPPORTED_LLM_PROVIDERS: frozenset[str] = frozenset(
-    {"ollama", "openai", "m365_copilot", "copilot_directline", "security_copilot"}
+    {"ollama", "openai", "m365_copilot", "copilot_studio", "copilot_directline", "security_copilot"}
 )
 
 
@@ -1091,8 +1091,9 @@ def _normalize_llm_provider(raw_provider: str | None) -> str:
         "enterprise_copilot": "m365_copilot",
         "directline": "copilot_directline",
         "copilot-directline": "copilot_directline",
-        "copilot_studio": "copilot_directline",
-        "copilot-studio": "copilot_directline",
+        "copilot_studio": "copilot_studio",
+        "copilot-studio": "copilot_studio",
+        "d2e": "copilot_studio",
         "security-copilot": "security_copilot",
         "sec_copilot": "security_copilot",
         "secops": "security_copilot",
@@ -1305,6 +1306,8 @@ def get_local_llm_config(
         default_url = DEFAULT_OPENAI_BASE_URL
     elif resolved_provider in ("m365_copilot", "security_copilot"):
         default_url = resolved_graph_url
+    elif resolved_provider == "copilot_studio":
+        default_url = get_effective_setting("ms_copilot_token_endpoint") or ""
     elif resolved_provider == "copilot_directline":
         default_url = resolved_dl_url
     else:
@@ -1316,7 +1319,7 @@ def get_local_llm_config(
         else None
     )
     raw_url = _clean_optional_str(base_url) or env_base_url or default_url
-    if not raw_url.lower().startswith(("http://", "https://")):
+    if raw_url and not raw_url.lower().startswith(("http://", "https://")):
         scheme = "https://" if resolved_provider in COPILOT_LLM_PROVIDERS else "http://"
         raw_url = f"{scheme}{raw_url}"
     normalized_url = raw_url.rstrip("/")

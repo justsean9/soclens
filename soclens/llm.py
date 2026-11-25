@@ -24,8 +24,10 @@ from soclens.config import (
 )
 from soclens.copilot import (
     CopilotDirectLineTransport,
+    CopilotStudioD2ETransport,
     M365CopilotTransport,
     SecurityCopilotTransport,
+    is_copilot_d2e_url,
 )
 
 __all__ = [
@@ -443,7 +445,11 @@ class LocalLLMClient:
         self._owns_session = session is None
         self._initial_conversation_id = (conversation_id or "").strip() or None
         self._copilot_transport: (
-            M365CopilotTransport | CopilotDirectLineTransport | SecurityCopilotTransport | None
+            M365CopilotTransport
+            | CopilotStudioD2ETransport
+            | CopilotDirectLineTransport
+            | SecurityCopilotTransport
+            | None
         ) = None
 
         if session is not None:
@@ -510,7 +516,12 @@ class LocalLLMClient:
 
     def _get_copilot_transport(
         self,
-    ) -> M365CopilotTransport | CopilotDirectLineTransport | SecurityCopilotTransport:
+    ) -> (
+        M365CopilotTransport
+        | CopilotStudioD2ETransport
+        | CopilotDirectLineTransport
+        | SecurityCopilotTransport
+    ):
         if self._copilot_transport is not None:
             return self._copilot_transport
         common_kwargs: dict[str, Any] = {
@@ -520,10 +531,22 @@ class LocalLLMClient:
             "error_factory": LocalLLMError,
             "connection_error_factory": LocalLLMConnectionError,
         }
-        if self.config.provider == "m365_copilot":
-            transport: M365CopilotTransport | CopilotDirectLineTransport | SecurityCopilotTransport = (
-                M365CopilotTransport(self.config, self.session, **common_kwargs)
+        is_d2e = self.config.provider == "copilot_studio" or (
+            self.config.provider == "copilot_directline"
+            and (
+                is_copilot_d2e_url(self.config.base_url)
+                or is_copilot_d2e_url(self.config.ms_token_endpoint)
             )
+        )
+        if self.config.provider == "m365_copilot":
+            transport: (
+                M365CopilotTransport
+                | CopilotStudioD2ETransport
+                | CopilotDirectLineTransport
+                | SecurityCopilotTransport
+            ) = M365CopilotTransport(self.config, self.session, **common_kwargs)
+        elif is_d2e:
+            transport = CopilotStudioD2ETransport(self.config, self.session, **common_kwargs)
         elif self.config.provider == "copilot_directline":
             transport = CopilotDirectLineTransport(self.config, self.session, **common_kwargs)
         elif self.config.provider == "security_copilot":
@@ -698,7 +721,7 @@ class LocalLLMClient:
             return self.config.model
         if self.config.provider == "m365_copilot":
             return "M365 Copilot Chat"
-        if self.config.provider == "copilot_directline":
+        if self.config.provider in ("copilot_studio", "copilot_directline"):
             return "Copilot Studio Agent"
         if self.config.provider == "security_copilot":
             return f"Security Copilot ({self.config.ms_security_workspace})"

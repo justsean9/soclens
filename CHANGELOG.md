@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-11-25
+
+### Added
+- **Native Copilot Studio Direct-to-Engine (`copilot_studio`) `POST` + SSE Transport (`soclens.copilot`, `soclens.llm`, `soclens.tui.screens.llm`)**:
+  - Added native `CopilotStudioD2ETransport` for Copilot Studio Native/Mobile App Connection String URLs (`https://<env>.environment.api.powerplatform.com/copilotstudio/.../bots/<schema>/conversations?api-version=...`), using `POST` + `Accept: text/event-stream` SSE streaming and automatic Power Platform token resolution (`az account get-access-token --resource https://api.powerplatform.com` via `az_cli`, or direct Bearer token — zero Entra ID App Registration required).
+  - Automatically routes `/copilotstudio/.../conversations` URLs to `CopilotStudioD2ETransport` even when `copilot_directline` is selected, fixing `HTTP 404: does not match any known API routes`.
+
 ## [2.3.0] - 2026-11-25
 
 ### Added

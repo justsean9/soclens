@@ -33,6 +33,7 @@ _PROVIDER_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Ollama", "ollama"),
     ("OpenAI-Compatible", "openai"),
     ("M365 Copilot Chat", "m365_copilot"),
+    ("Copilot Studio (Direct-to-Engine)", "copilot_studio"),
     ("Copilot Studio (Direct Line)", "copilot_directline"),
     ("Security Copilot", "security_copilot"),
 )
@@ -41,7 +42,8 @@ _PROVIDER_SHORT_LABELS: dict[str, str] = {
     "ollama": "Ollama",
     "openai": "OpenAI",
     "m365_copilot": "M365 Copilot",
-    "copilot_directline": "Copilot Studio",
+    "copilot_studio": "Copilot Studio D2E",
+    "copilot_directline": "Copilot Direct Line",
     "security_copilot": "Security Copilot",
 }
 
@@ -92,6 +94,8 @@ def _default_url_for_provider(provider: str) -> str:
         return DEFAULT_OPENAI_BASE_URL
     if provider in ("m365_copilot", "security_copilot"):
         return cfg.ms_graph_base_url or DEFAULT_M365_COPILOT_GRAPH_URL
+    if provider == "copilot_studio":
+        return cfg.ms_token_endpoint or ""
     if provider == "copilot_directline":
         return cfg.ms_token_endpoint or cfg.ms_directline_url or DEFAULT_COPILOT_DIRECTLINE_URL
     return DEFAULT_OLLAMA_BASE_URL
@@ -100,7 +104,7 @@ def _default_url_for_provider(provider: str) -> str:
 def _default_agent_label_for_provider(provider: str) -> str:
     if provider == "m365_copilot":
         return "M365 Copilot Chat"
-    if provider == "copilot_directline":
+    if provider in ("copilot_studio", "copilot_directline"):
         return "Copilot Studio Agent"
     if provider == "security_copilot":
         return "Security Copilot"

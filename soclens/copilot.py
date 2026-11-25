@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
 
@@ -32,12 +32,14 @@ from soclens.config import (
 
 __all__ = [
     "CopilotDirectLineTransport",
+    "CopilotStudioD2ETransport",
     "CopilotTokenResolver",
     "M365CopilotTransport",
     "SecurityCopilotTransport",
     "extract_activity_text",
     "extract_m365_reply_text",
     "inspect_jwt_expiry",
+    "is_copilot_d2e_url",
 ]
 
 logger = logging.getLogger("soclens.copilot")
@@ -110,6 +112,25 @@ def _graph_resource_from_url(graph_base_url: str) -> str:
     if parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
     return "https://graph.microsoft.com"
+
+
+def _powerplatform_resource_from_url(d2e_url: str) -> str:
+    host = (urlparse(d2e_url).netloc or "").lower()
+    if host.endswith(".api.powerplatform.microsoft.us"):
+        return "https://api.powerplatform.microsoft.us"
+    if host.endswith(".api.high.powerplatform.microsoft.us"):
+        return "https://api.high.powerplatform.microsoft.us"
+    if host.endswith(".api.appsplatform.us"):
+        return "https://api.appsplatform.us"
+    return "https://api.powerplatform.com"
+
+
+def is_copilot_d2e_url(url: str | None) -> bool:
+    """Return True if ``url`` is a Copilot Studio Direct-to-Engine (D2E) connection URL."""
+    raw = (url or "").strip().lower()
+    if not raw.startswith(("http://", "https://")):
+        return False
+    return "/copilotstudio/" in raw and ("/bots/" in raw or "/conversations" in raw)
 
 
 def _extract_adaptive_card_text(card: Mapping[str, Any]) -> list[str]:
@@ -284,16 +305,17 @@ class CopilotTokenResolver:
 
         if not self._static_token:
             raise error_cls(
-                "No Microsoft Graph Bearer token configured. Paste a token in Settings "
-                "(MS Copilot / Graph Bearer Token), set SOCLENS_MS_COPILOT_TOKEN, or switch "
-                "MS Copilot Auth Mode to 'az_cli' (see docs/MICROSOFT_COPILOT_GUIDE.md)."
+                f"No Microsoft Bearer token configured for {self.resource}. Paste a token in "
+                "Settings (MS Copilot / Graph Bearer Token), set SOCLENS_MS_COPILOT_TOKEN, or "
+                f"switch MS Copilot Auth Mode to 'az_cli' (`az account get-access-token --resource {self.resource}`). "
+                "See docs/MICROSOFT_COPILOT_GUIDE.md."
             )
         info = inspect_jwt_expiry(self._static_token)
         if info["expired"] and info["expires_at"] is not None:
             mins = max(1, int((time.time() - info["expires_at"]) // 60))
             raise error_cls(
-                f"Microsoft Graph Bearer token expired ~{mins}m ago. Refresh it from Graph "
-                "Explorer or `az account get-access-token --resource https://graph.microsoft.com`, "
+                f"Microsoft Bearer token expired ~{mins}m ago. Refresh it via "
+                f"`az account get-access-token --resource {self.resource}` (or Graph Explorer), "
                 "or switch MS Copilot Auth Mode to 'az_cli' for automatic refresh."
             )
         return self._static_token
@@ -1003,6 +1025,311 @@ class CopilotDirectLineTransport(_BaseCopilotTransport):
             "conversation_id": conv_id,
             "done": True,
             "raw": raw_activities,
+        }
+
+
+class CopilotStudioD2ETransport(_BaseCopilotTransport):
+    """Copilot Studio Direct-to-Engine (D2E) POST + SSE transport.
+
+    Supports connection strings from Copilot Studio -> Channels -> Native/Mobile App, e.g.::
+
+        https://<env>.environment.api.powerplatform.com/copilotstudio/
+        agenticruntime/3p/dataverse-backed/authenticated/bots/<schema>/
+        conversations?api-version=2022-03-01-preview
+    """
+
+    provider_name = "copilot_studio"
+
+    def __init__(
+        self,
+        config: LocalLLMConfig,
+        session: requests.Session,
+        *,
+        stop_event: threading.Event,
+        max_retries: int = 2,
+        backoff_base: float = 0.5,
+        error_factory: Callable[..., Exception],
+        connection_error_factory: Callable[..., Exception],
+        token_resolver: CopilotTokenResolver | None = None,
+        d2e_url: str | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            session,
+            stop_event=stop_event,
+            max_retries=max_retries,
+            backoff_base=backoff_base,
+            error_factory=error_factory,
+            connection_error_factory=connection_error_factory,
+        )
+        candidate_url = (
+            (d2e_url or "").strip()
+            or (config.base_url if is_copilot_d2e_url(config.base_url) else "")
+            or (
+                config.ms_token_endpoint
+                if config.ms_token_endpoint and is_copilot_d2e_url(config.ms_token_endpoint)
+                else ""
+            )
+        ).strip()
+        self.raw_d2e_url = candidate_url
+        self._start_url, self._turn_url_prefix, self._query = self._normalize_d2e_url(candidate_url)
+        self._requires_auth = "/authenticated/" in self._start_url.lower()
+        resource = _powerplatform_resource_from_url(self._start_url)
+        token = config.ms_bearer_token or config.api_key
+        self.token_resolver = token_resolver or CopilotTokenResolver(
+            auth_mode=config.ms_auth_mode,
+            bearer_token=token,
+            resource=resource,
+        )
+
+    @staticmethod
+    def _normalize_d2e_url(raw_url: str) -> tuple[str, str, str]:
+        if not raw_url:
+            return "", "", ""
+        parts = urlsplit(raw_url.strip())
+        path = parts.path.rstrip("/")
+        if not path.lower().endswith("/conversations"):
+            path = f"{path}/conversations"
+        query = parts.query or "api-version=2022-03-01-preview"
+        start_url = urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+        turn_prefix = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+        return start_url, turn_prefix, query
+
+    def _turn_url(self, conv_id: str) -> str:
+        return f"{self._turn_url_prefix}/{conv_id}?{self._query}"
+
+    def _headers(self, *, accept: str = "text/event-stream") -> dict[str, str]:
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": accept,
+            "Accept-Language": "en-US",
+            "User-Agent": _USER_AGENT,
+        }
+        if self._requires_auth or self.token_resolver.auth_mode == "az_cli" or self.token_resolver._static_token:
+            token = self.token_resolver.get_token(
+                error_cls=lambda msg: self._make_error(
+                    msg, provider=self.provider_name, endpoint=self._start_url
+                )
+            )
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _ensure_url(self) -> None:
+        if not self._start_url:
+            raise self._make_error(
+                "No Copilot Studio Direct-to-Engine URL configured. Paste your Copilot Studio "
+                "connection URL (https://<env>.environment.api.powerplatform.com/copilotstudio/.../conversations?api-version=...) "
+                "into the Base URL field or Settings -> Copilot Studio Token Endpoint.",
+                provider=self.provider_name,
+            )
+
+    def _parse_sse_or_json(
+        self,
+        response: requests.Response,
+        *,
+        stream_callback: Callable[[str], None] | None = None,
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], bool]:
+        """Parse D2E SSE or JSON response, returning ``(conv_id, messages, raw_events, done)``."""
+        conv_id: str | None = None
+        for hdr_key, hdr_val in response.headers.items():
+            if hdr_key.lower() == "x-ms-conversationid" and str(hdr_val).strip():
+                conv_id = str(hdr_val).strip()
+                break
+
+        raw_events: list[dict[str, Any]] = []
+        final_messages: list[str] = []
+        streamed_chunks: list[str] = []
+        done = True
+
+        ctype = str(response.headers.get("Content-Type") or "").lower()
+        if "application/json" in ctype:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if isinstance(data, dict):
+                raw_events.append(data)
+                conv_id = conv_id or self._extract_conv_id(data)
+                act = data.get("activity") if isinstance(data.get("activity"), Mapping) else data
+                if isinstance(act, Mapping) and str(act.get("type") or "").lower() == "message":
+                    rendered = extract_activity_text(act)
+                    if rendered:
+                        final_messages.append(rendered)
+                        if stream_callback is not None:
+                            stream_callback(rendered)
+            return conv_id, final_messages, raw_events, done
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if self._stop_event.is_set():
+                done = False
+                break
+            if raw_line is None:
+                continue
+            line = (
+                raw_line.decode("utf-8", errors="replace")
+                if isinstance(raw_line, bytes)
+                else raw_line
+            )
+            stripped = line.strip()
+            if not stripped or stripped.startswith(":") or stripped.startswith("event:") or stripped.startswith("id:"):
+                continue
+            data_str = stripped[5:].strip() if stripped.startswith("data:") else stripped
+            if data_str in ("[DONE]", "end"):
+                break
+            try:
+                event = json.loads(data_str)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            raw_events.append(event)
+            if not conv_id:
+                conv_id = self._extract_conv_id(event)
+
+            act = event.get("activity") if isinstance(event.get("activity"), dict) else event
+            if not isinstance(act, dict):
+                continue
+            act_type = str(act.get("type") or "").lower()
+            if act_type == "endofconversation":
+                break
+            if act_type != "message":
+                continue
+            sender = act.get("from")
+            if isinstance(sender, dict) and str(sender.get("role") or "").lower() == "user":
+                continue
+
+            raw_channel_data = act.get("channelData")
+            channel_data: dict[str, Any] = raw_channel_data if isinstance(raw_channel_data, dict) else {}
+            stream_type = str(channel_data.get("streamType") or "").lower()
+            rendered = extract_activity_text(act)
+            if not rendered:
+                continue
+            if stream_type in ("streaming", "informative"):
+                streamed_chunks.append(rendered)
+                if stream_callback is not None:
+                    stream_callback(rendered)
+            else:
+                final_messages.append(rendered)
+                if stream_callback is not None and not streamed_chunks:
+                    stream_callback(rendered)
+
+        messages = final_messages if final_messages else (["".join(streamed_chunks)] if streamed_chunks else [])
+        return conv_id, messages, raw_events, done
+
+    @staticmethod
+    def _extract_conv_id(obj: Mapping[str, Any]) -> str | None:
+        for key in ("conversationId", "conversation_id"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        conv = obj.get("conversation")
+        if isinstance(conv, Mapping):
+            cid = conv.get("id")
+            if isinstance(cid, str) and cid.strip():
+                return cid.strip()
+        act = obj.get("activity")
+        if isinstance(act, Mapping):
+            inner_conv = act.get("conversation")
+            if isinstance(inner_conv, Mapping):
+                cid = inner_conv.get("id")
+                if isinstance(cid, str) and cid.strip():
+                    return cid.strip()
+        return None
+
+    def check_connection(self) -> dict[str, Any]:
+        """Verify URL and start a lightweight D2E conversation to confirm auth & routing."""
+        try:
+            self._ensure_url()
+            conv_id = self.start_conversation()
+            return {
+                "ok": True,
+                "provider": self.provider_name,
+                "base_url": self._start_url,
+                "models": ["Copilot Studio Agent"],
+                "conversation_id": conv_id,
+                "error": None,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "provider": self.provider_name,
+                "base_url": self._start_url or self.raw_d2e_url,
+                "models": [],
+                "error": str(exc),
+            }
+
+    def start_conversation(self) -> str:
+        self._ensure_url()
+        resp = self._request(
+            "POST",
+            self._start_url,
+            headers=self._headers(accept="text/event-stream"),
+            json_payload={"emitStartConversationEvent": True},
+            stream=True,
+        )
+        try:
+            conv_id, _msgs, _raw, _done = self._parse_sse_or_json(resp)
+        finally:
+            resp.close()
+
+        if not conv_id:
+            raise self._make_error(
+                "Copilot Studio Direct-to-Engine did not return a conversation ID "
+                "(expected x-ms-conversationid header or conversation.id in SSE payload).",
+                provider=self.provider_name,
+                endpoint=self._start_url,
+            )
+        self.conversation_id = conv_id
+        return conv_id
+
+    def send_turn(
+        self,
+        text: str,
+        *,
+        conversation_id: str | None = None,
+        stream_callback: Callable[[str], None] | None = None,
+        model_label: str = "Copilot Studio Agent",
+    ) -> dict[str, Any]:
+        self._ensure_url()
+        conv_id = (conversation_id or self.conversation_id or "").strip()
+        if not conv_id:
+            conv_id = self.start_conversation()
+        else:
+            self.conversation_id = conv_id
+
+        url = self._turn_url(conv_id)
+        payload = {
+            "activity": {
+                "type": "message",
+                "text": text,
+                "channelData": {"locale": "en-US"},
+            }
+        }
+        resp = self._request(
+            "POST",
+            url,
+            headers=self._headers(accept="text/event-stream"),
+            json_payload=payload,
+            stream=True,
+        )
+        try:
+            parsed_conv_id, messages, raw_events, done = self._parse_sse_or_json(
+                resp, stream_callback=stream_callback
+            )
+        finally:
+            resp.close()
+
+        if parsed_conv_id:
+            conv_id = parsed_conv_id
+            self.conversation_id = conv_id
+
+        return {
+            "content": "\n\n".join(m for m in messages if m).strip(),
+            "model": model_label,
+            "provider": self.provider_name,
+            "conversation_id": conv_id,
+            "done": done,
+            "raw": raw_events,
         }
 
 

@@ -19,6 +19,7 @@ from soclens.copilot import (
     extract_activity_text,
     extract_m365_reply_text,
     inspect_jwt_expiry,
+    is_copilot_d2e_url,
 )
 from soclens.llm import LocalLLMClient, LocalLLMConnectionError, LocalLLMError
 
@@ -283,3 +284,64 @@ def test_named_agent_presets_and_client_resolution() -> None:
         assert client.provider == "security_copilot"
         assert client.config.ms_security_workspace == "soc-ws-1"
         assert "SecCopilot Prod" in client.list_models()
+
+
+def test_copilot_studio_d2e_post_sse_and_auto_routing() -> None:
+    d2e_url = (
+        "https://default1234.7e.environment.api.powerplatform.com/"
+        "copilotstudio/agenticruntime/3p/dataverse-backed/authenticated/"
+        "bots/cr9c8_rfthreat/conversations?api-version=2022-03-01-preview"
+    )
+    assert is_copilot_d2e_url(d2e_url) is True
+    assert is_copilot_d2e_url("https://directline.botframework.com/v3/directline") is False
+
+    start_resp = _fake_response(
+        200,
+        lines=[
+            'event: activity',
+            'data: {"type": "event", "conversation": {"id": "d2e-conv-777"}}',
+        ],
+    )
+    start_resp.headers = {
+        "Content-Type": "text/event-stream",
+        "x-ms-conversationid": "d2e-conv-777",
+    }
+    turn_resp = _fake_response(
+        200,
+        lines=[
+            "event: activity",
+            'data: {"type": "typing"}',
+            'data: {"type": "message", "from": {"role": "bot"}, "text": "RF threat score is 92 (Critical)."}',
+            "data: [DONE]",
+        ],
+    )
+    turn_resp.headers = {"Content-Type": "text/event-stream"}
+
+    session = MagicMock()
+    session.request.side_effect = [start_resp, turn_resp]
+
+    # Even if the user leaves provider on copilot_directline, pasting a D2E URL auto-routes to POST+SSE!
+    cfg = get_local_llm_config(
+        provider="copilot_directline",
+        base_url=d2e_url,
+        ms_bearer_token=_make_jwt(time.time() + 3600),
+    )
+    deltas: list[str] = []
+    with LocalLLMClient(config=cfg, session=session) as client:
+        res = client.chat(
+            [{"role": "user", "content": "Analyze IOC 198.51.100.10"}],
+            stream_callback=deltas.append,
+        )
+        assert res["provider"] == "copilot_studio"
+        assert res["conversation_id"] == "d2e-conv-777"
+        assert "RF threat score is 92 (Critical)." in res["content"]
+        assert deltas == ["RF threat score is 92 (Critical)."]
+
+        # Verify both calls used POST (never GET!) and turn appended /{conversationId}
+        assert session.request.call_count == 2
+        call1_kwargs = session.request.call_args_list[0].kwargs
+        call2_kwargs = session.request.call_args_list[1].kwargs
+        assert call1_kwargs["method"] == "POST"
+        assert call1_kwargs["url"] == d2e_url
+        assert call2_kwargs["method"] == "POST"
+        assert "/conversations/d2e-conv-777?api-version=2022-03-01-preview" in call2_kwargs["url"]

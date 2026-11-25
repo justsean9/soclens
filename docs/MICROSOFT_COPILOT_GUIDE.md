@@ -11,7 +11,8 @@ SOCLens supports five AI Analyst providers side-by-side (and you can open separa
 | Provider (`--provider`) | Microsoft Surface | Cost / Licensing Notes | Entra App Reg Needed? | Best Use Case |
 | :--- | :--- | :--- | :--- | :--- |
 | **`m365_copilot`** | Microsoft 365 Enterprise Copilot Chat (`graph.microsoft.com/beta/copilot/conversations`) | Uses your existing **M365 Copilot** license ($0 extra API/token spend). *Note: Free/base M365 web-only Copilot Chat does not currently expose a public REST chat API.* | **No** (Direct Bearer token or `az_cli`) | Lowest-cost direct Enterprise Copilot Chat grounded in M365 work data + web search |
-| **`copilot_directline`** | Copilot Studio published custom agents (Direct Line v3 / Token Endpoint) | Uses existing Copilot Studio message packs or Pay-As-You-Go capacity | **No** (Token Endpoint URL or Direct Line Secret) | Multi-agent workflows with custom enterprise SOC agents (Triage, SPL, Phishing, Playbooks) |
+| **`copilot_studio`** *(Direct-to-Engine)* | Copilot Studio published custom agents via Connection String (`/copilotstudio/.../conversations?api-version=...`) | Uses existing Copilot Studio capacity / message packs | **No** (Power Platform Bearer token or `az_cli` auto-refresh) | Native SSE streaming directly to your Copilot Studio agent using the Native/Mobile App Connection String |
+| **`copilot_directline`** | Copilot Studio published custom agents (Direct Line v3 / Token Endpoint) | Uses existing Copilot Studio message packs or Pay-As-You-Go capacity | **No** (Token Endpoint URL or Direct Line Secret) | Legacy Direct Line Secret / Token Endpoint channel |
 | **`security_copilot`** | Microsoft Security Copilot (`graph.microsoft.com/beta/security/securityCopilot/workspaces`) | Uses existing Security Copilot SCU capacity + `Security Copilot Contributor` RBAC | **No** (Direct Bearer token or `az_cli`) | Defender / Sentinel / Intune SOC investigations when Security Copilot is enabled |
 | **`ollama`** | Local Ollama (`http://127.0.0.1:11434`) | **$0** (runs locally / air-gapped) | **No** | Sensitive IOCs, offline investigations, zero cloud cost |
 | **`openai`** | OpenAI-compatible (LM Studio, vLLM, Azure AI Foundry) | Local = **$0**; Azure = per-token | Optional API key | Custom local or Azure-hosted LLMs |
@@ -55,14 +56,22 @@ $token | Set-Clipboard
 ```
 Paste into SOCLens **Settings → MS Copilot / Graph Bearer Token** (or `$env:SOCLENS_MS_COPILOT_TOKEN = $token`).
 
-### Method D: Copilot Studio Custom Agents (Token Endpoint / Direct Line Secret)
+### Method D: Copilot Studio Custom Agents (Direct-to-Engine Connection String or Direct Line)
 
-No Entra ID App Registration or Graph token is required for Copilot Studio channel access:
+#### Option D1: Direct-to-Engine Connection String (`copilot_studio`) — *Native SSE Streaming*
+1. Open your published agent in **Microsoft Copilot Studio** → **Channels** → **Native App / Mobile App** and copy the **Connection String URL**:
+   ```text
+   https://<env>.environment.api.powerplatform.com/copilotstudio/agenticruntime/3p/dataverse-backed/authenticated/bots/<schema>/conversations?api-version=2022-03-01-preview
+   ```
+2. Paste that URL into SOCLens **AI Analyst → Base URL** (or **Settings → Copilot Studio Token Endpoint**, or in `ms_copilot_agents_json` as `"base_url"`).
+3. Authenticate **without an Entra ID App Registration**:
+   - **Easiest (Auto-Refresh):** Run `az login` and set **MS Copilot Auth Mode** to `az_cli`. SOCLens automatically requests a Power Platform token (`az account get-access-token --resource https://api.powerplatform.com`).
+   - **Manual Bearer Token:** Run `az account get-access-token --resource https://api.powerplatform.com --query accessToken -o tsv` and paste into **Settings → MS Copilot / Graph Bearer Token**.
+   *(Note: If you paste a `/copilotstudio/.../conversations` URL while `copilot_directline` is selected, SOCLens automatically routes it to the Direct-to-Engine `POST` + SSE transport.)*
 
-1. Open your published agent in **Microsoft Copilot Studio**.
-2. Go to **Channels → Mobile App** (or **Native App / Web App**) and copy the **Token Endpoint** URL (e.g., `https://<env>.environment.api.powerplatform.com/powervirtualagents/botsbyschema/<schema>/directline/token?api-version=2022-03-01-preview`).
-   - *Alternative:* Under **Settings → Security → Web channel security**, copy a **Direct Line Secret**.
-3. Paste the Token Endpoint URL into SOCLens **Settings → Copilot Studio Token Endpoint** (or set `SOCLENS_MS_COPILOT_TOKEN_ENDPOINT`).
+#### Option D2: Direct Line Token Endpoint or Direct Line Secret (`copilot_directline`)
+1. Copy the **Direct Line Token Endpoint** (`.../powervirtualagents/botsbyschema/<schema>/directline/token?api-version=2022-03-01-preview`) or **Settings → Security → Web channel security → Secret 1**.
+2. Paste it into SOCLens **Settings → Copilot Studio Token Endpoint** or **Copilot Studio Direct Line Secret**.
 
 ---
 
@@ -179,14 +188,14 @@ pip install -e ".[dev]"
 
 ### Air-Gapped Offline Install (Windows)
 ```powershell
-Expand-Archive .\soclens-v2.3.0-offline-win_amd64.zip -DestinationPath .\soclens
+Expand-Archive .\soclens-v2.3.1-offline-win_amd64.zip -DestinationPath .\soclens
 cd .\soclens
 .\install_offline.ps1 -LaunchTui
 ```
 
 ### Air-Gapped Offline Install (Linux)
 ```bash
-unzip soclens-v2.3.0-offline-linux_x86_64.zip -d soclens
+unzip soclens-v2.3.1-offline-linux_x86_64.zip -d soclens
 cd soclens
 ./install_offline.sh --launch-tui
 ```
