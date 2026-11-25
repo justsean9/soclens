@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from rich.color import ColorSystem
 from rich.console import RenderableType
@@ -16,7 +17,7 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Select, Static, TabbedContent, TabPane
 
@@ -133,11 +134,57 @@ class _SocTabbedContent(TabbedContent):
         super()._on_tab_pane_focused(event)
 
 
+class _SocFooter(Footer):
+    """Footer that skips redundant recomposition when visible bindings are unchanged."""
+
+    _last_bindings_sig: tuple[tuple[str, str, str, bool, object], ...] | None = None
+
+    def bindings_changed(self, screen: Screen[Any]) -> None:
+        self._bindings_ready = True
+        if not screen.app.app_focus:
+            return
+        if self.is_attached and screen is self.screen:
+            sig = tuple(
+                (
+                    binding.key,
+                    binding.action,
+                    binding.description,
+                    enabled,
+                    binding.group,
+                )
+                for (_, binding, enabled, _tooltip) in screen.active_bindings.values()
+                if binding.show
+            )
+            if self._last_bindings_sig == sig and len(self.children) > 0:
+                return
+            self._last_bindings_sig = sig
+            self.call_after_refresh(self.recompose)
+
+
 class SocLensApp(App[None]):
     """Cross-platform Textual TUI covering all SOCLens investigation workflows."""
 
     TITLE = "SOCLens"
     SUB_TITLE = "SOC Investigation Workbench"
+
+    _TAB_SPECS: ClassVar[tuple[tuple[str, str, type[BaseSocPane]], ...]] = (
+        ("tab-dashboard", "Dashboard & Diagnostics", DashboardPane),
+        ("tab-watchlists", "Watchlists", WatchlistsPane),
+        ("tab-brand-logos", "Brand Logos", BrandLogosPane),
+        ("tab-rf-intel", "RF Intel & Alerts", RFIntelPane),
+        ("tab-sigma", "Sigma Rules", SigmaPane),
+        ("tab-splunk-bundle", "Splunk & Bundle", SplunkBundlePane),
+        ("tab-research", "Research", ResearchPane),
+        ("tab-logs", "Logs", LogsPane),
+        ("tab-sentinelone", "SentinelOne", SentinelOnePane),
+        ("tab-llm", "Local LLM", LocalLLMPane),
+        ("tab-splunk-search", "Splunk Search", SplunkSearchPane),
+        ("tab-splunk-es", "Splunk ES", SplunkESPane),
+        ("tab-settings", "Settings", SettingsPane),
+    )
+    _TAB_PANE_CLASSES: ClassVar[dict[str, type[BaseSocPane]]] = {
+        tab_id: pane_cls for tab_id, _title, pane_cls in _TAB_SPECS
+    }
 
     CSS: ClassVar[str] = """
     Screen {
@@ -948,6 +995,9 @@ class SocLensApp(App[None]):
         )
         self.log_store.set_on_entry(self._on_store_entry)
         self._verify_ssl_override: bool | str | None = None
+        self._mounted_tabs: set[str] = {self.initial_tab}
+        self._tab_mount_events: dict[str, asyncio.Event] = {}
+        self._pending_tab_callbacks: dict[str, list[Callable[[BaseSocPane], None]]] = {}
         self._update_subtitle()
 
     @property
@@ -1188,6 +1238,12 @@ class SocLensApp(App[None]):
                 with self._pending_log_lock:
                     self._log_flush_scheduled = False
 
+    def clear_pending_log_flush(self) -> None:
+        """Drop queued incremental log flush entries after a full log view rebuild."""
+        with self._pending_log_lock:
+            self._pending_log_entries.clear()
+            self._log_flush_scheduled = False
+
     def _flush_pending_logs(self) -> None:
         with self._pending_log_lock:
             batch = self._pending_log_entries
@@ -1195,11 +1251,73 @@ class SocLensApp(App[None]):
             self._log_flush_scheduled = False
         if not batch or self._shutting_down:
             return
+        logs_pane = self._get_mounted_pane("tab-logs")
+        if isinstance(logs_pane, LogsPane):
+            with contextlib.suppress(Exception):
+                logs_pane.append_entries(batch)
+
+    def _get_mounted_pane(self, tab_id: str) -> BaseSocPane | None:
+        if not self._ui_mounted or not tab_id or tab_id in self._tab_mount_events:
+            return None
         try:
-            logs_pane = self.query_one(LogsPane)
-            logs_pane.append_entries(batch)
+            tab_pane = self.query_one(f"#{tab_id}", TabPane)
         except Exception:
-            pass
+            return None
+        for child in tab_pane.children:
+            if isinstance(child, BaseSocPane):
+                return child
+        return None
+
+    async def ensure_tab_mounted(self, tab_id: str) -> BaseSocPane | None:
+        """Lazily mount the pane widget for ``tab_id`` if it has not been mounted yet."""
+        existing = self._get_mounted_pane(tab_id)
+        if existing is not None:
+            self._mounted_tabs.add(tab_id)
+            return existing
+
+        pane_cls = self._TAB_PANE_CLASSES.get(tab_id)
+        if pane_cls is None or self._shutting_down or not self._ui_mounted:
+            return None
+
+        inflight = self._tab_mount_events.get(tab_id)
+        if inflight is not None:
+            await inflight.wait()
+            return self._get_mounted_pane(tab_id)
+
+        try:
+            tab_pane = self.query_one(f"#{tab_id}", TabPane)
+        except Exception:
+            return None
+
+        done_event = asyncio.Event()
+        self._tab_mount_events[tab_id] = done_event
+        try:
+            pane = pane_cls()
+            await tab_pane.mount(pane)
+            for _ in range(10):
+                if self._shutting_down or not pane.is_attached:
+                    break
+                pending_events = [
+                    ev
+                    for child in pane.walk_children(with_self=True)
+                    if isinstance((ev := getattr(child, "_mounted_event", None)), asyncio.Event)
+                    and not ev.is_set()
+                    and not getattr(child, "_closing", False)
+                    and not getattr(child, "_pruning", False)
+                ]
+                if not pending_events:
+                    break
+                tasks = [asyncio.create_task(ev.wait()) for ev in pending_events]
+                _done, pending = await asyncio.wait(tasks, timeout=2.0)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    break
+            self._mounted_tabs.add(tab_id)
+            return pane
+        finally:
+            done_event.set()
+            self._tab_mount_events.pop(tab_id, None)
 
     def set_timezone(self, tz_name: str) -> str:
         """Validate, apply, and broadcast a display timezone change across mounted panes."""
@@ -1241,13 +1359,16 @@ class SocLensApp(App[None]):
 
     def open_logs_tab(self, *, source: str | None = None) -> None:
         """Switch to the dedicated Logs tab and optionally filter by ``source``."""
-        try:
-            tabs = self.query_one("#main-tabs", TabbedContent)
-            tabs.active = "tab-logs"
-            if source is not None:
-                self.query_one(LogsPane).set_source_filter(source)
-        except Exception:
-            pass
+
+        def _apply(pane: BaseSocPane) -> None:
+            if isinstance(pane, LogsPane) and source is not None:
+                pane.set_source_filter(source)
+
+        with contextlib.suppress(Exception):
+            self.activate_tab(
+                "tab-logs",
+                on_ready=_apply if source is not None else None,
+            )
 
     def open_llm_with_context(
         self,
@@ -1258,34 +1379,33 @@ class SocLensApp(App[None]):
         auto_send: bool = False,
     ) -> None:
         """Switch to the Local LLM tab and pre-load ``content`` with the given template."""
-        try:
-            tabs = self.query_one("#main-tabs", TabbedContent)
-            tabs.active = "tab-llm"
-            self.query_one(LocalLLMPane).analyze_context(
-                title,
-                content,
-                template=template,
-                auto_send=auto_send,
-            )
-        except Exception:
-            pass
+
+        def _apply(pane: BaseSocPane) -> None:
+            if isinstance(pane, LocalLLMPane):
+                pane.analyze_context(
+                    title,
+                    content,
+                    template=template,
+                    auto_send=auto_send,
+                )
+
+        with contextlib.suppress(Exception):
+            self.activate_tab("tab-llm", on_ready=_apply)
 
     def open_splunk_search(self, spl: str, *, auto_run: bool = False) -> None:
         """Switch to the Splunk Search tab and load an SPL query."""
-        try:
-            tabs = self.query_one("#main-tabs", TabbedContent)
-            tabs.active = "tab-splunk-search"
-            self.query_one(SplunkSearchPane).load_query(spl, auto_run=auto_run)
-        except Exception:
-            pass
+
+        def _apply(pane: BaseSocPane) -> None:
+            if isinstance(pane, SplunkSearchPane):
+                pane.load_query(spl, auto_run=auto_run)
+
+        with contextlib.suppress(Exception):
+            self.activate_tab("tab-splunk-search", on_ready=_apply)
 
     def open_settings_tab(self) -> None:
         """Switch to the Settings & Credentials tab."""
-        try:
-            tabs = self.query_one("#main-tabs", TabbedContent)
-            tabs.active = "tab-settings"
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            self.activate_tab("tab-settings")
 
     def action_open_settings(self) -> None:
         """Open the Settings tab unless a modal dialog is currently active."""
@@ -1334,9 +1454,10 @@ class SocLensApp(App[None]):
                     self.query_one(DashboardPane).sync_image_viewer_state()
                 with contextlib.suppress(Exception):
                     self.query_one(RFIntelPane).on_image_viewer_mode_changed()
-        self._apply_view_mode_to_ui()
-        self._sync_responsive_chrome()
-        self._focus_main_tabs()
+        with self.batch_update():
+            self._apply_view_mode_to_ui()
+            self._sync_responsive_chrome()
+            self._focus_main_tabs()
 
     def on_resize(self) -> None:
         """Update narrow-viewport chrome classes when terminal dimensions change."""
@@ -1418,33 +1539,11 @@ class SocLensApp(App[None]):
             )
             yield Button("Admin: OFF [F2]", id="view-mode-toggle-btn", compact=True)
         with _SocTabbedContent(initial=self.initial_tab, id="main-tabs"):
-            with TabPane("Dashboard & Diagnostics", id="tab-dashboard"):
-                yield DashboardPane()
-            with TabPane("Watchlists", id="tab-watchlists"):
-                yield WatchlistsPane()
-            with TabPane("Brand Logos", id="tab-brand-logos"):
-                yield BrandLogosPane()
-            with TabPane("RF Intel & Alerts", id="tab-rf-intel"):
-                yield RFIntelPane()
-            with TabPane("Sigma Rules", id="tab-sigma"):
-                yield SigmaPane()
-            with TabPane("Splunk & Bundle", id="tab-splunk-bundle"):
-                yield SplunkBundlePane()
-            with TabPane("Research", id="tab-research"):
-                yield ResearchPane()
-            with TabPane("Logs", id="tab-logs"):
-                yield LogsPane()
-            with TabPane("SentinelOne", id="tab-sentinelone"):
-                yield SentinelOnePane()
-            with TabPane("Local LLM", id="tab-llm"):
-                yield LocalLLMPane()
-            with TabPane("Splunk Search", id="tab-splunk-search"):
-                yield SplunkSearchPane()
-            with TabPane("Splunk ES", id="tab-splunk-es"):
-                yield SplunkESPane()
-            with TabPane("Settings", id="tab-settings"):
-                yield SettingsPane()
-        yield Footer()
+            for tab_id, title, pane_cls in self._TAB_SPECS:
+                with TabPane(title, id=tab_id):
+                    if tab_id == self.initial_tab:
+                        yield pane_cls()
+        yield _SocFooter()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide and disable Admin-only tab keybindings while in User View."""
@@ -1511,7 +1610,13 @@ class SocLensApp(App[None]):
         target = UI_VIEW_USER if self.is_admin_view else UI_VIEW_ADMIN
         self.set_view_mode(target)
 
-    def activate_tab(self, tab_id: str, *, auto_enable_admin: bool = False) -> bool:
+    def activate_tab(
+        self,
+        tab_id: str,
+        *,
+        auto_enable_admin: bool = False,
+        on_ready: Callable[[BaseSocPane], None] | None = None,
+    ) -> bool:
         """Activate ``tab_id`` if visible, optionally enabling Admin view when needed."""
         if tab_id not in ALL_TABS:
             return False
@@ -1526,7 +1631,32 @@ class SocLensApp(App[None]):
                 )
                 return False
         tabs = self.query_one("#main-tabs", TabbedContent)
-        tabs.active = tab_id
+        pane = self._get_mounted_pane(tab_id)
+        already_active = tabs.active == tab_id
+        if pane is not None:
+            if not already_active:
+                tabs.active = tab_id
+            if on_ready is not None:
+                on_ready(pane)
+            return True
+
+        if on_ready is not None:
+            self._pending_tab_callbacks.setdefault(tab_id, []).append(on_ready)
+        if not already_active:
+            tabs.active = tab_id
+        else:
+            async def _mount_and_dispatch() -> None:
+                mounted = await self.ensure_tab_mounted(tab_id)
+                if mounted is None:
+                    self._pending_tab_callbacks.pop(tab_id, None)
+                    return
+                mounted.on_tab_activated()
+                callbacks = self._pending_tab_callbacks.pop(tab_id, [])
+                for cb in callbacks:
+                    with contextlib.suppress(Exception):
+                        cb(mounted)
+
+            self.run_worker(_mount_and_dispatch(), exclusive=False)
         return True
 
     @on(Button.Pressed, "#view-mode-toggle-btn")
@@ -1546,15 +1676,22 @@ class SocLensApp(App[None]):
             self._focus_main_tabs()
 
     @on(TabbedContent.TabActivated, "#main-tabs")
-    def handle_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        """Notify the activated pane so it can auto-load or reflow tables."""
+    async def handle_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Lazily mount the activated pane, notify it, and invoke pending callbacks."""
         if event.pane is None:
             return
-        if event.pane.id in USER_VIEW_TABS:
-            self._last_user_tab = str(event.pane.id)
-        for child in event.pane.children:
-            if isinstance(child, BaseSocPane):
-                child.on_tab_activated()
+        tab_id = str(event.pane.id or "")
+        if tab_id in USER_VIEW_TABS:
+            self._last_user_tab = tab_id
+        pane = await self.ensure_tab_mounted(tab_id)
+        if pane is None:
+            self._pending_tab_callbacks.pop(tab_id, None)
+            return
+        pane.on_tab_activated()
+        callbacks = self._pending_tab_callbacks.pop(tab_id, [])
+        for cb in callbacks:
+            with contextlib.suppress(Exception):
+                cb(pane)
 
     def action_switch_tab(self, tab_id: str) -> None:
         """Activate a top-level workflow tab by ID when accessible in the active view."""
@@ -1566,26 +1703,16 @@ class SocLensApp(App[None]):
     def action_toggle_watchlist_filter(self) -> None:
         """Toggle search/filter drawer when Watchlists, RF Intel, Research, or Logs tab is active."""
         tabs = self.query_one("#main-tabs", TabbedContent)
-        if tabs.active == "tab-watchlists":
-            self.query_one(WatchlistsPane).action_toggle_filter()
-        elif tabs.active == "tab-rf-intel":
-            self.query_one(RFIntelPane).action_toggle_filter()
-        elif tabs.active == "tab-research":
-            self.query_one(ResearchPane).action_toggle_filter()
-        elif tabs.active == "tab-logs":
-            self.query_one(LogsPane).action_toggle_filter()
+        pane = self._get_mounted_pane(str(tabs.active or ""))
+        if isinstance(pane, (WatchlistsPane, RFIntelPane, ResearchPane, LogsPane)):
+            pane.action_toggle_filter()
 
     def action_collapse_watchlist_filter(self) -> None:
         """Collapse search/filter drawer when Watchlists, RF Intel, Research, or Logs tab is active."""
         tabs = self.query_one("#main-tabs", TabbedContent)
-        if tabs.active == "tab-watchlists":
-            self.query_one(WatchlistsPane).action_collapse_filter()
-        elif tabs.active == "tab-rf-intel":
-            self.query_one(RFIntelPane).action_collapse_filter()
-        elif tabs.active == "tab-research":
-            self.query_one(ResearchPane).action_collapse_filter()
-        elif tabs.active == "tab-logs":
-            self.query_one(LogsPane).action_collapse_filter()
+        pane = self._get_mounted_pane(str(tabs.active or ""))
+        if isinstance(pane, (WatchlistsPane, RFIntelPane, ResearchPane, LogsPane)):
+            pane.action_collapse_filter()
 
     def on_key(self, event: events.Key) -> None:
         """Forward printable keys on Watchlists and Research tabs when focus is outside the pane."""

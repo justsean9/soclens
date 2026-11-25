@@ -945,20 +945,27 @@ class WatchlistsPane(BaseSocPane):
     def _send_to_brand_logos(
         self, list_id: str, list_name: str, list_type: str, *, as_source: bool
     ) -> None:
+        def _apply(brand_pane: BaseSocPane) -> None:
+            if not isinstance(brand_pane, BrandLogosPane):
+                return
+            if as_source:
+                brand_pane.select_source_domain_list(list_id, list_name=list_name)
+            else:
+                brand_pane.select_brand_list(
+                    list_id,
+                    list_name=list_name,
+                    list_type=list_type,
+                )
+
+        activate_fn = getattr(self.app, "activate_tab", None)
+        if callable(activate_fn):
+            activate_fn("tab-brand-logos", auto_enable_admin=True, on_ready=_apply)
+            return
+
         tabs = self.app.query_one("#main-tabs", TabbedContent)
         tabs.active = "tab-brand-logos"
         brand_pane = self.app.query_one(BrandLogosPane)
-        if as_source:
-            self.call_after_refresh(
-                brand_pane.select_source_domain_list, list_id, list_name=list_name
-            )
-        else:
-            self.call_after_refresh(
-                brand_pane.select_brand_list,
-                list_id,
-                list_name=list_name,
-                list_type=list_type,
-            )
+        self.call_after_refresh(_apply, brand_pane)
 
     @staticmethod
     def _entity_sort_menu_items() -> list[tuple[str, str]]:
@@ -1118,6 +1125,15 @@ class WatchlistsPane(BaseSocPane):
         )
 
     def _lookup_entity_in_rf_intel(self, ent_type: str, ent_val: str) -> None:
+        def _apply(rf_pane: BaseSocPane) -> None:
+            if isinstance(rf_pane, RFIntelPane):
+                rf_pane.lookup_from_watchlist(ent_type, ent_val)
+
+        activate_fn = getattr(self.app, "activate_tab", None)
+        if callable(activate_fn):
+            activate_fn("tab-rf-intel", on_ready=_apply)
+            return
+
         tabs = self.app.query_one("#main-tabs", TabbedContent)
         tabs.active = "tab-rf-intel"
         rf_pane = self.app.query_one(RFIntelPane)
@@ -1136,6 +1152,16 @@ class WatchlistsPane(BaseSocPane):
             "company": "company",
         }
         mapped = type_map.get(ent_type.strip().lower(), "auto")
+
+        def _apply(res_pane: BaseSocPane) -> None:
+            if isinstance(res_pane, ResearchPane):
+                res_pane.investigate_external(ent_val, mapped)
+
+        activate_fn = getattr(self.app, "activate_tab", None)
+        if callable(activate_fn):
+            activate_fn("tab-research", on_ready=_apply)
+            return
+
         tabs = self.app.query_one("#main-tabs", TabbedContent)
         tabs.active = "tab-research"
         res_pane = self.app.query_one(ResearchPane)

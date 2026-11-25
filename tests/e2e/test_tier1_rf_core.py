@@ -789,6 +789,8 @@ def test_f4_remove_non_auto_resolved_company_via_client_cli_and_tui(
             await pilot.click("#confirm-approve-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             tui_status_after = str(app.query_one("#wl-status", Static).render())
 
     asyncio.run(_run_tui())

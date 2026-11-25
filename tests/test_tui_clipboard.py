@@ -210,14 +210,14 @@ def test_copy_text_modal_controls_and_save(
             workspace_dir=tmp_path,
         )
         async with app.run_test(size=(120, 36)) as pilot:
-            await pilot.pause(0.1)
+            await pilot.pause()
             pane = app.query_one(SigmaPane)
             pane.open_copy_modal(
                 "index=*wineventlog CommandLine=\"*-EncodedCommand*\"\n| table _time host",
                 title="Test SPL Query",
                 language="spl",
             )
-            await pilot.pause(0.1)
+            await pilot.pause()
             assert isinstance(app.screen, CopyTextModal)
 
             ta = app.screen.query_one("#copy-modal-textarea", TextArea)
@@ -230,25 +230,25 @@ def test_copy_text_modal_controls_and_save(
 
             # Copy All
             await pilot.click("#copy-modal-copy-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert len(copied_payloads) == 1
             assert "EncodedCommand" in copied_payloads[0]
 
             # Toggle Wrap
             await pilot.click("#copy-modal-wrap-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert ta.soft_wrap is False
 
             # Save to File
             await pilot.click("#copy-modal-save-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             exported = list((tmp_path / "exports").glob("test_spl_query_*.spl"))
             assert len(exported) == 1
             assert "EncodedCommand" in exported[0].read_text(encoding="utf-8")
 
             # Close via Escape
             await pilot.press("escape")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert not isinstance(app.screen, CopyTextModal)
 
     asyncio.run(_run())
@@ -274,7 +274,7 @@ def test_sigma_pane_copy_buttons_bindings_and_context_menu(
             workspace_dir=tmp_path,
         )
         async with app.run_test(size=(130, 38)) as pilot:
-            await pilot.pause(0.1)
+            await pilot.pause()
             pane = app.query_one(SigmaPane)
             sample_rule = {
                 "rule_id": "sigma-ps-001",
@@ -286,7 +286,7 @@ def test_sigma_pane_copy_buttons_bindings_and_context_menu(
             }
             pane._rules = [sample_rule]
             pane._populate_table([sample_rule])
-            await pilot.pause(0.1)
+            await pilot.pause()
 
             assert pane._last_raw_yaml == SAMPLE_SIGMA_YAML
             assert "index=*wineventlog" in pane._last_spl_query
@@ -294,63 +294,63 @@ def test_sigma_pane_copy_buttons_bindings_and_context_menu(
 
             # Copy SPL button
             await pilot.click("#sigma-copy-spl-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == pane._last_spl_query
 
             # Copy Stanza button
             await pilot.click("#sigma-copy-stanza-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == pane._last_stanza_text
 
             # Copy YAML button
             await pilot.click("#sigma-copy-yaml-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == SAMPLE_SIGMA_YAML
 
             # Copyable View button opens CopyTextModal
             await pilot.click("#sigma-copy-modal-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, CopyTextModal)
             await pilot.click("#copy-modal-close-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert not isinstance(app.screen, CopyTextModal)
 
             # Typing 'c', 'y', 'v' inside Input must NOT trigger copy/modal actions
             search_input = pane.query_one("#sigma-query-input", Input)
             search_input.focus()
-            await pilot.pause(0.05)
+            await pilot.pause()
             before_count = len(copied)
             await pilot.press("c", "y", "v")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert search_input.value == "cyv"
             assert len(copied) == before_count
             assert not isinstance(app.screen, CopyTextModal)
 
             # Focus table -> 'c' copies SPL, 'y' copies stanza, 'v' opens CopyTextModal
             pane.query_one("#sigma-table", DataTable).focus()
-            await pilot.pause(0.05)
+            await pilot.pause()
             await pilot.press("c")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == pane._last_spl_query
 
             await pilot.press("y")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == pane._last_stanza_text
 
             await pilot.press("v")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, CopyTextModal)
             await pilot.press("q")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert not isinstance(app.screen, CopyTextModal)
 
             # Context menu copy_rule_id
             pane._open_sigma_menu(row_rule_id="sigma-ps-001", origin=(5, 5))
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option(app, "copy_rule_id")
             await pilot.press("enter")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == "sigma-ps-001"
 
     asyncio.run(_run())
@@ -377,69 +377,69 @@ def test_cross_pane_copy_and_modal_actions(
             view_mode="admin",
         )
         async with app.run_test(size=(130, 38)) as pilot:
-            await pilot.pause(0.1)
+            await pilot.pause()
 
             # 1. RF Intel Pane: Copy Detail button + context menu
             rf_pane = app.query_one(RFIntelPane)
             await pilot.click("#rf-copy-detail-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert len(copied) >= 1
             assert copied[-1] != ""
 
             rf_pane._open_pane_context_menu(origin=(5, 5))
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option(app, "open_copy_view")
             await pilot.press("enter")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, CopyTextModal)
             await pilot.press("escape")
-            await pilot.pause(0.05)
+            await pilot.pause()
 
             # 2. Research Pane: Copy Detail button
             app.action_switch_tab("tab-research")
-            await pilot.pause(0.1)
+            await pilot.pause()
             res_pane = app.query_one(ResearchPane)
             before = len(copied)
             await pilot.click("#res-copy-detail-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert len(copied) == before + 1
             assert res_pane is not None
 
             # 3. Watchlists Pane: context menu Copy Watchlist ID
             app.action_switch_tab("tab-watchlists")
-            await pilot.pause(0.1)
+            await pilot.pause()
             wl_pane = app.query_one(WatchlistsPane)
             wl_pane._open_watchlist_menu(
                 {"id": "report:wl-123", "type": "domain", "name": "Corp Domains"},
                 origin=(5, 5),
             )
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option(app, "copy_list_id")
             await pilot.press("enter")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == "report:wl-123"
 
             # 4. Brand Logos Pane: context menu Copy Hash / Domain
             app.action_switch_tab("tab-brand-logos")
-            await pilot.pause(0.1)
+            await pilot.pause()
             brand_pane = app.query_one(BrandLogosPane)
             brand_table = brand_pane.query_one("#brand-table", DataTable)
             brand_table.clear()
             sha256_sample = "a" * 64
             brand_table.add_row("example.com", "synced", "1", sha256_sample)
             brand_pane._open_brand_menu(origin=(5, 5), row_index=0)
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option(app, "copy_hash_domain")
             await pilot.press("enter")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert copied[-1] == sha256_sample
 
             # 5. Splunk & Bundle Pane: context menu Copy Selected Stanza / Row
             app.action_switch_tab("tab-splunk-bundle")
-            await pilot.pause(0.1)
+            await pilot.pause()
             splunk_pane = app.query_one(SplunkBundlePane)
             splunk_pane._last_searches = [
                 {
@@ -451,24 +451,24 @@ def test_cross_pane_copy_and_modal_actions(
             splunk_table = splunk_pane.query_one("#splunk-results-table", DataTable)
             splunk_table.add_row("RF Test Detection", "savedsearches.conf", "DRY-RUN", "-", "")
             splunk_pane._open_splunk_menu(origin=(5, 5), row_index=0)
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert isinstance(app.screen, ContextMenuModal)
             _select_context_option(app, "copy_stanza_row")
             await pilot.press("enter")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert "[RF Test Detection]" in copied[-1]
             assert "index=*wineventlog EventCode=4688" in copied[-1]
 
             # 6. Logs Pane: Copy Visible Logs button
             app.action_switch_tab("tab-logs")
-            await pilot.pause(0.1)
+            await pilot.pause()
             app.record_log("Clipboard verification entry", level="INFO", source="tui")
-            await pilot.pause(0.05)
+            await pilot.pause()
             logs_pane = app.query_one(LogsPane)
             logs_pane.rebuild_view()
-            await pilot.pause(0.05)
+            await pilot.pause()
             await pilot.click("#logs-copy-btn")
-            await pilot.pause(0.05)
+            await pilot.pause()
             assert "Clipboard verification entry" in copied[-1]
             assert json.dumps({"ok": True})  # sanity
 

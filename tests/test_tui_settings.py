@@ -130,7 +130,6 @@ def test_tui_settings_zero_env_save_live_reloads_client_dashboard_and_watchlists
                 assert "INSECURE SSL" in app.sub_title
                 assert get_splunk_config(required=True).app == "CustomESApp"
                 assert get_sentinelone_config(required=True).console_url == "https://s1.ui.local"
-                assert app.query_one("#splunk-app", Input).value == "CustomESApp"
 
                 # Dashboard updated live
                 new_dash = str(app.query_one("#dash-env-summary", Static).content)
@@ -140,6 +139,11 @@ def test_tui_settings_zero_env_save_live_reloads_client_dashboard_and_watchlists
                 # Watchlists auto-load gate reset so switching back attempts load
                 wl_pane = app.query_one("WatchlistsPane")
                 assert wl_pane._auto_load_started is False
+
+                # Splunk & Bundle tab picks up updated Splunk app when activated
+                tabs.active = "tab-splunk-bundle"
+                await pilot.pause()
+                assert app.query_one("#splunk-app", Input).value == "CustomESApp"
 
         asyncio.run(_run())
 
@@ -293,66 +297,54 @@ def test_tui_settings_connection_tests_and_responsive_layout(tmp_path: Path) -> 
         workspace_dir=tmp_path,
     )
 
-    async def _run_narrow() -> None:
+    async def _run_all() -> None:
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             ws = app.query_one("#settings-workspace")
             assert not ws.has_class("split-horizontal")
 
-    asyncio.run(_run_narrow())
-
-    app2 = create_app(
-        client=mock_rf,
-        s1_client=mock_s1,
-        dry_run=True,
-        initial_tab="tab-settings",
-        workspace_dir=tmp_path,
-    )
-
-    async def _run_wide() -> None:
-        async with app2.run_test(size=(150, 42)) as pilot:
+            await pilot.resize_terminal(150, 42)
             await pilot.pause()
-            ws = app2.query_one("#settings-workspace")
             assert ws.has_class("split-horizontal")
 
-            pane = app2.query_one(SettingsPane)
-            app2.query_one("#set-rf-api-token", Input).value = "rf-tok"
-            app2.query_one("#set-s1-console-url", Input).value = "https://s1.local"
-            app2.query_one("#set-s1-api-token", Input).value = "s1-tok"
+            pane = app.query_one(SettingsPane)
+            app.query_one("#set-rf-api-token", Input).value = "rf-tok"
+            app.query_one("#set-s1-console-url", Input).value = "https://s1.local"
+            app.query_one("#set-s1-api-token", Input).value = "s1-tok"
             await pilot.click("#settings-test-rf-btn")
             await pilot.pause()
-            await app2.workers.wait_for_complete()
+            await app.workers.wait_for_complete()
             await pilot.pause()
-            assert "RF connected" in str(app2.query_one("#settings-status", Static).content)
+            assert "RF connected" in str(app.query_one("#settings-status", Static).content)
 
-            app2.query_one("#settings-category-list", OptionList).highlighted = 2
+            app.query_one("#settings-category-list", OptionList).highlighted = 2
             await pilot.pause()
             await pilot.click("#settings-test-s1-btn")
             await pilot.pause()
-            await app2.workers.wait_for_complete()
+            await app.workers.wait_for_complete()
             await pilot.pause()
-            assert "SentinelOne OK" in str(app2.query_one("#settings-status", Static).content)
+            assert "SentinelOne OK" in str(app.query_one("#settings-status", Static).content)
 
             with patch("soclens.tui.screens.settings.SplunkValidator") as mock_sp:
                 mock_sp.return_value.__enter__.return_value.check_connection.return_value = True
-                app2.query_one("#set-splunk-token", Input).value = "sp-tok"
-                app2.query_one("#settings-category-list", OptionList).highlighted = 1
+                app.query_one("#set-splunk-token", Input).value = "sp-tok"
+                app.query_one("#settings-category-list", OptionList).highlighted = 1
                 await pilot.pause()
                 await pilot.click("#settings-test-splunk-btn")
                 await pilot.pause()
-                await app2.workers.wait_for_complete()
+                await app.workers.wait_for_complete()
                 await pilot.pause()
-                assert "Splunk OK" in str(app2.query_one("#settings-status", Static).content)
+                assert "Splunk OK" in str(app.query_one("#settings-status", Static).content)
 
                 await pilot.click("#settings-test-all-btn")
                 await pilot.pause()
-                await app2.workers.wait_for_complete()
+                await app.workers.wait_for_complete()
                 await pilot.pause()
-                status_all = str(app2.query_one("#settings-status", Static).content)
+                status_all = str(app.query_one("#settings-status", Static).content)
                 assert "RF connected" in status_all
                 assert "Splunk OK" in status_all
                 assert "SentinelOne OK" in status_all
 
             assert isinstance(pane, SettingsPane)
 
-    asyncio.run(_run_wide())
+    asyncio.run(_run_all())

@@ -107,7 +107,8 @@ def test_s1_pane_views_and_refresh(tmp_path: Path) -> None:
 
             # Endpoints view refresh
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             assert table.row_count == 1
             s1.list_agents.assert_called_once()
 
@@ -115,7 +116,8 @@ def test_s1_pane_views_and_refresh(tmp_path: Path) -> None:
             pane.query_one("#s1-view-select", Select).value = "threats"
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             assert table.row_count == 1
             s1.list_threats.assert_called_once()
 
@@ -123,7 +125,8 @@ def test_s1_pane_views_and_refresh(tmp_path: Path) -> None:
             pane.query_one("#s1-view-select", Select).value = "exclusions"
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             assert table.row_count == 1
             s1.list_exclusions.assert_called_once()
 
@@ -131,7 +134,8 @@ def test_s1_pane_views_and_refresh(tmp_path: Path) -> None:
             pane.query_one("#s1-view-select", Select).value = "blocklist"
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             assert table.row_count == 1
             s1.list_blocklist.assert_called_once()
 
@@ -139,12 +143,14 @@ def test_s1_pane_views_and_refresh(tmp_path: Path) -> None:
             pane.query_one("#s1-view-select", Select).value = "sites_activities"
             await pilot.pause()
             await pilot.click("#s1-sites-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             assert table.row_count == 1
             s1.list_sites.assert_called_once()
 
             await pilot.click("#s1-activities-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             assert table.row_count == 1
             s1.list_activities.assert_called_once()
 
@@ -165,14 +171,15 @@ def test_s1_confirm_action_modal_guardrail_cancel_and_approve(tmp_path: Path) ->
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
             # Click Isolate -> ConfirmActionModal must open; Cancel blocks API call
             await pilot.click("#s1-isolate-btn")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-cancel-btn")
-            await pilot.pause(0.1)
+            await pilot.pause()
             s1.disconnect_agent.assert_not_called()
 
             # Click Isolate again -> Approve executes disconnect_agent
@@ -180,7 +187,8 @@ def test_s1_confirm_action_modal_guardrail_cancel_and_approve(tmp_path: Path) ->
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-approve-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             s1.disconnect_agent.assert_called_once_with(["ag-101"])
 
     asyncio.run(_run())
@@ -203,7 +211,8 @@ def test_s1_threat_triage_modal_applies_verdict_status_and_note(tmp_path: Path) 
             pane.query_one("#s1-view-select", Select).value = "threats"
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
             await pilot.click("#s1-triage-btn")
             await pilot.pause()
@@ -213,7 +222,8 @@ def test_s1_threat_triage_modal_applies_verdict_status_and_note(tmp_path: Path) 
             app.screen.query_one("#s1-triage-status-select", Select).value = "resolved"
             app.screen.query_one("#s1-triage-note-input", Input).value = "Contained by SOC"
             await pilot.click("#s1-triage-apply-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
             s1.update_threat_verdict.assert_called_once_with(["th-202"], "true_positive")
             s1.update_threat_incident_status.assert_called_once_with(["th-202"], "resolved")
@@ -246,7 +256,8 @@ def test_s1_exclusion_and_blocklist_modals(tmp_path: Path) -> None:
             app.screen.query_one("#s1-excl-value-input", Input).value = r"C:\Safe\app.exe"
             app.screen.query_one("#s1-excl-desc-input", Input).value = "Verified internal tool"
             await pilot.click("#s1-excl-create-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             s1.create_exclusion.assert_called_once()
 
             # Add blocklist modal
@@ -259,7 +270,8 @@ def test_s1_exclusion_and_blocklist_modals(tmp_path: Path) -> None:
             app.screen.query_one("#s1-block-hash-input", Input).value = valid_sha1
             app.screen.query_one("#s1-block-desc-input", Input).value = "Malicious payload"
             await pilot.click("#s1-block-add-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             s1.add_to_blocklist.assert_called_once_with(
                 valid_sha1,
                 os_type="windows",
@@ -284,11 +296,12 @@ def test_s1_dry_run_blocks_all_active_and_destructive_actions(tmp_path: Path) ->
             await pilot.pause()
             pane = app.query_one(SentinelOnePane)
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
             # Isolate blocked in dry-run without opening ConfirmActionModal or calling API
             await pilot.click("#s1-isolate-btn")
-            await pilot.pause(0.1)
+            await pilot.pause()
             assert not isinstance(app.screen, ConfirmActionModal)
             s1.disconnect_agent.assert_not_called()
 
@@ -296,10 +309,11 @@ def test_s1_dry_run_blocks_all_active_and_destructive_actions(tmp_path: Path) ->
             pane.query_one("#s1-view-select", Select).value = "threats"
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
             await pilot.click("#s1-quarantine-btn")
-            await pilot.pause(0.1)
+            await pilot.pause()
             assert not isinstance(app.screen, ConfirmActionModal)
             s1.mitigate_threat.assert_not_called()
 
@@ -309,7 +323,8 @@ def test_s1_dry_run_blocks_all_active_and_destructive_actions(tmp_path: Path) ->
             assert isinstance(app.screen, S1ThreatTriageModal)
             app.screen.query_one("#s1-triage-verdict-select", Select).value = "false_positive"
             app.screen.query_one("#s1-triage-apply-btn", Button).press()
-            await pilot.pause(0.2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             s1.update_threat_verdict.assert_not_called()
 
     asyncio.run(_run())

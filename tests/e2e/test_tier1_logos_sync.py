@@ -856,7 +856,9 @@ def test_t1_f10_grace_period_preserves_then_prunes_after_threshold(
     e2e_workspace: Path,
     mock_rf_server: MockRFServer,
     brand_http_server: BrandHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("time.sleep", lambda _s: None)
     sites = build_default_brand_sites()
     flaky_logo_sha = sites["brand-flaky.local"].expected_logo_hashes["/images/flaky-logo.png"]
     gamma_logo_sha = sites["brand-gamma.local"].expected_logo_hashes["/images/gamma-logo.gif"]

@@ -328,7 +328,9 @@ def test_t2_f7_invalid_data_uris_and_promo_og_image_gated(
 @pytest.mark.feature("F7")
 def test_t2_f7_unreachable_domain_and_http_404_error_tuple(
     brand_http_server: BrandHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("time.sleep", lambda _s: None)
     brand_http_server.queue_fault("brand-flaky.local", "/", 404, body="Not Found", count=1)
     flaky_host = _site_host(brand_http_server, "brand-flaky.local")
 
@@ -674,7 +676,9 @@ def test_t2_f9_manual_watchlist_entries_never_pruned(
 def test_t2_f9_all_domains_failing_aborts_without_wiping_watchlist(
     mock_rf_server: MockRFServer,
     brand_http_server: BrandHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("time.sleep", lambda _s: None)
     sites = build_default_brand_sites()
     existing_flaky_sha = sites["brand-flaky.local"].expected_logo_hashes["/images/flaky-logo.png"]
     flaky_host = _site_host(brand_http_server, "brand-flaky.local")
@@ -890,7 +894,9 @@ def test_t2_f10_transient_failures_reset_after_recovery_below_grace(
     e2e_workspace: Path,
     mock_rf_server: MockRFServer,
     brand_http_server: BrandHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("time.sleep", lambda _s: None)
     sites = build_default_brand_sites()
     flaky_logo_sha = sites["brand-flaky.local"].expected_logo_hashes["/images/flaky-logo.png"]
     original_home_route = brand_http_server.sites["brand-flaky.local"].routes["/"]

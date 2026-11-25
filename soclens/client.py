@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import re
 import threading
@@ -509,6 +510,7 @@ class RecordedFutureClient:
         riskrecon_base_url: str | None = None,
         verify_ssl: bool | str | Path | None = None,
         insecure: bool | None = None,
+        retry_backoff: float | None = None,
     ) -> None:
         if api_token is not None:
             self.api_token: str | None = api_token.strip() or None
@@ -577,6 +579,17 @@ class RecordedFutureClient:
             Path(error_log_dir) if error_log_dir is not None else None
         )
         self.timeout = timeout
+        if retry_backoff is not None:
+            self.retry_backoff = max(0.0, float(retry_backoff))
+        else:
+            raw_backoff = os.environ.get("SOCLENS_RF_RETRY_BACKOFF", "").strip()
+            if raw_backoff:
+                try:
+                    self.retry_backoff = max(0.0, float(raw_backoff))
+                except ValueError:
+                    self.retry_backoff = 2.0
+            else:
+                self.retry_backoff = 2.0
         self._stop_event: threading.Event | None = stop_event
         self.last_trace_id: str | None = None
 
@@ -705,7 +718,7 @@ class RecordedFutureClient:
         json_data: dict[str, Any] | list[Any] | None = None,
         params: dict[str, Any] | None = None,
         retries: int = 5,
-        backoff: float = 2.0,
+        backoff: float | None = None,
         is_sandbox: bool = False,
         *,
         headers_extra: dict[str, str] | None = None,
@@ -742,6 +755,7 @@ class RecordedFutureClient:
             req_auth = ("", self.api_token)
 
         max_attempts = max(1, retries)
+        effective_backoff = self.retry_backoff if backoff is None else backoff
         req_timeout = self.timeout if timeout is None else timeout
 
         for attempt in range(max_attempts):
@@ -792,7 +806,7 @@ class RecordedFutureClient:
             except requests.exceptions.RequestException as exc:
                 logger.error("Network error on %s %s: %s", method, url, exc)
                 if attempt < max_attempts - 1:
-                    delay = self._compute_backoff(backoff, attempt)
+                    delay = self._compute_backoff(effective_backoff, attempt)
                     if self._wait_backoff(delay):
                         raise RecordedFutureAPIError(
                             None,
@@ -834,7 +848,7 @@ class RecordedFutureClient:
                     if retry_after is not None:
                         delay = min(retry_after, 60.0)
                     else:
-                        delay = self._compute_backoff(backoff, attempt)
+                        delay = self._compute_backoff(effective_backoff, attempt)
                     logger.warning(
                         "Retryable HTTP %s on %s %s (attempt %d/%d). Sleeping %.2fs...",
                         status_code,

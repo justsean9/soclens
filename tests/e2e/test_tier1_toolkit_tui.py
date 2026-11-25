@@ -1072,14 +1072,27 @@ def test_f15_tui_pilot_dry_run_prevents_api_writes(
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            for button in app.query(textual_widgets.Button):
-                label = str(getattr(button, "label", "")).lower()
-                if any(tok in label for tok in ("dry", "sync", "add", "refresh", "load")):
-                    try:
-                        await pilot.click(button)
-                    except Exception:
-                        button.press()
-                    await pilot.pause()
+            activate_fn = getattr(app, "activate_tab", None)
+            for tabbed in app.query(textual_widgets.TabbedContent):
+                for pane in tabbed.query(textual_widgets.TabPane):
+                    pane_label = str(getattr(pane, "label", "") or pane.id or "").lower()
+                    if pane.id in {"tab-watchlists", "tab-brand-logos"} or any(
+                        tok in pane_label for tok in ("watchlist", "brand")
+                    ):
+                        if pane.id:
+                            if callable(activate_fn):
+                                activate_fn(pane.id, auto_enable_admin=True)
+                            else:
+                                tabbed.active = pane.id
+                            await pilot.pause()
+                        for button in pane.query(textual_widgets.Button):
+                            label = str(getattr(button, "label", "")).lower()
+                            if any(tok in label for tok in ("dry", "sync", "add", "refresh", "load")):
+                                try:
+                                    await pilot.click(button)
+                                except Exception:
+                                    button.press()
+                                await pilot.pause()
             await app.workers.wait_for_complete()
 
     asyncio.run(_run())
@@ -1131,20 +1144,29 @@ def test_f15_tui_pilot_mocked_watchlist_and_sigma_data_load(
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
+            activate_fn = getattr(app, "activate_tab", None)
             for tabbed in app.query(textual_widgets.TabbedContent):
                 for pane in tabbed.query(textual_widgets.TabPane):
-                    if pane.id:
-                        tabbed.active = pane.id
-                        await pilot.pause()
-                    for btn in pane.query(textual_widgets.Button):
-                        label = str(getattr(btn, "label", "")).lower()
-                        if any(tok in label for tok in ("load", "refresh", "list", "search")):
-                            try:
-                                await pilot.click(btn)
-                            except Exception:
-                                btn.press()
+                    pane_label = str(getattr(pane, "label", "") or pane.id or "").lower()
+                    if pane.id in {"tab-watchlists", "tab-sigma"} or any(
+                        tok in pane_label for tok in ("watchlist", "sigma")
+                    ):
+                        if pane.id:
+                            if callable(activate_fn):
+                                activate_fn(pane.id, auto_enable_admin=True)
+                            else:
+                                tabbed.active = pane.id
                             await pilot.pause()
+                        for btn in pane.query(textual_widgets.Button):
+                            label = str(getattr(btn, "label", "")).lower()
+                            if any(tok in label for tok in ("load", "refresh", "list")):
+                                try:
+                                    await pilot.click(btn)
+                                except Exception:
+                                    btn.press()
+                                await pilot.pause()
             await app.workers.wait_for_complete()
+            await pilot.pause()
             rendered = _collect_tui_text(app)
             assert (
                 "TUI Seeded Watchlist" in rendered

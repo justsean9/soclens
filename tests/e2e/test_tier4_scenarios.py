@@ -419,7 +419,7 @@ def test_t4_s04_sigma_sync_to_splunk_es_validation_pipeline(
     mock_rf_server.set_fault("/detection-rule/search", 500, body={"message": "RF outage"})
     fallback_res = run_cli(
         ["sigma", "--refresh", "--export", "--output", str(out_conf)],
-        env={"SOCLENS_HOME": str(e2e_workspace)},
+        env={"SOCLENS_HOME": str(e2e_workspace), "SOCLENS_RF_RETRY_BACKOFF": "0"},
         timeout=60.0,
     )
     assert fallback_res.returncode == 0, f"Fallback failed: {fallback_res.stderr}"

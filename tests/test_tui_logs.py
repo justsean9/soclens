@@ -310,6 +310,16 @@ def test_tui_research_and_other_tabs_capture_stdout_and_hide_inline_activity_log
                 await pilot.pause()
 
                 # Activity compact-logs removed from operational tabs; detail/YAML viewers preserved.
+                for tid in (
+                    "tab-watchlists",
+                    "tab-brand-logos",
+                    "tab-rf-intel",
+                    "tab-sigma",
+                    "tab-splunk-bundle",
+                    "tab-research",
+                    "tab-logs",
+                ):
+                    await app.ensure_tab_mounted(tid)
                 for removed_id in ("#dash-log", "#wl-log", "#brand-log", "#splunk-log", "#res-log"):
                     assert len(app.query(removed_id)) == 0
                 for kept_id in ("#res-detail-log", "#rf-log", "#sigma-log", "#app-log"):
@@ -403,7 +413,7 @@ def test_tui_logs_pane_filters_clear_export_and_responsive_layout(tmp_path: Path
             assert "Brand info message" not in tui_text
 
             # Brand Sync quick button
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#logs-brand-btn")
             await pilot.pause()
             assert app.query_one("#logs-source-select", Select).value == "brand_sync"
@@ -413,7 +423,7 @@ def test_tui_logs_pane_filters_clear_export_and_responsive_layout(tmp_path: Path
             assert "Dashboard snapshot" not in brand_text
 
             # Errors Only quick button
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#logs-errors-btn")
             await pilot.pause()
             assert app.query_one("#logs-level-select", Select).value == "ERROR"
@@ -421,9 +431,9 @@ def test_tui_logs_pane_filters_clear_export_and_responsive_layout(tmp_path: Path
             assert "Brand info message" not in _rich_log_text(app)
 
             # Toggle back off + text filter via / and escape
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#logs-errors-btn")
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#logs-brand-btn")
             await pilot.pause()
             await pilot.press("slash")
@@ -442,12 +452,12 @@ def test_tui_logs_pane_filters_clear_export_and_responsive_layout(tmp_path: Path
             # Auto-scroll toggle
             scroll_btn = app.query_one("#logs-autoscroll-btn", Button)
             assert "ON" in str(scroll_btn.label)
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#logs-autoscroll-btn")
             await pilot.pause()
             assert "OFF" in str(scroll_btn.label)
             assert app.query_one("#app-log", RichLog).auto_scroll is False
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#logs-autoscroll-btn")
             await pilot.pause()
             assert "ON" in str(scroll_btn.label)
@@ -477,35 +487,26 @@ def test_tui_logs_pane_filters_clear_export_and_responsive_layout(tmp_path: Path
             assert _rich_log_text(app) == ""
             assert app.log_store.counts() == (0, 0, 0)
 
+            for width, height in ((80, 24), (120, 36), (180, 52)):
+                await pilot.resize_terminal(width, height)
+                await pilot.pause()
+                pane = app.query_one("#tab-logs", TabPane)
+                for wid, wtype in (
+                    ("#logs-source-select", Select),
+                    ("#logs-level-select", Select),
+                    ("#logs-filter-input", Input),
+                    ("#logs-autoscroll-btn", Button),
+                    ("#logs-clear-btn", Button),
+                    ("#logs-export-btn", Button),
+                    ("#logs-errors-btn", Button),
+                    ("#logs-brand-btn", Button),
+                    ("#app-log", RichLog),
+                ):
+                    widget = app.query_one(wid, wtype)
+                    assert widget.region.height >= 1, f"{wid} collapsed at {(width, height)}"
+                    assert widget.region.right <= pane.region.right, (
+                        f"{wid} clipped horizontally at {(width, height)}: "
+                        f"{widget.region} vs {pane.region}"
+                    )
+
     asyncio.run(_run())
-
-    async def _check_bounds(width: int, height: int) -> None:
-        sized_app = create_app(
-            client=MagicMock(),
-            dry_run=True,
-            initial_tab="tab-logs",
-            workspace_dir=tmp_path,
-        )
-        async with sized_app.run_test(size=(width, height)) as pilot:
-            await pilot.pause()
-            pane = sized_app.query_one("#tab-logs", TabPane)
-            for wid, wtype in (
-                ("#logs-source-select", Select),
-                ("#logs-level-select", Select),
-                ("#logs-filter-input", Input),
-                ("#logs-autoscroll-btn", Button),
-                ("#logs-clear-btn", Button),
-                ("#logs-export-btn", Button),
-                ("#logs-errors-btn", Button),
-                ("#logs-brand-btn", Button),
-                ("#app-log", RichLog),
-            ):
-                widget = sized_app.query_one(wid, wtype)
-                assert widget.region.height >= 1, f"{wid} collapsed at {(width, height)}"
-                assert widget.region.right <= pane.region.right, (
-                    f"{wid} clipped horizontally at {(width, height)}: "
-                    f"{widget.region} vs {pane.region}"
-                )
-
-    for dims in ((80, 24), (120, 36), (180, 52)):
-        asyncio.run(_check_bounds(*dims))

@@ -1091,7 +1091,7 @@ def test_screenshot_modal_kitty_fallback_aspect_and_notice(
             await pilot.pause()
             modal = ScreenshotViewerModal(title="fallback.test", screenshots=shots, dry_run=True)
             app_fail.push_screen(modal)
-            await pilot.pause(0.25)
+            await pilot.pause()
 
             canvas = modal.query_one("#shot-viewer-canvas", RichLog)
             meta_bar = modal.query_one("#shot-viewer-meta", Static)
@@ -1139,7 +1139,7 @@ def test_screenshot_modal_kitty_fallback_aspect_and_notice(
             await pilot.pause()
             modal = ScreenshotViewerModal(title="aspect.test", screenshots=shots, dry_run=True)
             app_ok.push_screen(modal)
-            await pilot.pause(0.25)
+            await pilot.pause()
 
             canvas = modal.query_one("#shot-viewer-canvas", RichLog)
             avail_w = canvas.scrollable_content_region.width
@@ -1161,7 +1161,7 @@ def test_screenshot_modal_kitty_fallback_aspect_and_notice(
 
             # Unblur uploads exact original bytes in the same cell geometry (zero grid jitter)
             await pilot.press("b")
-            await pilot.pause(0.25)
+            await pilot.pause()
             assert captured_grid[-1] == (expected_cols, expected_rows)
             assert captured_uploads[-1] == wide_png
 

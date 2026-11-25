@@ -727,9 +727,12 @@ def test_t3_a05_detection_rules_pagination_cache_and_splunk_export(
 def test_t3_a05_sigma_cache_preserved_on_api_500_and_tstats_multiline_ini(
     e2e_workspace: Path,
     mock_rf_server: MockRFServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from soclens.client import RecordedFutureClient
     from soclens.sigma import convert_to_savedsearch_stanza, load_rules
+
+    monkeypatch.setattr("soclens.client.time.sleep", lambda _s: None)
 
     sentinel_rules: list[dict[str, Any]] = [
         {

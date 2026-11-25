@@ -291,6 +291,7 @@ def test_tui_brand_logos_auto_loads_and_picks_brand_hash_lists(
 
             # Switching domain watchlist automatically loads the new watchlist's domains
             src_select.value = "report:dom-2"
+            await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert src_input.value == "report:dom-2"
@@ -708,14 +709,14 @@ def test_tui_brand_logos_sorting_and_issue_dashboards(
             dom_list = app.query_one("#brand-domain-selection", SelectionList)
             assert _selection_option_values(dom_list)[0] == "conn-err.test"
             await pilot.click("#brand-domain-sort-btn")  # Z-A v
-            await pilot.pause(0.25)
+            await pilot.pause()
             assert _selection_option_values(dom_list)[0] == "two-hashes.test"
             await pilot.click("#brand-domain-sort-btn")  # 0-Hash
-            await pilot.pause(0.25)
+            await pilot.pause()
             first_three = set(_selection_option_values(dom_list)[:3])
             assert first_three == {"conn-err.test", "never-synced.test", "silent-zero.test"}
             await pilot.click("#brand-domain-sort-btn")  # Errors
-            await pilot.pause(0.25)
+            await pilot.pause()
             assert _selection_option_values(dom_list)[0] == "conn-err.test"
 
             # 3. Switch to Missing Hashes dashboard via Issues button

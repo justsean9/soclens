@@ -159,10 +159,14 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 @pytest.mark.feature("F11")
 def test_f11_sigma_cache_preserved_on_api_500_and_empty_response(
-    e2e_workspace: Path, mock_rf_server: MockRFServer
+    e2e_workspace: Path,
+    mock_rf_server: MockRFServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from soclens.client import RecordedFutureClient
     from soclens.sigma import load_rules
+
+    monkeypatch.setattr("soclens.client.time.sleep", lambda _s: None)
 
     cache_path = e2e_workspace / "sigma_rules_cache.json"
     seeded = [
@@ -196,10 +200,14 @@ def test_f11_sigma_cache_preserved_on_api_500_and_empty_response(
 
 @pytest.mark.feature("F11")
 def test_f11_sigma_api_failure_with_no_cache_raises_cleanly(
-    e2e_workspace: Path, mock_rf_server: MockRFServer
+    e2e_workspace: Path,
+    mock_rf_server: MockRFServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from soclens.client import RecordedFutureClient, RecordedFutureError
     from soclens.sigma import load_rules
+
+    monkeypatch.setattr("soclens.client.time.sleep", lambda _s: None)
 
     cache_path = e2e_workspace / "sigma_rules_cache.json"
     assert not cache_path.exists()
@@ -899,23 +907,30 @@ def test_f15_tui_pilot_rf_api_403_500_displays_error_and_logs_traceid(
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
+            activate_fn = getattr(app, "activate_tab", None)
             for tabbed in app.query(textual_widgets.TabbedContent):
                 for pane in tabbed.query(textual_widgets.TabPane):
-                    if pane.id:
-                        tabbed.active = pane.id
-                        await pilot.pause()
-                    for btn in pane.query(textual_widgets.Button):
-                        label = str(getattr(btn, "label", "")).lower()
-                        if any(tok in label for tok in ("load", "refresh", "list")):
-                            if btn.region.width > 0 and btn.region.height > 0:
-                                try:
-                                    await pilot.click(btn)
-                                except Exception:
-                                    btn.press()
+                    pane_label = str(getattr(pane, "label", "") or pane.id or "").lower()
+                    if pane.id == "tab-watchlists" or "watchlist" in pane_label:
+                        if pane.id:
+                            if callable(activate_fn):
+                                activate_fn(pane.id, auto_enable_admin=True)
                             else:
-                                btn.press()
+                                tabbed.active = pane.id
                             await pilot.pause()
+                        for btn in pane.query(textual_widgets.Button):
+                            label = str(getattr(btn, "label", "")).lower()
+                            if any(tok in label for tok in ("load", "refresh", "list")):
+                                if btn.region.width > 0 and btn.region.height > 0:
+                                    try:
+                                        await pilot.click(btn)
+                                    except Exception:
+                                        btn.press()
+                                else:
+                                    btn.press()
+                                await pilot.pause()
             await app.workers.wait_for_complete()
+            await pilot.pause()
             assert app.is_running
             rendered = _collect_tui_text(app).lower()
             assert "403" in rendered or "error" in rendered or "privileges" in rendered
@@ -974,12 +989,16 @@ def test_f15_tui_pilot_splunk_unreachable_or_401_no_freeze(
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
+            activate_fn = getattr(app, "activate_tab", None)
             for tabbed in app.query(textual_widgets.TabbedContent):
                 for pane in tabbed.query(textual_widgets.TabPane):
                     label = str(getattr(pane, "label", "") or pane.id or "").lower()
                     if any(tok in label for tok in ("splunk", "validat", "dashboard", "diagnostic")):
                         if pane.id:
-                            tabbed.active = pane.id
+                            if callable(activate_fn):
+                                activate_fn(pane.id, auto_enable_admin=True)
+                            else:
+                                tabbed.active = pane.id
                             await pilot.pause()
                         for btn in pane.query(textual_widgets.Button):
                             blabel = str(getattr(btn, "label", "")).lower()
@@ -1028,7 +1047,13 @@ def test_f15_windows_utf8_console_and_cli_tui_help(
 
 
 @pytest.mark.feature("F15")
-def test_f15_tui_pilot_rapid_navigation_and_clean_quit(e2e_workspace: Path) -> None:
+def test_f15_tui_pilot_rapid_navigation_and_clean_quit(
+    e2e_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from textual.worker import WorkerCancelled
+
+    monkeypatch.setattr("soclens.client.time.sleep", lambda _s: None)
     app = _create_tui_app(dry_run=True)
     textual_widgets = importlib.import_module("textual.widgets")
 
@@ -1048,6 +1073,10 @@ def test_f15_tui_pilot_rapid_navigation_and_clean_quit(e2e_workspace: Path) -> N
             if app.is_running:
                 app.exit()
                 await pilot.pause()
-            await app.workers.wait_for_complete()
+            try:
+                await app.workers.wait_for_complete()
+            except WorkerCancelled:
+                pass
+            assert not app.is_running
 
     asyncio.run(_run())

@@ -266,7 +266,8 @@ def test_tui_research_example_click_and_cross_tab_pivots(tmp_path: Path) -> None
             assert pane._current_dossier.target.raw_query == "APT29"
 
             # Cross-tab jumps from Watchlists and RF Intel
-            wl_pane = app.query_one(WatchlistsPane)
+            wl_pane = await app.ensure_tab_mounted("tab-watchlists")
+            assert isinstance(wl_pane, WatchlistsPane)
             wl_pane._research_entity_in_research_tab("IpAddress", "8.8.8.8")
             await pilot.pause()
             await app.workers.wait_for_complete()
@@ -274,7 +275,8 @@ def test_tui_research_example_click_and_cross_tab_pivots(tmp_path: Path) -> None
             assert app.query_one("#main-tabs", TabbedContent).active == "tab-research"
             assert pane._current_dossier.target.canonical_name == "8.8.8.8"
 
-            rf_pane = app.query_one(RFIntelPane)
+            rf_pane = await app.ensure_tab_mounted("tab-rf-intel")
+            assert isinstance(rf_pane, RFIntelPane)
             rf_pane._research_in_research_tab("idn:pivot.example", "domain")
             await pilot.pause()
             await app.workers.wait_for_complete()

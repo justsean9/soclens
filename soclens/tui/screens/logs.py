@@ -209,6 +209,9 @@ class LogsPane(BaseSocPane):
         """Clear and re-render visible log entries from the shared log store."""
         if not self._ready or self.is_app_shutting_down():
             return
+        clear_pending = getattr(self.app, "clear_pending_log_flush", None)
+        if callable(clear_pending):
+            clear_pending()
         try:
             log_widget = self.query_one("#app-log", RichLog)
         except Exception:

@@ -24,6 +24,17 @@ import pytest
 from tests.e2e.fixtures.assets import make_png
 from tests.e2e.fixtures.brand_sites import BrandSiteProfile, RouteSpec, build_default_brand_sites
 
+
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that suppresses benign client-disconnect tracebacks."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 ALL_LIST_TYPES: tuple[str, ...] = (
     "entity",
     "source",
@@ -241,11 +252,15 @@ class MockRFServer:
             def do_HEAD(self) -> None:
                 self._handle("HEAD")
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd = _QuietThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port: int = self._httpd.server_address[1]
         self.base_url: str = f"http://127.0.0.1:{self.port}"
         self.sandbox_base_url: str = f"http://127.0.0.1:{self.port}/api/v0"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            kwargs={"poll_interval": 0.005},
+            daemon=True,
+        )
         self._thread.start()
 
     def close(self) -> None:
@@ -1323,10 +1338,14 @@ class MockSplunkServer:
             def do_POST(self) -> None:
                 server_ref._dispatch(self, "POST")
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd = _QuietThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port: int = self._httpd.server_address[1]
         self.base_url: str = f"http://127.0.0.1:{self.port}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            kwargs={"poll_interval": 0.005},
+            daemon=True,
+        )
         self._thread.start()
 
     def close(self) -> None:
@@ -1641,10 +1660,14 @@ class BrandHTTPServer:
             def do_HEAD(self) -> None:
                 server_ref._dispatch(self, "HEAD")
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd = _QuietThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port: int = self._httpd.server_address[1]
         self.base_url: str = f"http://127.0.0.1:{self.port}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            kwargs={"poll_interval": 0.005},
+            daemon=True,
+        )
         self._thread.start()
 
     def _ensure_domain_listener_locked(self, domain: str) -> int:
@@ -1667,9 +1690,13 @@ class BrandHTTPServer:
             def do_HEAD(self) -> None:
                 server_ref._dispatch(self, "HEAD", forced_domain=norm_domain)
 
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), DomainHandler)
+        httpd = _QuietThreadingHTTPServer(("127.0.0.1", 0), DomainHandler)
         port: int = httpd.server_address[1]
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread = threading.Thread(
+            target=httpd.serve_forever,
+            kwargs={"poll_interval": 0.005},
+            daemon=True,
+        )
         thread.start()
         self._domain_servers[norm_domain] = (httpd, thread, port)
         return port

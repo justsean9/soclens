@@ -565,9 +565,23 @@ def test_rf_api_error_aborts_non_destructively() -> None:
     client.get_watchlist_entities.side_effect = RecordedFutureAPIError(
         500, "Server error", trace_id="trace-xyz"
     )
+    def _stub_hasher(*_a: Any, **_k: Any) -> tuple[list[dict[str, str]], int, None, list[str], list[dict[str, Any]]]:
+        return (
+            [{"sha256": "a" * 64, "image_url": "https://a.com/logo.png"}],
+            1,
+            None,
+            [],
+            [],
+        )
+
     assert (
         validate_domain_brand_sync(
-            client, "list_1", ["a.com"], output_locations_file=None, ignored_hashes={}
+            client,
+            "list_1",
+            ["a.com"],
+            output_locations_file=None,
+            ignored_hashes={},
+            image_hasher=_stub_hasher,
         )
         is False
     )
@@ -580,13 +594,7 @@ def test_rf_api_error_aborts_non_destructively() -> None:
             output_locations_file=None,
             ignored_hashes={},
             state_file=None,
-            image_hasher=lambda *a, **k: (
-                [{"sha256": "a" * 64, "image_url": "https://a.com/logo.png"}],
-                1,
-                None,
-                [],
-                [],
-            ),
+            image_hasher=_stub_hasher,
         )
         is False
     )

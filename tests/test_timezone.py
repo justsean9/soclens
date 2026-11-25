@@ -196,7 +196,8 @@ def test_tui_f3_and_logs_tz_button_update_alerts_research_and_logs(
                     ),
                 },
             )
-            res_pane = app.query_one(ResearchPane)
+            res_pane = await app.ensure_tab_mounted("tab-research")
+            assert isinstance(res_pane, ResearchPane)
             res_pane._current_dossier = dossier
             res_pane._all_findings = build_research_findings(dossier)
             res_pane._render_master_table()

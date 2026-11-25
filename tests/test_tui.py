@@ -315,82 +315,92 @@ def test_tui_fills_screen_across_terminal_sizes(tmp_path: Path) -> None:
     ]
     mock_client.get_watchlist_entities.return_value = []
 
-    async def _measure(width: int, height: int) -> dict[str, tuple[int, int, int, int]]:
-        app = create_app(
-            client=mock_client, dry_run=True, workspace_dir=tmp_path, view_mode="admin"
-        )
-        metrics: dict[str, tuple[int, int, int, int]] = {}
-        async with app.run_test(size=(width, height)) as pilot:
+    app = create_app(
+        client=mock_client, dry_run=True, workspace_dir=tmp_path, view_mode="admin"
+    )
+
+    async def _measure_all() -> dict[str, dict[str, tuple[int, int, int, int]]]:
+        all_metrics: dict[str, dict[str, tuple[int, int, int, int]]] = {}
+        async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             tabs = app.query_one("#main-tabs", TabbedContent)
-            for tab_id, selector in (
-                ("tab-dashboard", "#dash-apis-table"),
-                ("tab-watchlists", "#wl-lists-table"),
-                ("tab-brand-logos", "#brand-table"),
-                ("tab-rf-intel", "#rf-log"),
-                ("tab-sigma", "#sigma-table"),
-                ("tab-splunk-bundle", "#splunk-results-table"),
-                ("tab-research", "#res-detail-log"),
-                ("tab-logs", "#app-log"),
-                ("tab-sentinelone", "#s1-table"),
-                ("tab-llm", "#llm-transcript"),
-                ("tab-splunk-search", "#splunk-search-table"),
-                ("tab-splunk-es", "#es-table"),
-                ("tab-settings", "#settings-form-pane"),
+            for size_key, (width, height) in (
+                ("small", (80, 24)),
+                ("medium", (120, 36)),
+                ("large", (180, 52)),
             ):
-                tabs.active = tab_id
+                if (width, height) != (80, 24):
+                    await pilot.resize_terminal(width, height)
+                    await pilot.pause()
+                metrics: dict[str, tuple[int, int, int, int]] = {}
+                for tab_id, selector in (
+                    ("tab-dashboard", "#dash-apis-table"),
+                    ("tab-watchlists", "#wl-lists-table"),
+                    ("tab-brand-logos", "#brand-table"),
+                    ("tab-rf-intel", "#rf-log"),
+                    ("tab-sigma", "#sigma-table"),
+                    ("tab-splunk-bundle", "#splunk-results-table"),
+                    ("tab-research", "#res-detail-log"),
+                    ("tab-logs", "#app-log"),
+                    ("tab-sentinelone", "#s1-table"),
+                    ("tab-llm", "#llm-transcript"),
+                    ("tab-splunk-search", "#splunk-search-table"),
+                    ("tab-splunk-es", "#es-table"),
+                    ("tab-settings", "#settings-form-pane"),
+                ):
+                    tabs.active = tab_id
+                    await pilot.pause()
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    pane = app.query_one(f"#{tab_id}", TabPane)
+                    target = app.query_one(selector)
+                    metrics[tab_id] = (
+                        pane.region.width,
+                        pane.region.height,
+                        target.region.width,
+                        target.region.height,
+                    )
+                    assert pane.region.width == width
+                    assert pane.region.height >= height - 5
+
+                tabs.active = "tab-rf-intel"
                 await pilot.pause()
-                await app.workers.wait_for_complete()
-                await pilot.pause()
-                pane = app.query_one(f"#{tab_id}", TabPane)
-                target = app.query_one(selector)
-                metrics[tab_id] = (
-                    pane.region.width,
-                    pane.region.height,
-                    target.region.width,
-                    target.region.height,
+                rf_ws = app.query_one("#rf-workspace", Container)
+                rf_res_pane = app.query_one("#rf-results-pane", Vertical)
+                rf_det_pane = app.query_one("#rf-detail-pane", Vertical)
+                rf_table = app.query_one("#rf-results-table", DataTable)
+                metrics["rf-table"] = (
+                    rf_res_pane.region.width,
+                    rf_res_pane.region.height,
+                    rf_table.region.width,
+                    rf_table.region.height,
                 )
-                assert pane.region.width == width
-                assert pane.region.height >= height - 5
+                if width >= 130:
+                    assert rf_ws.has_class("split-horizontal")
+                    assert rf_det_pane.region.x > rf_res_pane.region.x
+                else:
+                    assert not rf_ws.has_class("split-horizontal")
+                    assert rf_det_pane.region.y > rf_res_pane.region.y
+                rf_col_total = sum(c.width for c in rf_table.columns.values())
+                assert rf_col_total >= rf_table.region.width - 14
 
-            tabs.active = "tab-rf-intel"
-            await pilot.pause()
-            rf_ws = app.query_one("#rf-workspace", Container)
-            rf_res_pane = app.query_one("#rf-results-pane", Vertical)
-            rf_det_pane = app.query_one("#rf-detail-pane", Vertical)
-            rf_table = app.query_one("#rf-results-table", DataTable)
-            metrics["rf-table"] = (
-                rf_res_pane.region.width,
-                rf_res_pane.region.height,
-                rf_table.region.width,
-                rf_table.region.height,
-            )
-            if width >= 130:
-                assert rf_ws.has_class("split-horizontal")
-                assert rf_det_pane.region.x > rf_res_pane.region.x
-            else:
-                assert not rf_ws.has_class("split-horizontal")
-                assert rf_det_pane.region.y > rf_res_pane.region.y
-            rf_col_total = sum(c.width for c in rf_table.columns.values())
-            assert rf_col_total >= rf_table.region.width - 14
+                tabs.active = "tab-watchlists"
+                await pilot.pause()
+                ws_box = app.query_one("#wl-workspace", Container)
+                wl_pane = app.query_one("#wl-lists-pane", Vertical)
+                ent_pane = app.query_one("#wl-entities-pane", Vertical)
+                wl_table = app.query_one("#wl-lists-table", DataTable)
+                assert not ws_box.has_class("split-horizontal")
+                assert not wl_pane.has_class("wl-hidden")
+                assert ent_pane.has_class("wl-hidden")
+                assert wl_table.region.width >= width - 12
+                col_total = sum(c.width for c in wl_table.columns.values())
+                assert col_total >= wl_table.region.width - 14
+                all_metrics[size_key] = metrics
+        return all_metrics
 
-            tabs.active = "tab-watchlists"
-            await pilot.pause()
-            ws_box = app.query_one("#wl-workspace", Container)
-            wl_pane = app.query_one("#wl-lists-pane", Vertical)
-            ent_pane = app.query_one("#wl-entities-pane", Vertical)
-            wl_table = app.query_one("#wl-lists-table", DataTable)
-            assert not ws_box.has_class("split-horizontal")
-            assert not wl_pane.has_class("wl-hidden")
-            assert ent_pane.has_class("wl-hidden")
-            assert wl_table.region.width >= width - 12
-            col_total = sum(c.width for c in wl_table.columns.values())
-            assert col_total >= wl_table.region.width - 14
-        return metrics
-
-    small = asyncio.run(_measure(80, 24))
-    medium = asyncio.run(_measure(120, 36))
-    large = asyncio.run(_measure(180, 52))
+    measured = asyncio.run(_measure_all())
+    small, medium, large = measured["small"], measured["medium"], measured["large"]
 
     for tab_id in small:
         assert large[tab_id][2] > small[tab_id][2], f"{tab_id} width did not scale"
@@ -1435,7 +1445,7 @@ def test_tui_rf_intel_v2_soar_entity_match_and_sandbox_views(tmp_path: Path) -> 
 
             app.query_one("#rf-v2-type", Select).value = "domain"
             app.query_one("#rf-ioc-input", Input).value = "bad.example"
-            await pilot.pause(0.35)
+            await pilot.pause()
             await pilot.click("#rf-lookup-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -1484,7 +1494,7 @@ def test_tui_rf_intel_v2_soar_entity_match_and_sandbox_views(tmp_path: Path) -> 
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert table.row_count == 1
-            await pilot.pause(0.35)
+            await pilot.pause()
             await pilot.click("#rf-fetch-detail-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -2241,7 +2251,7 @@ def test_tui_screenshot_viewer_crop_zoom_mode_and_open(
 
             # Toggle Blur OFF -> reveals original bytes on Open Viewer
             await pilot.click("#shot-blur-btn")
-            await pilot.pause(0.2)
+            await pilot.pause()
             assert "Blur: OFF" in str(blur_btn.label)
             assert "BLURRED" not in str(meta_bar.render())
             await pilot.click("#shot-open-btn")
@@ -2250,21 +2260,21 @@ def test_tui_screenshot_viewer_crop_zoom_mode_and_open(
 
             # Toggle Crop -> Full Page -> Auto-crop
             await pilot.click("#shot-crop-btn")
-            await pilot.pause(0.35)
+            await pilot.pause()
             assert "Full Page" in str(meta_bar.render())
             assert "Crop: Full" in str(crop_btn.label)
 
             await pilot.click("#shot-crop-btn")
-            await pilot.pause(0.35)
+            await pilot.pause()
             assert "Cropped:" in str(meta_bar.render())
 
             # Zoom in and out
             await pilot.click("#shot-zoom-in-btn")
-            await pilot.pause(0.35)
+            await pilot.pause()
             assert "Zoom: 1.5x" in str(meta_bar.render())
 
             await pilot.click("#shot-zoom-out-btn")
-            await pilot.pause(0.35)
+            await pilot.pause()
             assert "Zoom:" not in str(meta_bar.render())
 
         # 2) Kitty-capable terminal auto-renders Kitty HD + starts blurred
@@ -2276,7 +2286,7 @@ def test_tui_screenshot_viewer_crop_zoom_mode_and_open(
             await pilot.pause()
             modal = ScreenshotViewerModal(title="evil.test", screenshots=shots, dry_run=True)
             app2.push_screen(modal)
-            await pilot.pause(0.2)
+            await pilot.pause()
 
             meta_bar = modal.query_one("#shot-viewer-meta", Static)
             blur_btn = modal.query_one("#shot-blur-btn", Button)
@@ -2289,7 +2299,7 @@ def test_tui_screenshot_viewer_crop_zoom_mode_and_open(
             assert "\U0010eeee" in "".join(strip.text for strip in canvas.lines)
 
             await pilot.press("b")
-            await pilot.pause(0.2)
+            await pilot.pause()
             assert "Blur: OFF" in str(blur_btn.label)
             assert "BLURRED" not in str(meta_bar.render())
             assert "Mode: Kitty HD" in str(meta_bar.render())
@@ -2937,7 +2947,7 @@ def test_tui_dashboard_insecure_ssl_toggle_and_proxy_diagnostics(
             assert "INSECURE (Disabled - Proxy Mode)" in str(summary_widget.render())
 
             # Toggle insecure SSL back OFF (wait past Textual's 0.2s button active cooldown)
-            await pilot.pause(0.25)
+            await pilot.pause()
             await pilot.click("#dash-ssl-btn")
             await pilot.pause()
             assert client.verify_ssl is True

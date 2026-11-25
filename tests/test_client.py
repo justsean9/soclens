@@ -1016,7 +1016,11 @@ class TestRecordedFutureClient(unittest.TestCase):
         ssl_ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
         port = httpd.server_address[1]
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread = threading.Thread(
+            target=httpd.serve_forever,
+            kwargs={"poll_interval": 0.005},
+            daemon=True,
+        )
         thread.start()
 
         https_url = f"https://127.0.0.1:{port}"

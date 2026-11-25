@@ -314,19 +314,22 @@ def test_cli_view_mode_flags_and_forwarding() -> None:
 
 
 def test_tui_view_mode_bar_layout_bounds_user_and_admin(tmp_path: Path) -> None:
-    for mode in (UI_VIEW_USER, UI_VIEW_ADMIN):
-        for width, height in ((80, 24), (120, 36), (180, 52)):
-            app = create_app(
-                client=MagicMock(),
-                dry_run=True,
-                view_mode=mode,
-                workspace_dir=tmp_path,
-            )
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        view_mode=UI_VIEW_USER,
+        workspace_dir=tmp_path,
+    )
 
-            async def _check(cur_app: object = app, w: int = width, h: int = height) -> None:
-                async with cur_app.run_test(size=(w, h)) as pilot:  # type: ignore[attr-defined]
+    async def _check() -> None:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            for mode in (UI_VIEW_USER, UI_VIEW_ADMIN):
+                app.set_view_mode(mode)
+                for w, h in ((80, 24), (120, 36), (180, 52)):
+                    await pilot.resize_terminal(w, h)
                     await pilot.pause()
-                    bar = cur_app.query_one("#view-mode-bar", Horizontal)  # type: ignore[attr-defined]
+                    bar = app.query_one("#view-mode-bar", Horizontal)
                     assert bar.region.height == 1
                     assert bar.region.right <= w
                     for wid, wtype in (
@@ -334,13 +337,13 @@ def test_tui_view_mode_bar_layout_bounds_user_and_admin(tmp_path: Path) -> None:
                         ("#view-mode-select", Select),
                         ("#view-mode-toggle-btn", Button),
                     ):
-                        widget = cur_app.query_one(wid, wtype)  # type: ignore[attr-defined]
+                        widget = app.query_one(wid, wtype)
                         assert widget.region.height >= 1
                         assert widget.region.right <= bar.region.right
-                    active_pane = cur_app.query_one(  # type: ignore[attr-defined]
-                        f"#{cur_app.query_one('#main-tabs', TabbedContent).active}",
+                    active_pane = app.query_one(
+                        f"#{app.query_one('#main-tabs', TabbedContent).active}",
                         TabPane,
                     )
                     assert active_pane.region.height >= h - 5
 
-            asyncio.run(_check())
+    asyncio.run(_check())
