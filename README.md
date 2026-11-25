@@ -13,6 +13,52 @@ See [docs/RF_API_REVIEW.md](docs/RF_API_REVIEW.md) for the Recorded Future API r
 
 ---
 
+## Screenshots
+
+Interactive Textual TUI (`soclens tui`) rendered with sanitized demo data (regenerate anytime with `python scripts/generate_screenshots.py`):
+
+### Threat Research Workbench (`7`)
+Multi-API dossier investigation with risk scoring, related infrastructure pivots, Insikt Group analyst notes, and detection rules:
+
+![Threat Research Workbench](docs/screenshots/research.svg)
+
+### Recorded Future Intel & Alerts (`4`)
+Unified Alerts v3, Playbook Alerts, and Cases triage with multi-status filters, inline inspection, and on-demand enrichment:
+
+![Recorded Future Intel & Alerts](docs/screenshots/rf-intel.svg)
+
+### Splunk ES & Mission Control Triage (`F9`)
+Hybrid Mission Control v2 / SPL notable triage with tenant filtering, RF enrichment, and cross-workbench pivoting:
+
+![Splunk ES & Mission Control Triage](docs/screenshots/splunk-es.svg)
+
+### SentinelOne EDR Workbench (`9`)
+Multi-site threats, endpoints, exclusions, and blocklist triage with Admin View mutation guardrails (`F2`):
+
+![SentinelOne EDR Workbench](docs/screenshots/sentinelone.svg)
+
+<details>
+<summary>More screenshots: Sigma Rules, Local LLM Copilot &amp; Admin Dashboard</summary>
+
+### Sigma Rules & Splunk Export (`5`, Admin View)
+Insikt Group & local Sigma rule browsing with live pySigma `savedsearches.conf` stanza preview:
+
+![Sigma Rules & Splunk Export](docs/screenshots/sigma-rules.svg)
+
+### Local LLM SOC Copilot (`F7`)
+Ollama & OpenAI-compatible triage assistant with attached investigation context and SPL generation:
+
+![Local LLM SOC Copilot](docs/screenshots/local-llm.svg)
+
+### Dashboard & Diagnostics (`1`, Admin View — All 13 Tabs)
+Environment, proxy/SSL, credential status, `trace_id` API error logs, and Recorded Future API surface coverage:
+
+![Dashboard & Diagnostics](docs/screenshots/dashboard-admin.svg)
+
+</details>
+
+---
+
 ## Quick Download: Offline Release Bundles
 
 Pre-packaged air-gapped deployment archives (source + installers + verified offline `wheelhouse/` for Python 3.12, 3.13, and 3.14) are published on the GitHub **Releases** tab and can also be built locally with `python scripts/build_release_bundles.py`:
@@ -39,17 +85,18 @@ cd soclens
 ---
 
 ## Table of Contents
-1. [Quick Download: Offline Release Bundles](#quick-download-offline-release-bundles)
-2. [Prerequisites & Installation](#prerequisites--installation)
-3. [Authentication & Workspace Configuration](#authentication--workspace-configuration)
-4. [Windows-Compatible TUI](#windows-compatible-tui)
-5. [General CLI Usage](#general-cli-usage)
-6. [Recorded Future Lists & Brand Logo Automation](#recorded-future-lists--brand-logo-automation)
-7. [Recorded Future SOC APIs (`rf`)](#recorded-future-soc-apis-rf)
-8. [Threat Research (`research` & TUI Research Tab)](#threat-research-research--tui-research-tab)
-9. [Sigma Rule Searching & Splunk Conversion](#sigma-rule-searching--splunk-conversion)
-10. [Splunk Saved Searches Validation](#splunk-saved-searches-validation)
-11. [Packaging & Air-Gapped Deployment Bundling](#packaging--air-gapped-deployment-bundling)
+1. [Screenshots](#screenshots)
+2. [Quick Download: Offline Release Bundles](#quick-download-offline-release-bundles)
+3. [Prerequisites & Installation](#prerequisites--installation)
+4. [Authentication & Workspace Configuration](#authentication--workspace-configuration)
+5. [Windows-Compatible TUI](#windows-compatible-tui)
+6. [General CLI Usage](#general-cli-usage)
+7. [Recorded Future Lists & Brand Logo Automation](#recorded-future-lists--brand-logo-automation)
+8. [Recorded Future SOC APIs (`rf`)](#recorded-future-soc-apis-rf)
+9. [Threat Research (`research` & TUI Research Tab)](#threat-research-research--tui-research-tab)
+10. [Sigma Rule Searching & Splunk Conversion](#sigma-rule-searching--splunk-conversion)
+11. [Splunk Saved Searches Validation](#splunk-saved-searches-validation)
+12. [Packaging & Air-Gapped Deployment Bundling](#packaging--air-gapped-deployment-bundling)
 
 ---
 
