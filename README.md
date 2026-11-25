@@ -1,6 +1,5 @@
 # SOCLens (`soclens`)
 
-[![CI](https://github.com/justsean9/soclens/actions/workflows/ci.yml/badge.svg)](https://github.com/justsean9/soclens/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/justsean9/soclens)](https://github.com/justsean9/soclens/releases)
 [![License: MIT](https://img.shields.io/github/license/justsean9/soclens)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
