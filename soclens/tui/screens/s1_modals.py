@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar
@@ -886,8 +885,16 @@ class S1SitePolicyModal(ModalScreen[dict[str, Any] | None]):
     def on_mount(self) -> None:
         if not self.app.is_running or getattr(self.app, "_exit", False):
             return
+        from soclens.tui.s1_formatters import render_s1_policy_detail
+
         log = self.query_one("#s1-policy-log", RichLog)
-        log.write(Text(json.dumps(self._policy, indent=2, default=str)))
+        log.write(
+            render_s1_policy_detail(
+                self._policy,
+                site_name=self._site_name,
+                site_id=self._site_id,
+            )
+        )
         self.query_one("#s1-policy-cancel-btn", Button).focus()
 
     @on(Button.Pressed, "#s1-policy-cancel-btn")

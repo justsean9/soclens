@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, ClassVar, Literal
 
 from rich.text import Text
@@ -1205,10 +1204,18 @@ class WatchlistsPane(BaseSocPane):
             lname = (info.get("name") if isinstance(info, dict) else None) or list_name or list_id
             summary = f"Watchlist '{lname}' ({list_id}) | type={ltype} | size={size}"
             self.set_status(summary)
-            self.append_log(
-                f"=== {summary} ===\n"
-                + json.dumps({"info": info, "status": status}, indent=2, default=str)
-            )
+            from soclens.tui.s1_formatters import format_s1_value, pretty_s1_label
+
+            lines = [f"=== {summary} ==="]
+            if isinstance(info, dict):
+                for k, v in info.items():
+                    if v not in (None, "", [], {}):
+                        lines.append(f"  {pretty_s1_label(str(k))}: {format_s1_value(v)}")
+            if isinstance(status, dict):
+                for k, v in status.items():
+                    if v not in (None, "", [], {}):
+                        lines.append(f"  Status {pretty_s1_label(str(k))}: {format_s1_value(v)}")
+            self.append_log("\n".join(lines))
         except Exception as exc:
             self.report_error("Inspect Watchlist Info", exc)
 

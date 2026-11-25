@@ -9,6 +9,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
+from rich import box
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 from textual import events, on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -17,6 +21,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, Checkbox, Collapsible, DataTable, Input, RichLog, Select, Static
 
+from soclens.alert_cache import CACHE_SOURCE_ES
 from soclens.client import RecordedFutureClient
 from soclens.config import (
     PivotPayload,
@@ -53,6 +58,9 @@ from soclens.tui.filters import (
 )
 from soclens.tui.modals import SplunkNotableTriageModal
 from soclens.tui.pivot import emit_pivot
+from soclens.tui.rf_formatters import render_raw_json
+from soclens.tui.s1_formatters import format_s1_value as _format_human_value
+from soclens.tui.s1_formatters import pretty_s1_label as _pretty_field_label
 from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
 from soclens.tui.screens.es_modals import (
     ESAdaptiveResponseModal,
@@ -827,7 +835,40 @@ class SplunkESPane(BaseSocPane):
         self._sync_controls_for_view(self._current_view)
         self._update_split_layout()
         self._refresh_timer = self.set_interval(30.0, self._on_auto_refresh_tick)
+        self._hydrated_from_cache: bool = False
+        self._cache_fetched_at: float = 0.0
         self.call_after_refresh(self._mark_es_ready)
+
+    def hydrate_from_alert_cache(self, *, force: bool = False) -> bool:
+        """Populate Splunk ES Notables from the local 24h alert cache when available."""
+        if self._current_view != "notables" or self._item_type != "all":
+            return False
+        cache = getattr(self.app, "alert_cache", None)
+        if cache is None:
+            return False
+        entry = cache.get(CACHE_SOURCE_ES)
+        if entry is None:
+            return False
+        if not force and self._raw_rows and (
+            not getattr(self, "_hydrated_from_cache", False)
+            or entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
+        ):
+            return False
+        self._source_backend = str(entry.meta.get("source_backend") or "cached")
+        self._hydrated_from_cache = True
+        self._cache_fetched_at = entry.fetched_at
+        cols = self._get_notable_columns()
+        self._populate_table(
+            entry.items,
+            cols,
+            header_label="Notable Events",
+            loaded_item_type="all",
+        )
+        self.set_status(
+            f"Loaded {len(entry.items)} cached Splunk ES notable(s) "
+            f"(Last 24h, updated {entry.age_label()})."
+        )
+        return True
 
     def on_unmount(self) -> None:
         if self._refresh_timer is not None:
@@ -839,12 +880,15 @@ class SplunkESPane(BaseSocPane):
 
     def _mark_es_ready(self) -> None:
         self._es_ready = True
+        self.hydrate_from_alert_cache(force=False)
 
     def on_resize(self) -> None:
         self._update_split_layout()
 
     def on_tab_activated(self) -> None:
         self._update_split_layout()
+        if self._es_ready:
+            self.hydrate_from_alert_cache(force=False)
 
     def _sync_compact_labels(self, compact: bool) -> None:
         button_labels: tuple[tuple[str, str, str], ...] = (
@@ -2828,20 +2872,45 @@ class SplunkESPane(BaseSocPane):
         )
 
         if self._current_view != "notables":
+            tbl = Table.grid(padding=(0, 2), expand=True)
+            tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+            tbl.add_column(ratio=1, overflow="fold")
             for key, value in row.items():
-                if key == "raw" or key in _RF_ENRICHMENT_KEYS:
+                if key == "raw" or key in _RF_ENRICHMENT_KEYS or str(key).startswith("_"):
                     continue
-                rendered = (
-                    json.dumps(value, indent=2, ensure_ascii=False)
-                    if isinstance(value, (dict, list))
-                    else str(value)
+                rendered = _format_human_value(value)
+                if rendered and rendered != "-":
+                    tbl.add_row(_pretty_field_label(str(key)), Text(rendered))
+            detail.write(
+                Panel(
+                    tbl,
+                    title=Text(f"{self._view_header_title()}: {title_hint}", style="bold cyan"),
+                    border_style="cyan",
+                    box=box.ROUNDED,
                 )
-                detail.write(f"{key}: {rendered}")
+            )
             raw_payload = row.get("raw")
             if isinstance(raw_payload, dict) and raw_payload:
-                detail.write("")
-                detail.write("--- Raw Fields ---")
-                detail.write(json.dumps(raw_payload, indent=2, ensure_ascii=False, sort_keys=True))
+                extra_tbl = Table.grid(padding=(0, 2), expand=True)
+                extra_tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+                extra_tbl.add_column(ratio=1, overflow="fold")
+                added = 0
+                for rk, rv in sorted(raw_payload.items()):
+                    if rk in row or str(rk).startswith("_") or rv in (None, "", [], {}):
+                        continue
+                    rendered = _format_human_value(rv)
+                    if rendered and rendered != "-":
+                        extra_tbl.add_row(_pretty_field_label(str(rk)), Text(rendered))
+                        added += 1
+                if added > 0:
+                    detail.write(
+                        Panel(
+                            extra_tbl,
+                            title=Text("Additional Fields", style="bold white"),
+                            border_style="blue",
+                            box=box.ROUNDED,
+                        )
+                    )
             return
 
         tab = self._inspector_tab
@@ -2857,22 +2926,59 @@ class SplunkESPane(BaseSocPane):
             self._render_inspector_notes(detail, row)
         else:
             raw_payload = row.get("raw") or row
-            detail.write(json.dumps(raw_payload, indent=2, ensure_ascii=False, sort_keys=True))
+            detail.write(render_raw_json(raw_payload, title=f"Raw JSON - {title_hint}"))
 
     def _render_inspector_overview(
         self, detail: RichLog, row: dict[str, Any], tenant_badge: str
     ) -> None:
+        tbl = Table.grid(padding=(0, 2), expand=True)
+        tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+        tbl.add_column(ratio=1, overflow="fold")
         if tenant_badge and tenant_badge != "-":
-            detail.write(f"Tenant: {tenant_badge}")
-        for key, value in row.items():
-            if key in {"raw", "custom_fields", "selected"} or key in _RF_ENRICHMENT_KEYS:
+            tbl.add_row("Tenant", Text(tenant_badge, style="bold magenta"))
+        preferred = (
+            "event_id",
+            "rule_title",
+            "rule_name",
+            "title",
+            "urgency",
+            "severity",
+            "status_label",
+            "disposition",
+            "owner",
+            "entity",
+            "risk_score",
+            "security_domain",
+            "_time",
+            "rule_description",
+        )
+        seen: set[str] = {"raw", "custom_fields", "selected", "tenant_id"}
+        for key in preferred:
+            if key in seen or key not in row or key in _RF_ENRICHMENT_KEYS:
                 continue
-            rendered = (
-                json.dumps(value, indent=2, ensure_ascii=False)
-                if isinstance(value, (dict, list))
-                else str(value)
+            val = row.get(key)
+            rendered = _format_human_value(val)
+            if rendered and rendered != "-":
+                seen.add(key)
+                label = "Time" if key == "_time" else _pretty_field_label(key)
+                tbl.add_row(label, Text(rendered))
+        for key, value in row.items():
+            if key in seen or key in _RF_ENRICHMENT_KEYS or str(key).startswith("_"):
+                continue
+            rendered = _format_human_value(value)
+            if rendered and rendered != "-":
+                seen.add(key)
+                tbl.add_row(_pretty_field_label(str(key)), Text(rendered))
+
+        title_hint = str(row.get("rule_title") or row.get("title") or row.get("event_id") or "Finding")
+        detail.write(
+            Panel(
+                tbl,
+                title=Text(f"Finding Overview: {title_hint[:56]}", style="bold cyan"),
+                border_style="cyan",
+                box=box.ROUNDED,
             )
-            detail.write(f"{key}: {rendered}")
+        )
 
         tenant_cfg = get_splunk_es_tenant_settings()
         if tenant_cfg.custom_fields:
@@ -2883,17 +2989,28 @@ class SplunkESPane(BaseSocPane):
             )
             pinned_items = [(k, cf_map[k]) for k in tenant_cfg.custom_fields if k in cf_map]
             if pinned_items:
-                detail.write("")
-                detail.write("--- Pinned Custom Fields ---")
+                cf_tbl = Table.grid(padding=(0, 2), expand=True)
+                cf_tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+                cf_tbl.add_column(ratio=1, overflow="fold")
                 for k, v in pinned_items:
-                    lbl = self._discovered_labels.get(k, k)
-                    detail.write(f"{lbl} ({k}): {v}")
+                    lbl = self._discovered_labels.get(k, _pretty_field_label(k))
+                    cf_tbl.add_row(f"{lbl} ({k})", Text(_format_human_value(v)))
+                detail.write(
+                    Panel(
+                        cf_tbl,
+                        title=Text("Pinned Custom Fields", style="bold white"),
+                        border_style="blue",
+                        box=box.ROUNDED,
+                    )
+                )
 
         if "rf_observables" in row or "rf_max_risk_score" in row:
             self._render_inspector_rf(detail, row, include_header_gap=True)
 
     def _render_inspector_metadata(self, detail: RichLog, row: dict[str, Any]) -> None:
-        detail.write("--- Finding Metadata ---")
+        meta_tbl = Table.grid(padding=(0, 2), expand=True)
+        meta_tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+        meta_tbl.add_column(ratio=1, overflow="fold")
         for k in (
             "event_id",
             "rule_title",
@@ -2913,7 +3030,16 @@ class SplunkESPane(BaseSocPane):
             "_time",
         ):
             if row.get(k) not in (None, ""):
-                detail.write(f"{k}: {row.get(k)}")
+                label = "Time" if k == "_time" else _pretty_field_label(k)
+                meta_tbl.add_row(label, Text(_format_human_value(row.get(k))))
+        detail.write(
+            Panel(
+                meta_tbl,
+                title=Text("Finding Metadata", style="bold cyan"),
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
 
         tenant_cfg = get_splunk_es_tenant_settings()
         custom_map = extract_custom_fields(
@@ -2921,17 +3047,31 @@ class SplunkESPane(BaseSocPane):
             pinned_fields=tenant_cfg.custom_fields,
             discovered_fields=self._discovered_fields,
         )
-        detail.write("")
-        detail.write("--- Custom / Org Fields ---")
         if not custom_map:
-            detail.write("(No non-internal custom/org fields present on this record.)")
+            detail.write(
+                Panel(
+                    Text("No non-internal custom/org fields present on this record.", style="dim"),
+                    title=Text("Custom / Org Fields", style="bold white"),
+                    border_style="dim",
+                    box=box.ROUNDED,
+                )
+            )
         else:
+            cf_tbl = Table.grid(padding=(0, 2), expand=True)
+            cf_tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+            cf_tbl.add_column(ratio=1, overflow="fold")
             for k in sorted(custom_map.keys()):
-                lbl = self._discovered_labels.get(k, k)
-                prefix = f"{lbl} ({k})" if lbl != k else k
-                val = custom_map[k]
-                rendered = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
-                detail.write(f"{prefix}: {rendered}")
+                lbl = self._discovered_labels.get(k, _pretty_field_label(k))
+                prefix = f"{lbl} ({k})" if lbl != k else _pretty_field_label(k)
+                cf_tbl.add_row(prefix, Text(_format_human_value(custom_map[k])))
+            detail.write(
+                Panel(
+                    cf_tbl,
+                    title=Text("Custom / Org Fields", style="bold white"),
+                    border_style="blue",
+                    box=box.ROUNDED,
+                )
+            )
 
     def _render_inspector_srcdest(self, detail: RichLog, row: dict[str, Any]) -> None:
         raw_val = row.get("raw")
@@ -3498,6 +3638,41 @@ class SplunkESPane(BaseSocPane):
                 return
 
             self._source_backend = backend
+            self._hydrated_from_cache = False
+            if (
+                earliest == "-24h"
+                and item_type == "all"
+                and not any(
+                    (
+                        urgency,
+                        status,
+                        search_text,
+                        owner,
+                        disposition,
+                        rule_name,
+                        tenant_id,
+                        security_domain,
+                        severity,
+                        entity,
+                        src,
+                        dest,
+                        user,
+                        file_hash,
+                        min_risk_score,
+                        raw_query,
+                        orig_sid,
+                        custom_filters,
+                    )
+                )
+            ):
+                cache = getattr(self.app, "alert_cache", None)
+                if cache is not None:
+                    cache.put(
+                        CACHE_SOURCE_ES,
+                        notables,
+                        timeframe="last_24h",
+                        meta={"source_backend": backend},
+                    )
             cols = self._get_notable_columns()
             self._run_if_current(
                 seq,

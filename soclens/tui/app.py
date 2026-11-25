@@ -23,6 +23,13 @@ from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Select, Static, TabbedContent, TabPane
 
+from soclens.alert_cache import (
+    CACHE_SOURCE_ES,
+    CACHE_SOURCE_RF,
+    CACHE_SOURCE_S1,
+    AlertCacheStore,
+    get_alert_cache_refresh_seconds,
+)
 from soclens.client import RecordedFutureClient
 from soclens.config import (
     IMAGE_VIEWER_OS,
@@ -33,7 +40,10 @@ from soclens.config import (
     ensure_utf8_console,
     format_image_viewer_status,
     get_image_viewer_mode,
+    get_rf_token,
     get_rf_verify_ssl,
+    get_sentinelone_config,
+    get_splunk_config,
     get_ui_view_mode,
     get_workspace_dir,
     has_explicit_image_viewer_setting,
@@ -881,7 +891,15 @@ class SocLensApp(App[None]):
         text-style: bold;
     }
     DataTable > .datatable--hover {
-        background: #18233a;
+        background: #1d3557;
+        color: #f0f6ff;
+    }
+    Tooltip {
+        background: #162033;
+        color: #eef4ff;
+        border: round #58a6ff;
+        max-width: 110;
+        padding: 0 1;
     }
     RichLog {
         width: 1fr;
@@ -1117,6 +1135,8 @@ class SocLensApp(App[None]):
         image_viewer: str | None = None,
         view_mode: str | None = None,
         no_secret_store: bool = False,
+        preload_alerts: bool | None = None,
+        alert_cache_refresh_seconds: int | None = None,
     ) -> None:
         ensure_utf8_console()
         super().__init__()
@@ -1189,6 +1209,14 @@ class SocLensApp(App[None]):
         self._mounted_tabs: set[str] = {self.initial_tab}
         self._tab_mount_events: dict[str, asyncio.Event] = {}
         self._pending_tab_callbacks: dict[str, list[Callable[[BaseSocPane], None]]] = {}
+        self._preload_alerts_opt: bool | None = preload_alerts
+        self._alert_cache_refresh_override: int | None = alert_cache_refresh_seconds
+        self._preload_lock = threading.Lock()
+        self._preload_running: bool = False
+        self._alert_refresh_timer: Any = None
+        self.alert_cache = AlertCacheStore(
+            cache_dir=self.workspace_dir / ".soclens_cache" / "alerts"
+        )
         self._update_subtitle()
 
     @property
@@ -1727,6 +1755,227 @@ class SocLensApp(App[None]):
             self._prompt_settings_unlock()
         elif not self.no_secret_store:
             self._hydrate_secrets_worker()
+        self._start_alert_preloader()
+
+    def _should_preload_alerts(self) -> bool:
+        """Return True when startup/periodic 24h alert preloading should run."""
+        if self._preload_alerts_opt is not None:
+            return bool(self._preload_alerts_opt)
+        return not self.is_headless
+
+    def _effective_alert_refresh_seconds(self) -> int:
+        if self._alert_cache_refresh_override is not None:
+            return max(0, int(self._alert_cache_refresh_override))
+        return get_alert_cache_refresh_seconds()
+
+    def _start_alert_preloader(self) -> None:
+        if self._shutting_down or not self._should_preload_alerts():
+            return
+        self._preload_alerts_worker()
+        interval = self._effective_alert_refresh_seconds()
+        if interval > 0 and self._alert_refresh_timer is None:
+            with contextlib.suppress(Exception):
+                self._alert_refresh_timer = self.set_interval(
+                    float(interval), self._on_alert_refresh_tick
+                )
+
+    def _on_alert_refresh_tick(self) -> None:
+        if self._shutting_down or self._stop_event.is_set():
+            return
+        self._preload_alerts_worker()
+
+    @work(thread=True, exit_on_error=False)
+    def _preload_alerts_worker(self) -> None:
+        """Preload and refresh last-24h RF Alerts, Splunk ES Notables, and S1 Alerts."""
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        with self._preload_lock:
+            if self._preload_running:
+                return
+            self._preload_running = True
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            tasks: list[tuple[str, Callable[[], None]]] = [
+                (CACHE_SOURCE_RF, self._preload_rf_alerts_24h),
+                (CACHE_SOURCE_ES, self._preload_es_notables_24h),
+                (CACHE_SOURCE_S1, self._preload_s1_threats_24h),
+            ]
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="soclens-preload") as pool:
+                futures = [pool.submit(fn) for _, fn in tasks]
+                for fut in futures:
+                    with contextlib.suppress(Exception):
+                        fut.result()
+        finally:
+            with self._preload_lock:
+                self._preload_running = False
+
+    def _preload_rf_alerts_24h(self) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        if not self._custom_client_injected and not get_rf_token(required=False):
+            return
+        try:
+            from soclens.tui.filters import build_alerts_v3_triggered_param
+            from soclens.tui.rf_formatters import extract_alerts_v3, normalize_alert_v3
+
+            triggered = build_alerts_v3_triggered_param("last_24h")
+            call_kw: dict[str, Any] = {"limit": 100}
+            if triggered:
+                call_kw["triggered"] = triggered
+            data = self.client.search_alerts_v3(**call_kw)
+            raw_items, total = extract_alerts_v3(data)
+            normalized = [normalize_alert_v3(item) for item in raw_items]
+            if self._stop_event.is_set() or self._shutting_down:
+                return
+            self.alert_cache.put(
+                CACHE_SOURCE_RF,
+                normalized,
+                timeframe="last_24h",
+                meta={"total": total},
+            )
+            self._notify_cache_updated(CACHE_SOURCE_RF, len(normalized))
+        except Exception as exc:
+            self._log_preload_debug("RF alerts (24h)", exc)
+
+    def _preload_es_notables_24h(self) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        custom_es = getattr(self, "splunk_es_client", None)
+        if custom_es is None and not get_splunk_config(required=False).has_auth:
+            return
+        try:
+            from soclens.splunk_es import SplunkESClient
+
+            es_client = custom_es
+            owns_client = False
+            if es_client is None:
+                cfg = get_splunk_config(required=True)
+                es_client = SplunkESClient(
+                    host=cfg.host,
+                    token=cfg.token,
+                    username=cfg.username,
+                    password=cfg.password,
+                    verify_ssl=cfg.verify_ssl,
+                    stop_event=self._stop_event,
+                )
+                owns_client = True
+            try:
+                hybrid_fn = getattr(es_client, "query_findings_hybrid", None)
+                notables: list[dict[str, Any]] = []
+                backend = "spl_fallback"
+                if callable(hybrid_fn):
+                    res = hybrid_fn(earliest="-24h", item_type="all", limit=100)
+                    if isinstance(res, dict) and isinstance(res.get("items"), list):
+                        notables = list(res["items"])
+                        backend = str(res.get("source_backend") or "mc_v2")
+                if not notables and not callable(hybrid_fn):
+                    notables = es_client.list_notables(earliest="-24h", limit=100)
+                    backend = "spl_fallback"
+            finally:
+                if owns_client:
+                    with contextlib.suppress(Exception):
+                        es_client.close()
+
+            if self._stop_event.is_set() or self._shutting_down:
+                return
+            self.alert_cache.put(
+                CACHE_SOURCE_ES,
+                notables,
+                timeframe="last_24h",
+                meta={"source_backend": backend},
+            )
+            self._notify_cache_updated(CACHE_SOURCE_ES, len(notables))
+        except Exception as exc:
+            self._log_preload_debug("Splunk ES notables (24h)", exc)
+
+    def _preload_s1_threats_24h(self) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        if self.s1_client is None and not get_sentinelone_config(required=False).has_auth:
+            return
+        try:
+            from soclens.tui.filters import compute_timeframe_bounds
+
+            start_dt, end_dt = compute_timeframe_bounds("last_24h")
+            created_after = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if start_dt else None
+            created_before = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if end_dt else None
+
+            s1 = self.s1_client
+            owns_client = False
+            if s1 is None:
+                cfg = get_sentinelone_config(
+                    verify_ssl=self.get_effective_verify_ssl(),
+                    required=True,
+                )
+                s1 = SentinelOneClient(config=cfg, stop_event=self._stop_event)
+                owns_client = True
+            try:
+                records = s1.list_threats(
+                    created_after=created_after,
+                    created_before=created_before,
+                )
+                sites: list[dict[str, Any]] = []
+                with contextlib.suppress(Exception):
+                    sites = s1.list_sites()
+            finally:
+                if owns_client:
+                    with contextlib.suppress(Exception):
+                        s1.close()
+
+            if self._stop_event.is_set() or self._shutting_down:
+                return
+            self.alert_cache.put(
+                CACHE_SOURCE_S1,
+                records,
+                timeframe="last_24h",
+                meta={"sites": sites},
+            )
+            self._notify_cache_updated(CACHE_SOURCE_S1, len(records))
+        except Exception as exc:
+            self._log_preload_debug("SentinelOne alerts (24h)", exc)
+
+    def _log_preload_debug(self, label: str, exc: Exception) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        with contextlib.suppress(Exception):
+            self.record_log(
+                f"Background preload skipped/failed for {label}: {exc}",
+                level="DEBUG",
+                source="cache",
+                logger_name="AlertPreloader",
+            )
+
+    def _notify_cache_updated(self, source: str, count: int) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        with contextlib.suppress(Exception):
+            self.record_log(
+                f"Preloaded {count} cached record(s) for {source}.",
+                level="INFO",
+                source="cache",
+                logger_name="AlertPreloader",
+            )
+
+        def _apply() -> None:
+            if self._shutting_down:
+                return
+            tab_map = {
+                CACHE_SOURCE_RF: "tab-rf-intel",
+                CACHE_SOURCE_ES: "tab-splunk-es",
+                CACHE_SOURCE_S1: "tab-sentinelone",
+            }
+            tab_id = tab_map.get(source)
+            if not tab_id:
+                return
+            pane = self._get_mounted_pane(tab_id)
+            hydrate_fn = getattr(pane, "hydrate_from_alert_cache", None)
+            if callable(hydrate_fn):
+                with contextlib.suppress(Exception):
+                    hydrate_fn(force=False)
+
+        with contextlib.suppress(Exception):
+            self.call_from_thread(_apply)
 
     def _prompt_settings_unlock(self) -> None:
         """Open the master passphrase unlock dialog when settings.json is locked."""
@@ -1804,6 +2053,8 @@ class SocLensApp(App[None]):
             source="secrets",
             logger_name="SocLensApp",
         )
+        if self._should_preload_alerts():
+            self._preload_alerts_worker()
 
     def on_resize(self) -> None:
         """Update narrow-viewport chrome classes when terminal dimensions change."""
@@ -1869,6 +2120,10 @@ class SocLensApp(App[None]):
         self._ui_mounted = False
         self._shutting_down = True
         self._stop_event.set()
+        if self._alert_refresh_timer is not None:
+            with contextlib.suppress(Exception):
+                self._alert_refresh_timer.stop()
+            self._alert_refresh_timer = None
         clear_session_overrides()
         clear_unlocked_keys(mark_locked=False)
         self._logging_bridge.uninstall()
@@ -2153,6 +2408,8 @@ def create_app(
     image_viewer: str | None = None,
     view_mode: str | None = None,
     no_secret_store: bool = False,
+    preload_alerts: bool | None = None,
+    alert_cache_refresh_seconds: int | None = None,
 ) -> SocLensApp:
     """Factory returning a configured ``SocLensApp`` instance."""
     return SocLensApp(
@@ -2165,6 +2422,8 @@ def create_app(
         image_viewer=image_viewer,
         view_mode=view_mode,
         no_secret_store=no_secret_store,
+        preload_alerts=preload_alerts,
+        alert_cache_refresh_seconds=alert_cache_refresh_seconds,
     )
 
 

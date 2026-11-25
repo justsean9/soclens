@@ -8,6 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rich import box
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 from textual import events, on, work
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical
@@ -18,6 +22,8 @@ from soclens.splunk import SplunkClient, export_results_csv, export_results_json
 from soclens.splunk_rf_enrichment import SplunkRFEnricher
 from soclens.tui.filters import SPLUNK_TIME_PRESETS
 from soclens.tui.pivot import PivotPayload, build_spl_from_pivot
+from soclens.tui.s1_formatters import format_s1_value as _format_human_value
+from soclens.tui.s1_formatters import pretty_s1_label as _pretty_field_label
 from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
 
 _TIME_PRESETS: list[tuple[str, str]] = list(SPLUNK_TIME_PRESETS)
@@ -482,20 +488,33 @@ class SplunkSearchPane(BaseSocPane):
         detail.clear()
         header = self.query_one("#splunk-search-detail-header", Static)
         if self._table_mode == "saved_searches":
-            header.update(f"Saved Search Detail — {row.get('name', '')}")
+            panel_title = f"Saved Search Detail — {row.get('name', '')}"
+            header.update(panel_title)
         elif self._table_mode == "indexes":
-            header.update(f"Index Detail — {row.get('name', '')}")
+            panel_title = f"Index Detail — {row.get('name', '')}"
+            header.update(panel_title)
         else:
-            header.update(f"Event Detail — Row #{self._current_offset + row_index + 1}")
+            panel_title = f"Event Detail — Row #{self._current_offset + row_index + 1}"
+            header.update(panel_title)
 
+        tbl = Table.grid(padding=(0, 2), expand=True)
+        tbl.add_column(style="bold cyan", no_wrap=True, min_width=16)
+        tbl.add_column(ratio=1, overflow="fold")
         for key, value in row.items():
             if key in _RF_ENRICHMENT_KEYS:
                 continue
-            if isinstance(value, (dict, list)):
-                rendered = json.dumps(value, indent=2, ensure_ascii=False)
-            else:
-                rendered = str(value)
-            detail.write(f"{key}: {rendered}")
+            rendered = _format_human_value(value)
+            if rendered and rendered != "-":
+                label = "Time" if key == "_time" else ("Raw Event" if key == "_raw" else _pretty_field_label(str(key)))
+                tbl.add_row(label, Text(rendered))
+        detail.write(
+            Panel(
+                tbl,
+                title=Text(panel_title, style="bold cyan"),
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
 
         if "rf_observables" in row or "rf_max_risk_score" in row:
             detail.write("")

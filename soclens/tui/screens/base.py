@@ -95,6 +95,47 @@ class DoubleClickDataTable(DataTable[Any]):
         super().__init__(*args, **kwargs)
         self._last_click_row: int | None = None
         self._last_click_time: float = 0.0
+        self._hovered_row_index: int | None = None
+        self._row_tooltip_provider: Callable[[int], str | None] | None = None
+
+    def set_row_tooltip_provider(self, provider: Callable[[int], str | None] | None) -> None:
+        """Register an optional callback returning custom full-line hover text for a row index."""
+        self._row_tooltip_provider = provider
+
+    def _build_hover_tooltip(self, row_index: int) -> str | None:
+        if not self.is_valid_row_index(row_index):
+            return None
+        if self._row_tooltip_provider is not None:
+            try:
+                custom = self._row_tooltip_provider(row_index)
+                if custom:
+                    return custom
+            except Exception:
+                pass
+        row_text = extract_table_row_text(self, row_index=row_index)
+        return row_text or None
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        """Show a full-line hover popup tooltip for the row currently under the pointer."""
+        meta = event.style.meta
+        if "row" in meta:
+            try:
+                row_index = int(meta["row"])
+            except (TypeError, ValueError):
+                row_index = -1
+            if self.is_valid_row_index(row_index):
+                if row_index != self._hovered_row_index:
+                    self._hovered_row_index = row_index
+                    self.tooltip = self._build_hover_tooltip(row_index)
+                return
+        if self._hovered_row_index is not None or self.tooltip is not None:
+            self._hovered_row_index = None
+            self.tooltip = None
+
+    def on_leave(self, _event: events.Leave) -> None:
+        """Clear row hover popup tooltip when pointer leaves the table."""
+        self._hovered_row_index = None
+        self.tooltip = None
 
     async def _on_click(self, event: events.Click) -> None:
         event.prevent_default()

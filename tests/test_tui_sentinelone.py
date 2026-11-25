@@ -41,7 +41,7 @@ def _make_mock_s1_client() -> MagicMock:
             "lastIpToMgmt": "10.0.1.25",
             "networkStatus": "connected",
             "infected": True,
-            "siteName": "Finance",
+            "siteName": "MDR-1234",
         }
     ]
     s1.list_threats.return_value = [
@@ -52,9 +52,12 @@ def _make_mock_s1_client() -> MagicMock:
                 "analystVerdict": "undefined",
                 "incidentStatus": "unresolved",
                 "mitigationStatus": "active",
-                "createdAt": "2026-11-24T10:00:00Z",
+                "createdAt": "2026-11-25T10:00:00Z",
             },
-            "agentRealtimeInfo": {"agentComputerName": "FIN-WKSTN-01"},
+            "agentRealtimeInfo": {
+                "agentComputerName": "FIN-WKSTN-01",
+                "siteName": "MDR-1234",
+            },
         }
     ]
     s1.list_exclusions.return_value = [
@@ -77,14 +80,14 @@ def _make_mock_s1_client() -> MagicMock:
         }
     ]
     s1.list_sites.return_value = [
-        {"id": "site-1", "name": "Finance", "state": "active", "updatedAt": "2026-11-24T00:00:00Z"}
+        {"id": "site-1", "name": "MDR-1234", "state": "active", "updatedAt": "2026-11-25T00:00:00Z"}
     ]
     s1.list_activities.return_value = [
         {
             "id": "act-1",
             "primaryDescription": "Agent isolated",
-            "siteName": "Finance",
-            "createdAt": "2026-11-24T12:00:00Z",
+            "siteName": "MDR-1234",
+            "createdAt": "2026-11-25T12:00:00Z",
         }
     ]
     s1.disconnect_agent.return_value = {"data": {"affected": 1}}
@@ -104,7 +107,7 @@ def _make_mock_s1_client() -> MagicMock:
                 "alertId": "ca-505",
                 "incidentStatus": "UNRESOLVED",
                 "analystVerdict": "UNDEFINED",
-                "createdAt": "2026-11-24T13:00:00Z",
+                "createdAt": "2026-11-25T13:00:00Z",
             },
             "ruleInfo": {"name": "STAR: Unusual Script", "severity": "High"},
             "agentDetectionInfo": {
@@ -130,7 +133,7 @@ def _make_mock_s1_client() -> MagicMock:
         "sha1": "",
         "createdAt": (rec.get("alertInfo") or {}).get("createdAt")
         or rec.get("createdAt")
-        or "2026-11-24T13:00:00Z",
+        or "2026-11-25T13:00:00Z",
     }
     s1.list_users.return_value = [
         {
@@ -172,21 +175,25 @@ def test_s1_pane_views_and_refresh(tmp_path: Path) -> None:
             pane = app.query_one(SentinelOnePane)
             table = pane.query_one("#s1-table", DoubleClickDataTable)
 
-            # Endpoints view refresh
-            await pilot.click("#s1-refresh-btn")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            assert table.row_count == 1
-            s1.list_agents.assert_called_once()
-
-            # Switch to Threats view
-            pane.query_one("#s1-view-select", Select).value = "threats"
-            await pilot.pause()
+            # Default view is Threats & Alerts with MDR tier + Last 24h
+            assert pane._current_view == "threats"
+            assert pane._tier_filter == "MDR"
+            assert pane._timeframe_filter == "last_24h"
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert table.row_count == 1
             s1.list_threats.assert_called_once()
+            assert s1.list_threats.call_args.kwargs.get("created_after") is not None
+
+            # Switch to Endpoints view
+            pane.query_one("#s1-view-select", Select).value = "endpoints"
+            await pilot.pause()
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert table.row_count == 1
+            s1.list_agents.assert_called_once()
 
             # Switch to Exclusions view
             pane.query_one("#s1-view-select", Select).value = "exclusions"
@@ -236,6 +243,8 @@ def test_s1_confirm_action_modal_guardrail_cancel_and_approve(tmp_path: Path) ->
 
     async def _run() -> None:
         async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.click("#s1-wb-agents-btn")
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
@@ -382,6 +391,8 @@ def test_s1_dry_run_blocks_all_active_and_destructive_actions(tmp_path: Path) ->
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             pane = app.query_one(SentinelOnePane)
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -523,6 +534,8 @@ def test_s1_admin_view_gating_and_confirm_delete_site_modal(tmp_path: Path) -> N
             await pilot.pause()
 
             # User View blocks Move Site & Decommission on Agents
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -633,6 +646,8 @@ def test_s1_tier_filter_pills_and_four_grouping_modes(tmp_path: Path) -> None:
             table = pane.query_one("#s1-table", DoubleClickDataTable)
 
             await pilot.click("#s1-wb-alerts-btn")
+            await pilot.pause()
+            await pilot.click("#s1-tier-all-btn")
             await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
@@ -1682,6 +1697,9 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
             pane = app.query_one(SentinelOnePane)
             table = pane.query_one("#s1-table", DoubleClickDataTable)
 
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.click("#s1-tier-all-btn")
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -1692,6 +1710,8 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
             assert str(table.get_row_at(119)[0]) == "HOST-000"
 
             await pilot.click("#s1-wb-alerts-btn")
+            pane.query_one("#s1-timeframe-select", Select).value = "any"
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()

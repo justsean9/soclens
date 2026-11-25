@@ -1557,13 +1557,15 @@ class SentinelOneClient:
         computer_name: str | None = None,
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
         sort_by: str | None = "createdAt",
         sort_order: str = "desc",
         limit: int | None = None,
         max_pages: int | None = None,
         on_page: Callable[[int, int | None], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """List SentinelOne threats with optional incident/verdict/query filters."""
+        """List SentinelOne threats with optional incident/verdict/query/time filters."""
         params = self._scope_params(account_ids=account_ids, site_ids=site_ids)
         if query and query.strip():
             params["query"] = query.strip()
@@ -1577,6 +1579,10 @@ class SentinelOneClient:
             params["analystVerdicts"] = verdict_csv
         if resolved is not None:
             params["resolved"] = str(bool(resolved)).lower()
+        if created_after and created_after.strip():
+            params["createdAt__gte"] = created_after.strip()
+        if created_before and created_before.strip():
+            params["createdAt__lte"] = created_before.strip()
         _apply_sort_params(params, sort_by=sort_by, sort_order=sort_order)
         return self._paginate(
             "threats",
@@ -2035,6 +2041,8 @@ class SentinelOneClient:
         account_ids: Sequence[str] | str | None = None,
         site_ids: Sequence[str] | str | None = None,
         sites: Sequence[Mapping[str, Any]] | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
         sort_order: str = "desc",
         limit: int | None = None,
         max_pages: int | None = None,
@@ -2075,6 +2083,8 @@ class SentinelOneClient:
                 analyst_verdicts=analyst_verdicts,
                 account_ids=account_ids,
                 site_ids=site_ids,
+                created_after=created_after,
+                created_before=created_before,
                 sort_order=clean_order,
                 limit=limit,
                 max_pages=max_pages,
@@ -2095,6 +2105,8 @@ class SentinelOneClient:
                 analyst_verdicts=analyst_verdicts,
                 account_ids=account_ids,
                 site_ids=site_ids,
+                created_after=created_after,
+                created_before=created_before,
                 sort_order=clean_order,
                 limit=limit,
                 max_pages=max_pages,

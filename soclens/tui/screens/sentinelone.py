@@ -26,6 +26,7 @@ from textual.widgets import (
     Static,
 )
 
+from soclens.alert_cache import CACHE_SOURCE_S1
 from soclens.config import (
     S1TierConfig,
     get_s1_tier_config,
@@ -42,6 +43,7 @@ from soclens.sentinelone import (
 from soclens.tui.filters import (
     S1_PRESETS_BY_VIEW,
     TIMEFRAME_OPTIONS,
+    compute_timeframe_bounds,
     timeframe_label,
     timestamp_matches_timeframe,
 )
@@ -51,7 +53,11 @@ from soclens.tui.modals import (
     S1ThreatTriageModal,
 )
 from soclens.tui.pivot import PivotPayload, emit_pivot
-from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
+from soclens.tui.s1_formatters import (
+    render_raw_json,
+    render_s1_record_detail,
+)
+from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable, extract_richlog_text
 from soclens.tui.screens.s1_modals import (
     CloneExclusionsModal,
     ConfirmDeleteSiteModal,
@@ -227,12 +233,12 @@ class SentinelOnePane(BaseSocPane):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._current_view: str = "endpoints"
+        self._current_view: str = "threats"
         self._sites_submode: str = "sites"
         self._users_submode: str = "console"
         self._alert_source: str = "threats"
         self._grouping_mode: str = "flat"
-        self._tier_filter: str = "ALL"
+        self._tier_filter: str = "MDR"
         self._records: list[dict[str, Any]] = []
         self._filtered_records: list[dict[str, Any]] = []
         self._table_rows: list[dict[str, Any]] = []
@@ -244,10 +250,13 @@ class SentinelOnePane(BaseSocPane):
         self._table_ready: bool = False
         self._s1_client: SentinelOneClient | None = None
         self._active_preset_id: str = "all"
-        self._timeframe_filter: str = "any"
+        self._timeframe_filter: str = "last_24h"
+        self._loaded_timeframe_filter: str | None = None
         self._status_filter: str = "any"
         self._syncing_s1_filters: bool = False
         self._load_seq: int = 0
+        self._detail_mode: str = "overview"
+        self._hydrated_from_cache: bool = False
 
     def _get_s1_client(self) -> SentinelOneClient:
         """Return an injected or freshly configured ``SentinelOneClient``."""
@@ -308,22 +317,22 @@ class SentinelOnePane(BaseSocPane):
         )
 
         with Horizontal(id="s1-workbench-bar", classes="action-row filter-bar"):
-            yield Button("1: Alerts", id="s1-wb-alerts-btn", compact=True)
-            yield Button("2: Sites", id="s1-wb-sites-btn", compact=True)
-            yield Button("3: Users", id="s1-wb-users-btn", compact=True)
-            yield Button("4: Exclusions", id="s1-wb-exclusions-btn", compact=True)
             yield Button(
-                "5: Agents",
-                id="s1-wb-agents-btn",
+                "1: Alerts",
+                id="s1-wb-alerts-btn",
                 variant="primary",
                 compact=True,
             )
+            yield Button("2: Sites", id="s1-wb-sites-btn", compact=True)
+            yield Button("3: Users", id="s1-wb-users-btn", compact=True)
+            yield Button("4: Exclusions", id="s1-wb-exclusions-btn", compact=True)
+            yield Button("5: Agents", id="s1-wb-agents-btn", compact=True)
 
         with Horizontal(classes="action-row toolbar-row"):
             yield Select(
                 _VIEW_OPTIONS,
                 allow_blank=False,
-                value="endpoints",
+                value="threats",
                 id="s1-view-select",
                 compact=True,
             )
@@ -337,8 +346,8 @@ class SentinelOnePane(BaseSocPane):
             yield Button("Check Connection", id="s1-check-btn", compact=True)
 
         with Horizontal(id="s1-tier-bar", classes="action-row filter-bar"):
-            yield Button("All Tiers", id="s1-tier-all-btn", variant="primary", compact=True)
-            yield Button("MDR", id="s1-tier-mdr-btn", compact=True)
+            yield Button("All Tiers", id="s1-tier-all-btn", compact=True)
+            yield Button("MDR", id="s1-tier-mdr-btn", variant="primary", compact=True)
             yield Button("MSSP", id="s1-tier-mssp-btn", compact=True)
             yield Button("Other", id="s1-tier-other-btn", compact=True)
             yield Static(
@@ -367,7 +376,7 @@ class SentinelOnePane(BaseSocPane):
         with Vertical(id="s1-filter-bar"):
             with Horizontal(classes="action-row filter-bar"):
                 yield Select(
-                    [("View: All Endpoints", "all")],
+                    [("View: Alerts (Last 24h)", "all")],
                     allow_blank=False,
                     value="all",
                     id="s1-preset-select",
@@ -376,12 +385,12 @@ class SentinelOnePane(BaseSocPane):
                 yield Select(
                     list(TIMEFRAME_OPTIONS),
                     allow_blank=False,
-                    value="any",
+                    value="last_24h",
                     id="s1-timeframe-select",
                     compact=True,
                 )
                 yield Select(
-                    list(_S1_ENDPOINT_STATUS_OPTIONS),
+                    list(_S1_THREAT_STATUS_OPTIONS),
                     allow_blank=False,
                     value="any",
                     id="s1-status-select",
@@ -485,8 +494,11 @@ class SentinelOnePane(BaseSocPane):
                 )
                 yield DoubleClickDataTable(id="s1-table")
             with Vertical(id="s1-detail-pane"):
-                with Horizontal(classes="detail-toolbar"):
-                    yield Static("Details", id="s1-detail-header", classes="section-label", markup=False)
+                with Horizontal(id="s1-detail-toolbar", classes="detail-toolbar"):
+                    yield Static("Inspector (Overview)", id="s1-detail-header", classes="section-label", markup=False)
+                    yield Button("Overview", id="s1-view-overview-btn", variant="primary", compact=True)
+                    yield Button("Raw JSON", id="s1-view-json-btn", compact=True)
+                    yield Button("Copy Detail", id="s1-copy-detail-btn", compact=True)
                 yield RichLog(
                     id="s1-detail-log",
                     classes="detail-log",
@@ -512,10 +524,41 @@ class SentinelOnePane(BaseSocPane):
         self._sync_workbench_pills()
         self._sync_tier_pills()
         self._sync_admin_badge()
-        self._configure_columns("endpoints")
+        self._configure_columns(self._current_view)
         self._render_empty_detail()
         self._update_split_layout()
         self._update_initial_status()
+        self._cache_fetched_at: float = 0.0
+        self.hydrate_from_alert_cache(force=False)
+
+    def hydrate_from_alert_cache(self, *, force: bool = False) -> bool:
+        """Populate Threats & Alerts from the local 24h alert cache when available."""
+        if not self._table_ready or self._current_view != "threats":
+            return False
+        if self._alert_source != "threats" or self._timeframe_filter != "last_24h":
+            return False
+        cache = getattr(self.app, "alert_cache", None)
+        if cache is None:
+            return False
+        entry = cache.get(CACHE_SOURCE_S1)
+        if entry is None:
+            return False
+        if not force and self._records and (
+            not self._hydrated_from_cache or entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
+        ):
+            return False
+        cached_sites = entry.meta.get("sites")
+        if isinstance(cached_sites, list) and cached_sites and not self._cached_sites:
+            self._populate_site_selector(cached_sites)
+        self._loaded_timeframe_filter = "last_24h"
+        self._hydrated_from_cache = True
+        self._cache_fetched_at = entry.fetched_at
+        self._populate_table(entry.items)
+        self.set_status(
+            f"Loaded {len(entry.items)} cached SentinelOne alert(s) "
+            f"(Last 24h, updated {entry.age_label()})."
+        )
+        return True
 
     def _on_app_subtitle_changed(self, _old: str, _new: str) -> None:
         self._sync_admin_badge()
@@ -553,6 +596,7 @@ class SentinelOnePane(BaseSocPane):
         self._sync_admin_badge()
         self._update_split_layout()
         if self._table_ready:
+            self.hydrate_from_alert_cache(force=False)
             self.call_after_refresh(self._fit_table)
 
     def _update_split_layout(self) -> None:
@@ -631,9 +675,10 @@ class SentinelOnePane(BaseSocPane):
                 preset_sel.value = "all"
                 preset_sel.mutate_reactive(getattr(Select, "value"))
 
+            default_tf = "last_24h" if self._current_view == "threats" else "any"
             tf_sel = self.query_one("#s1-timeframe-select", Select)
             with tf_sel.prevent(Select.Changed):
-                tf_sel.value = "any"
+                tf_sel.value = default_tf
                 tf_sel.display = self._current_view in {"threats", "sites_activities"}
 
             status_sel = self.query_one("#s1-status-select", Select)
@@ -664,7 +709,7 @@ class SentinelOnePane(BaseSocPane):
             group_sel.display = self._current_view == "threats"
 
             self._active_preset_id = "all"
-            self._timeframe_filter = "any"
+            self._timeframe_filter = default_tf
             self._status_filter = "any"
         except Exception:
             pass
@@ -681,6 +726,7 @@ class SentinelOnePane(BaseSocPane):
         self._filtered_records = []
         self._table_rows = []
         self._selected_record = None
+        self._loaded_timeframe_filter = None
         try:
             view_sel = self.query_one("#s1-view-select", Select)
             if str(view_sel.value or "") != val:
@@ -1148,8 +1194,11 @@ class SentinelOnePane(BaseSocPane):
                 "threats",
                 "sites_activities",
             }:
-                if not timestamp_matches_timeframe(
-                    self._record_timestamp(rec),
+                rec_ts = self._record_timestamp(rec)
+                if rec_ts is None and self._loaded_timeframe_filter == self._timeframe_filter:
+                    pass
+                elif not timestamp_matches_timeframe(
+                    rec_ts,
                     self._timeframe_filter,
                 ):
                     continue
@@ -1203,36 +1252,65 @@ class SentinelOnePane(BaseSocPane):
 
             rec_id = str(rec.get("id") or "-")
             tier, tenant_id, site_id, site_name = self._classify_record_tier(rec)
-            header.update(f"Details ({self._current_view}: {rec_id} | {tier})")
+            mode_tag = "Raw JSON" if self._detail_mode == "json" else "Overview"
+            header.update(f"Inspector ({mode_tag}) - {self._current_view}: {rec_id} | {tier}")
+            self._sync_detail_mode_buttons()
             detail = self.query_one("#s1-detail-log", RichLog)
             detail.clear()
 
-            summary_tbl = Table.grid(padding=(0, 1))
-            summary_tbl.add_column(style="bold cyan", no_wrap=True)
-            summary_tbl.add_column()
-            summary_tbl.add_row("Service Tier", tier)
-            if tenant_id:
-                summary_tbl.add_row("Tenant Code", tenant_id)
-            if site_name or site_id:
-                summary_tbl.add_row("Site", f"{site_name or '-'} ({site_id or '-'})")
-            for key, val in list(rec.items())[:18]:
-                if str(key).startswith("_"):
-                    continue
-                if isinstance(val, (dict, list)):
-                    rendered = _truncate(json.dumps(val, default=str), 120)
-                else:
-                    rendered = str(val)
-                summary_tbl.add_row(str(key), rendered)
-            detail.write(Panel(summary_tbl, title=f"Record {rec_id}", border_style="cyan"))
-            detail.write(
-                Panel(
-                    Text(json.dumps(rec, indent=2, default=str)),
-                    title="Raw JSON",
-                    border_style="dim",
+            if self._detail_mode == "json":
+                detail.write(render_raw_json(rec, title=f"Raw JSON - {rec_id}"))
+            else:
+                detail.write(
+                    render_s1_record_detail(
+                        self._current_view,
+                        rec,
+                        tier=tier,
+                        tenant_id=tenant_id,
+                        site_id=site_id,
+                        site_name=site_name,
+                    )
                 )
-            )
         except Exception:
             pass
+
+    def _sync_detail_mode_buttons(self) -> None:
+        try:
+            ov_btn = self.query_one("#s1-view-overview-btn", Button)
+            js_btn = self.query_one("#s1-view-json-btn", Button)
+            if self._detail_mode == "json":
+                ov_btn.variant = "default"
+                js_btn.variant = "primary"
+            else:
+                ov_btn.variant = "primary"
+                js_btn.variant = "default"
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#s1-view-overview-btn")
+    def handle_view_overview(self) -> None:
+        self._detail_mode = "overview"
+        self._sync_detail_mode_buttons()
+        if self._selected_record is not None:
+            self._select_record(self._selected_record)
+
+    @on(Button.Pressed, "#s1-view-json-btn")
+    def handle_view_json(self) -> None:
+        self._detail_mode = "json"
+        self._sync_detail_mode_buttons()
+        if self._selected_record is not None:
+            self._select_record(self._selected_record)
+
+    @on(Button.Pressed, "#s1-copy-detail-btn")
+    def handle_copy_detail(self) -> None:
+        if self._selected_record is not None and self._detail_mode == "json":
+            text = json.dumps(self._selected_record, indent=2, default=str)
+        else:
+            try:
+                text = extract_richlog_text(self.query_one("#s1-detail-log", RichLog))
+            except Exception:
+                text = ""
+        self.copy_to_clipboard(text, label="SentinelOne Detail")
 
     def _record_for_row_index(self, row_index: int | None) -> dict[str, Any] | None:
         if row_index is None:
@@ -1692,16 +1770,23 @@ class SentinelOnePane(BaseSocPane):
         finally:
             self._syncing_s1_filters = False
         if self._table_ready:
-            self._apply_local_filter()
+            if self._timeframe_needs_reload(self._timeframe_filter):
+                self._load_view_worker(self._current_view, self._sites_submode)
+            else:
+                self._apply_local_filter()
         self.set_status(f"Applied preset: {matched.get('label')}")
 
     @on(Select.Changed, "#s1-timeframe-select")
     def handle_timeframe_changed(self, event: Select.Changed) -> None:
         if self._syncing_s1_filters or event.value is Select.BLANK:
             return
-        self._timeframe_filter = str(event.value or "any")
+        new_tf = str(event.value or "any")
+        self._timeframe_filter = new_tf
         if self._table_ready:
-            self._apply_local_filter()
+            if self._timeframe_needs_reload(new_tf):
+                self._load_view_worker(self._current_view, self._sites_submode)
+            else:
+                self._apply_local_filter()
 
     @on(Select.Changed, "#s1-status-select")
     def handle_status_filter_changed(self, event: Select.Changed) -> None:
@@ -2660,19 +2745,52 @@ class SentinelOnePane(BaseSocPane):
         except Exception as exc:
             self._report_s1_error("SentinelOne Load Sites Scope", exc)
 
+    @staticmethod
+    def _timeframe_query_bounds(timeframe: str) -> tuple[str | None, str | None]:
+        """Convert a timeframe filter key into ISO-8601 UTC ``(created_after, created_before)``."""
+        start_dt, end_dt = compute_timeframe_bounds(timeframe)
+        created_after = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if start_dt is not None else None
+        created_before = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if end_dt is not None else None
+        return created_after, created_before
+
+    def _timeframe_needs_reload(self, new_tf: str) -> bool:
+        """Return True if ``new_tf`` requires a wider server fetch than the loaded window."""
+        if self._current_view != "threats" or self._loaded_timeframe_filter is None:
+            return False
+        if self._loaded_timeframe_filter == "any" or new_tf == self._loaded_timeframe_filter:
+            return False
+        if new_tf == "any":
+            return True
+        old_start, old_end = compute_timeframe_bounds(self._loaded_timeframe_filter)
+        new_start, new_end = compute_timeframe_bounds(new_tf)
+        if old_start is not None and (new_start is None or new_start < old_start):
+            return True
+        if old_end is not None and (new_end is None or new_end > old_end):
+            return True
+        return False
+
     @work(thread=True, exit_on_error=False)
     def _load_view_worker(self, view: str, submode: str = "sites") -> None:
         self._load_seq += 1
         my_seq = self._load_seq
+        active_tf = self._timeframe_filter if view == "threats" else "any"
+        created_after, created_before = (
+            self._timeframe_query_bounds(active_tf) if view == "threats" else (None, None)
+        )
         try:
-            self.set_status(f"Loading SentinelOne {view}...")
+            tf_suffix = (
+                f" ({timeframe_label(active_tf)})"
+                if view == "threats" and active_tf != "any"
+                else ""
+            )
+            self.set_status(f"Loading SentinelOne {view}{tf_suffix}...")
             site_filter = sorted(self._selected_site_ids) if self._selected_site_ids else None
 
             def _on_page(loaded: int, total: int | None) -> None:
                 if my_seq != self._load_seq:
                     return
                 suffix = f"{loaded}/{total}" if total is not None else f"{loaded}"
-                self.set_status(f"Loading SentinelOne {view}... ({suffix} loaded)")
+                self.set_status(f"Loading SentinelOne {view}{tf_suffix}... ({suffix} loaded)")
 
             with self.log_scope("sentinelone"):
                 client = self._get_s1_client()
@@ -2682,6 +2800,8 @@ class SentinelOnePane(BaseSocPane):
                     if self._alert_source == "cloud":
                         raw_cloud = client.list_cloud_alerts(
                             site_ids=site_filter,
+                            created_after=created_after,
+                            created_before=created_before,
                             on_page=_on_page,
                         )
                         records = sort_s1_records_newest_first(
@@ -2691,10 +2811,17 @@ class SentinelOnePane(BaseSocPane):
                         records = client.list_unified_alerts(
                             site_ids=site_filter,
                             sites=self._cached_sites or None,
+                            created_after=created_after,
+                            created_before=created_before,
                             on_page=_on_page,
                         )
                     else:
-                        records = client.list_threats(site_ids=site_filter, on_page=_on_page)
+                        records = client.list_threats(
+                            site_ids=site_filter,
+                            created_after=created_after,
+                            created_before=created_before,
+                            on_page=_on_page,
+                        )
                 elif view == "exclusions":
                     records = client.list_exclusions(site_ids=site_filter, on_page=_on_page)
                 elif view == "blocklist":
@@ -2725,8 +2852,24 @@ class SentinelOnePane(BaseSocPane):
 
             if my_seq != self._load_seq:
                 return
+            if view == "threats":
+                self._loaded_timeframe_filter = active_tf
+                self._hydrated_from_cache = False
+                if (
+                    active_tf == "last_24h"
+                    and self._alert_source == "threats"
+                    and not site_filter
+                ):
+                    cache = getattr(self.app, "alert_cache", None)
+                    if cache is not None:
+                        cache.put(
+                            CACHE_SOURCE_S1,
+                            records,
+                            timeframe="last_24h",
+                            meta={"sites": list(self._cached_sites)},
+                        )
             self.run_on_ui(self._populate_table, records)
-            msg = f"Loaded {len(records)} SentinelOne {view} record(s)."
+            msg = f"Loaded {len(records)} SentinelOne {view}{tf_suffix} record(s)."
             self.set_status(msg)
             self.append_log(msg)
         except Exception as exc:

@@ -417,7 +417,8 @@ SPLUNK_ES_PRESETS: tuple[dict[str, Any], ...] = (
 
 S1_PRESETS_BY_VIEW: dict[str, tuple[dict[str, Any], ...]] = {
     "threats": (
-        {"id": "all", "label": "View: All Threats", "timeframe": "any", "status": "any"},
+        {"id": "all", "label": "View: Alerts (Last 24h)", "timeframe": "last_24h", "status": "any"},
+        {"id": "all_time", "label": "View: All Time Alerts", "timeframe": "any", "status": "any"},
         {
             "id": "active_24h",
             "label": "Active Unresolved (24h)",

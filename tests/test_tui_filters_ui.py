@@ -492,6 +492,9 @@ def test_tui_sentinelone_view_presets_and_timeframes(tmp_path: Path) -> None:
     async def _run() -> None:
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
+            await pilot.click("#s1-tier-all-btn")
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -506,6 +509,8 @@ def test_tui_sentinelone_view_presets_and_timeframes(tmp_path: Path) -> None:
 
             app.query_one("#s1-view-select", Select).value = "threats"
             await pilot.pause()
+            app.query_one("#s1-timeframe-select", Select).value = "any"
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -518,6 +523,9 @@ def test_tui_sentinelone_view_presets_and_timeframes(tmp_path: Path) -> None:
             assert "OldUnresolvedThreat" in [str(c) for c in table.get_row_at(0)]
 
             await pilot.click("#s1-clear-filter-btn")
+            await pilot.pause()
+            app.query_one("#s1-timeframe-select", Select).value = "any"
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert table.row_count == 2
 

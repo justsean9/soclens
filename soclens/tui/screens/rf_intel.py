@@ -28,6 +28,7 @@ from textual.widgets import (
     TabbedContent,
 )
 
+from soclens.alert_cache import CACHE_SOURCE_RF
 from soclens.client import RecordedFutureError
 from soclens.tui.filters import (
     ASSIGNEE_FILTER_BASE_OPTIONS,
@@ -646,9 +647,48 @@ class RFIntelPane(BaseSocPane):
         table.cursor_type = "row"
         table.zebra_stripes = True
         self._tables_ready = True
+        self._hydrated_from_cache: bool = False
+        self._cache_fetched_at: float = 0.0
         self._refresh_preset_options(select_id=self._active_preset_id)
         self._render_view()
         self._update_responsive_layout()
+        self.call_after_refresh(self.hydrate_from_alert_cache)
+
+    def hydrate_from_alert_cache(self, *, force: bool = False) -> bool:
+        """Populate RF Alerts v3 from the local 24h alert cache when available."""
+        if not self._tables_ready:
+            return False
+        cache = getattr(self.app, "alert_cache", None)
+        if cache is None:
+            return False
+        entry = cache.get(CACHE_SOURCE_RF)
+        if entry is None:
+            return False
+        already_same_cache = (
+            bool(self._datasets.get("alerts_v3"))
+            and self._active_mode == "alerts_v3"
+            and (
+                not getattr(self, "_hydrated_from_cache", False)
+                or entry.fetched_at <= getattr(self, "_cache_fetched_at", 0.0)
+            )
+        )
+        if not force and already_same_cache:
+            return False
+        if self._active_mode not in ("welcome", "alerts_v3") and not force:
+            return False
+        self._datasets["alerts_v3"] = list(entry.items)
+        raw_total = entry.meta.get("total")
+        self._dataset_totals["alerts_v3"] = raw_total if isinstance(raw_total, int) else len(entry.items)
+        self._active_mode = "alerts_v3"
+        self._hydrated_from_cache = True
+        self._cache_fetched_at = entry.fetched_at
+        self._refresh_assignee_options()
+        self._render_view(schedule_auto_enrich=False)
+        self.set_status(
+            f"Loaded {len(entry.items)} cached RF alert(s) "
+            f"(Last 24h, updated {entry.age_label()})."
+        )
+        return True
 
     def on_unmount(self) -> None:
         clear_kitty_images(self.app, self._inline_kitty_ids)
@@ -659,6 +699,7 @@ class RFIntelPane(BaseSocPane):
 
     def on_tab_activated(self) -> None:
         if self._tables_ready:
+            self.hydrate_from_alert_cache(force=False)
             self._update_responsive_layout()
 
     def _update_responsive_layout(self) -> None:
@@ -3512,6 +3553,19 @@ class RFIntelPane(BaseSocPane):
                     total = len(by_id)
 
             normalized = [normalize_alert_v3(item) for item in raw_items]
+            if (
+                str(f.get("timeframe") or "any") == "last_24h"
+                and not active_statuses
+                and assignee_val.lower() == "any"
+            ):
+                cache = getattr(self.app, "alert_cache", None)
+                if cache is not None:
+                    cache.put(
+                        CACHE_SOURCE_RF,
+                        normalized,
+                        timeframe="last_24h",
+                        meta={"total": total},
+                    )
 
             def _apply() -> tuple[list[dict[str, Any]], int] | None:
                 if seq != self._request_seq:
@@ -3519,6 +3573,7 @@ class RFIntelPane(BaseSocPane):
                 self._datasets["alerts_v3"] = normalized
                 self._dataset_totals["alerts_v3"] = total
                 self._active_mode = "alerts_v3"
+                self._hydrated_from_cache = False
                 self._refresh_assignee_options()
                 self._render_view(schedule_auto_enrich=False)
                 return self._claim_visible_enrichment_targets("alerts_v3")
