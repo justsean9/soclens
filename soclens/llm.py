@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +14,22 @@ from requests.adapters import HTTPAdapter
 
 from soclens.config import (
     ConfigurationError,
+    ConfiguredSession,
     LocalLLMConfig,
+    PivotPayload,
     get_local_llm_config,
     suppress_insecure_ssl_warnings,
 )
+
+__all__ = [
+    "SOC_PROMPT_TEMPLATES",
+    "LocalLLMClient",
+    "LocalLLMConfigError",
+    "LocalLLMConnectionError",
+    "LocalLLMError",
+    "build_copilot_prompt",
+    "format_llm_copilot_context",
+]
 
 logger = logging.getLogger("soclens.llm")
 
@@ -104,7 +116,157 @@ SOC_PROMPT_TEMPLATES: dict[str, dict[str, str]] = {
         ),
         "user_prefix": "Assist with the following Splunk SPL request:\n\n",
     },
+    "summarize_attack_chain": {
+        "label": "Attack-Chain Summary",
+        "description": "Summarize correlated Splunk ES, Tenant, SentinelOne, and RF context into an attack chain.",
+        "system_prompt": (
+            "You are a senior Tier-2/3 SOC incident responder analyzing correlated multi-tool "
+            "telemetry ([Splunk ES Notable + Tenant Context + SentinelOne Threat/Mitigation + "
+            "Recorded Future IOC Enrichment]). Produce a structured attack-chain summary covering: "
+            "(1) Tenant & Scope, (2) Execution & Attack Chain Timeline, (3) Endpoint / SentinelOne "
+            "Telemetry & Mitigation State, (4) Recorded Future Threat Intel & Risk Attribution, and "
+            "(5) Immediate Containment & Next Hunt Steps. Cite only facts present in the context; "
+            "explicitly note if S1 or RF telemetry is absent."
+        ),
+        "user_prefix": "Summarize the attack chain from the following bundled SOC context:\n\n",
+    },
+    "draft_closing_note": {
+        "label": "Draft Closing Note",
+        "description": "Draft a concise, audit-ready SOC closing note from bundled ES/S1/RF triage context.",
+        "system_prompt": (
+            "You are a senior SOC analyst drafting a concise, audit-ready closing note for a "
+            "Splunk ES notable/investigation or incident ticket. Output: (1) Recommended Disposition "
+            "& Severity, (2) Concise Incident Summary (Tenant, Host/User, Key IOCs), (3) Actions "
+            "Taken / Mitigation Status (SentinelOne/ES), (4) Recorded Future Risk Context, and "
+            "(5) Follow-up / Monitoring Notes. Keep the note factual, crisp, and ready to paste."
+        ),
+        "user_prefix": "Draft a concise closing note for the following bundled SOC context:\n\n",
+    },
 }
+
+
+def format_llm_copilot_context(context: str | PivotPayload | Mapping[str, Any]) -> str:
+    """Format bundled ``[ES + Tenant + S1 + RF]`` SOC context into prompt text."""
+    if isinstance(context, str):
+        rendered = context.strip()
+        if not rendered:
+            raise LocalLLMConfigError("Copilot context cannot be empty.")
+        return rendered
+
+    if isinstance(context, PivotPayload):
+        title_parts = ["SOC Triage Pivot"]
+        if context.tenant_id:
+            title_parts.append(f"Tenant {context.tenant_id}")
+        if context.hostname:
+            title_parts.append(context.hostname)
+        elif context.entity:
+            title_parts.append(context.entity)
+        title = " | ".join(title_parts)
+
+        sections: list[str] = [f"# {title}"]
+        if context.summary and context.summary.strip():
+            sections.append(f"## Summary\n{context.summary.strip()}")
+
+        scope_lines: list[str] = []
+        for label, val in (
+            ("Source Tab", context.source_tab),
+            ("Tenant ID", context.tenant_id),
+            ("Tier", context.tier),
+            ("Site Name", context.site_name),
+            ("Site ID", context.site_id),
+            ("Earliest", context.earliest),
+            ("Latest", context.latest),
+        ):
+            if val:
+                scope_lines.append(f"- **{label}**: {val}")
+        if scope_lines:
+            sections.append("## Tenant & Scope\n" + "\n".join(scope_lines))
+
+        ioc_lines: list[str] = []
+        for label, val in (
+            ("Entity", context.entity),
+            ("Entity Type", context.entity_type),
+            ("Hostname", context.hostname),
+            ("Username", context.username),
+            ("Source IP", context.src_ip),
+            ("Destination IP", context.dest_ip),
+            ("SHA-1", context.sha1),
+            ("SHA-256", context.sha256),
+            ("Original SID", context.orig_sid),
+        ):
+            if val:
+                ioc_lines.append(f"- **{label}**: `{val}`")
+        if ioc_lines:
+            sections.append("## Indicators & Entities\n" + "\n".join(ioc_lines))
+
+        if context.spl_query and context.spl_query.strip():
+            sections.append(f"## Splunk Query\n```spl\n{context.spl_query.strip()}\n```")
+
+        for heading, blob in (
+            ("Splunk ES Finding", context.es_finding),
+            ("SentinelOne Threat / Context", context.s1_threat),
+            ("Recorded Future Enrichment", context.rf_enrichment),
+        ):
+            if blob:
+                rendered_blob = json.dumps(blob, indent=2, ensure_ascii=False, default=str)
+                sections.append(f"## {heading}\n```json\n{rendered_blob}\n```")
+
+        has_substance = any(
+            (
+                context.summary and context.summary.strip(),
+                context.tenant_id,
+                context.tier,
+                context.site_name,
+                context.site_id,
+                context.entity,
+                context.hostname,
+                context.username,
+                context.src_ip,
+                context.dest_ip,
+                context.sha1,
+                context.sha256,
+                context.orig_sid,
+                context.spl_query and context.spl_query.strip(),
+                context.es_finding,
+                context.s1_threat,
+                context.rf_enrichment,
+            )
+        )
+        if not has_substance:
+            raise LocalLLMConfigError("Copilot context cannot be empty.")
+        return "\n\n".join(sections)
+
+    if isinstance(context, Mapping):
+        if not context:
+            raise LocalLLMConfigError("Copilot context cannot be empty.")
+        return json.dumps(dict(context), indent=2, ensure_ascii=False, default=str)
+
+    raise LocalLLMConfigError("Unsupported copilot context type.")
+
+
+def build_copilot_prompt(
+    template_key: str,
+    context: str | PivotPayload | Mapping[str, Any],
+    *,
+    extra_instruction: str = "",
+) -> tuple[str, str]:
+    """Validate ``template_key`` and build ``(system_prompt, user_content)``."""
+    key = template_key.strip().lower()
+    template = SOC_PROMPT_TEMPLATES.get(key)
+    if template is None:
+        available = ", ".join(SOC_PROMPT_TEMPLATES.keys())
+        raise LocalLLMConfigError(
+            f"Unknown SOC prompt template '{template_key}'. Available: {available}"
+        )
+
+    rendered_context = format_llm_copilot_context(context)
+    prefix = template.get("user_prefix", "")
+    parts = [f"{prefix}{rendered_context}"]
+    extra = extra_instruction.strip()
+    if extra:
+        parts.append(f"\n\nAdditional analyst instructions:\n{extra}")
+    user_content = "".join(parts).strip()
+    return template["system_prompt"], user_content
 
 
 def _extract_error_detail(response: requests.Response) -> str:
@@ -199,7 +361,7 @@ class LocalLLMClient:
         if session is not None:
             self.session = session
         else:
-            self.session = requests.Session()
+            self.session = ConfiguredSession()
             adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8)
             self.session.mount("http://", adapter)
             self.session.mount("https://", adapter)
@@ -250,6 +412,10 @@ class LocalLLMClient:
             raise LocalLLMConfigError(f"Unknown endpoint kind: {kind}")
 
         # OpenAI-compatible endpoints: avoid duplicating /v1 if base_url already includes it
+        for suffix in ("/chat/completions", "/models"):
+            if base.lower().endswith(suffix):
+                base = base[: -len(suffix)].rstrip("/")
+                break
         has_v1 = base.lower().endswith("/v1") or "/v1/" in base.lower()
         prefix = "" if has_v1 else "/v1"
         if kind == "models":
@@ -657,19 +823,67 @@ class LocalLLMClient:
                 f"Unknown SOC prompt template '{template_key}'. Available: {available}"
             )
 
-        prefix = template.get("user_prefix", "")
-        parts = [f"{prefix}{content.strip()}"] if content.strip() else []
-        extra = extra_instruction.strip()
-        if extra:
-            parts.append(f"\n\nAdditional analyst instructions:\n{extra}")
-        user_content = "".join(parts).strip()
-        if not user_content:
-            raise LocalLLMConfigError("Prompt content cannot be empty.")
+        if content.strip():
+            system_prompt, user_content = build_copilot_prompt(
+                key,
+                content,
+                extra_instruction=extra_instruction,
+            )
+        else:
+            extra = extra_instruction.strip()
+            if not extra:
+                raise LocalLLMConfigError("Prompt content cannot be empty.")
+            system_prompt = template["system_prompt"]
+            user_content = f"Additional analyst instructions:\n{extra}"
 
         return self.chat(
             [{"role": "user", "content": user_content}],
             model=model,
-            system_prompt=template["system_prompt"],
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream_callback=stream_callback,
+        )
+
+    def summarize_attack_chain(
+        self,
+        context: str | PivotPayload | Mapping[str, Any],
+        *,
+        extra_instruction: str = "",
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        stream_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Summarize a bundled [ES + Tenant + S1 + RF] triage context into an attack chain."""
+        rendered = format_llm_copilot_context(context)
+        return self.analyze_with_template(
+            "summarize_attack_chain",
+            rendered,
+            extra_instruction=extra_instruction,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream_callback=stream_callback,
+        )
+
+    def draft_closing_note(
+        self,
+        context: str | PivotPayload | Mapping[str, Any],
+        *,
+        extra_instruction: str = "",
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        stream_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Draft a concise closing note from a bundled [ES + Tenant + S1 + RF] triage context."""
+        rendered = format_llm_copilot_context(context)
+        return self.analyze_with_template(
+            "draft_closing_note",
+            rendered,
+            extra_instruction=extra_instruction,
+            model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             stream_callback=stream_callback,

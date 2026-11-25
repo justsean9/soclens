@@ -99,6 +99,9 @@ def format_copilot_context(payload: PivotPayload) -> tuple[str, str]:
     if ioc_lines:
         sections.append("## Indicators & Entities\n" + "\n".join(ioc_lines))
 
+    if payload.spl_query and payload.spl_query.strip():
+        sections.append(f"## Splunk Query\n```spl\n{payload.spl_query.strip()}\n```")
+
     for heading, blob in (
         ("Splunk ES Finding", payload.es_finding),
         ("SentinelOne Threat / Context", payload.s1_threat),

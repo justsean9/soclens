@@ -494,6 +494,9 @@ S1_PRESETS_BY_VIEW: dict[str, tuple[dict[str, Any], ...]] = {
     "blocklist": (
         {"id": "all", "label": "View: All Blocklist", "timeframe": "any", "status": "any"},
     ),
+    "users_rbac": (
+        {"id": "all", "label": "View: All Users & RBAC", "timeframe": "any", "status": "any"},
+    ),
 }
 
 

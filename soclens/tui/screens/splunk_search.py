@@ -17,6 +17,7 @@ from soclens.config import get_splunk_config
 from soclens.splunk import SplunkClient, export_results_csv, export_results_json
 from soclens.splunk_rf_enrichment import SplunkRFEnricher
 from soclens.tui.filters import SPLUNK_TIME_PRESETS
+from soclens.tui.pivot import PivotPayload, build_spl_from_pivot
 from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
 
 _TIME_PRESETS: list[tuple[str, str]] = list(SPLUNK_TIME_PRESETS)
@@ -106,6 +107,7 @@ class SplunkSearchPane(BaseSocPane):
         self._last_duration: float = 0.0
         self._rendering_table: bool = False
         self._syncing_preset: bool = False
+        self._request_seq: int = 0
         self._enricher: SplunkRFEnricher | None = None
 
     def compose(self) -> ComposeResult:
@@ -124,7 +126,7 @@ class SplunkSearchPane(BaseSocPane):
             show_line_numbers=False,
         )
 
-        with Horizontal(classes="action-row filter-bar"):
+        with Horizontal(id="splunk-search-time-bar", classes="action-row filter-bar"):
             yield Select(
                 _TIME_PRESETS,
                 allow_blank=False,
@@ -157,7 +159,7 @@ class SplunkSearchPane(BaseSocPane):
                 compact=True,
             )
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="splunk-search-toolbar", classes="action-row toolbar-row"):
             yield Button(
                 "Run Search",
                 id="splunk-search-run-btn",
@@ -195,7 +197,12 @@ class SplunkSearchPane(BaseSocPane):
                 yield DoubleClickDataTable(id="splunk-search-table")
 
             with Vertical(id="splunk-search-detail-pane"):
-                yield Static("Event Detail", id="splunk-search-detail-header", classes="section-label")
+                yield Static(
+                    "Event Detail",
+                    id="splunk-search-detail-header",
+                    classes="section-label",
+                    markup=False,
+                )
                 yield RichLog(
                     id="splunk-search-detail",
                     classes="detail-log",
@@ -220,6 +227,12 @@ class SplunkSearchPane(BaseSocPane):
         if self.is_app_shutting_down():
             return
         try:
+            compact = self.size.width < 110 or self.size.height <= 26
+            self.set_class(compact, "search-compact")
+            self.set_class(
+                compact or self.size.width < 130,
+                "search-toolbar-compact",
+            )
             ws = self.query_one("#splunk-search-workspace", Container)
             if self.size.width >= 110:
                 ws.add_class("split-horizontal")
@@ -240,6 +253,46 @@ class SplunkSearchPane(BaseSocPane):
         if auto_run and clean_spl:
             self.handle_run_search()
 
+    def accept_pivot(self, payload: PivotPayload) -> None:
+        """Accept a ``PivotPayload``, sync time window, and auto-run ONLY for ``orig_sid``."""
+        spl, should_auto_run = build_spl_from_pivot(payload)
+
+        earliest_val = (payload.earliest or "").strip()
+        latest_val = (payload.latest or "").strip()
+        if earliest_val or latest_val:
+            target_earliest = earliest_val or "-24h"
+            target_latest = latest_val or "now"
+            self._syncing_preset = True
+            try:
+                earliest_inp = self.query_one("#splunk-search-earliest", Input)
+                latest_inp = self.query_one("#splunk-search-latest", Input)
+                preset_sel = self.query_one("#splunk-search-preset", Select)
+                with earliest_inp.prevent(Input.Changed):
+                    earliest_inp.value = target_earliest
+                with latest_inp.prevent(Input.Changed):
+                    latest_inp.value = target_latest
+                preset_values = {v for _, v in _TIME_PRESETS if v != "custom"}
+                target_preset = (
+                    target_earliest
+                    if (target_earliest in preset_values and target_latest == "now")
+                    else "custom"
+                )
+                with preset_sel.prevent(Select.Changed):
+                    preset_sel.value = target_preset
+            finally:
+                self._syncing_preset = False
+
+        self.load_query(spl, auto_run=False)
+        self._update_summary_bar()
+        src = payload.source_tab or "workbench"
+        if should_auto_run:
+            self.set_status(f"Pivot from {src}: running orig_sid drilldown.")
+            self.handle_run_search()
+        else:
+            self.set_status(
+                f"Pivot from {src}: loaded SPL ({len(spl)} chars; auto-run disabled for safety)."
+            )
+
     def _build_splunk_client(self, app_override: str | None = None) -> SplunkClient:
         cfg = get_splunk_config(app=app_override, required=True)
         return SplunkClient(
@@ -249,6 +302,7 @@ class SplunkSearchPane(BaseSocPane):
             password=cfg.password,
             app=cfg.app,
             verify_ssl=cfg.verify_ssl,
+            stop_event=getattr(self.app, "_stop_event", None),
         )
 
     def _parse_limit(self) -> tuple[bool, int]:
@@ -270,8 +324,12 @@ class SplunkSearchPane(BaseSocPane):
         if value != "custom":
             self._syncing_preset = True
             try:
-                self.query_one("#splunk-search-earliest", Input).value = value
-                self.query_one("#splunk-search-latest", Input).value = "now"
+                earliest_inp = self.query_one("#splunk-search-earliest", Input)
+                latest_inp = self.query_one("#splunk-search-latest", Input)
+                with earliest_inp.prevent(Input.Changed):
+                    earliest_inp.value = value
+                with latest_inp.prevent(Input.Changed):
+                    latest_inp.value = "now"
             finally:
                 self._syncing_preset = False
         self._update_summary_bar()
@@ -289,7 +347,8 @@ class SplunkSearchPane(BaseSocPane):
         if str(select.value) != target:
             self._syncing_preset = True
             try:
-                select.value = target
+                with select.prevent(Select.Changed):
+                    select.value = target
             finally:
                 self._syncing_preset = False
         self._update_summary_bar()
@@ -589,7 +648,8 @@ class SplunkSearchPane(BaseSocPane):
         app_ov = self.query_one("#splunk-search-app", Input).value.strip() or None
         self._page_size = limit
         self._current_offset = 0
-        self._run_search_worker(spl, earliest, latest, app_ov, limit)
+        self._request_seq += 1
+        self._run_search_worker(spl, earliest, latest, app_ov, limit, seq=self._request_seq)
 
     @work(thread=True, exit_on_error=False)
     def _run_search_worker(
@@ -599,11 +659,15 @@ class SplunkSearchPane(BaseSocPane):
         latest: str,
         app_ov: str | None,
         limit: int,
+        *,
+        seq: int = 0,
     ) -> None:
         try:
             self.set_status(f"Dispatching Splunk search ({earliest} to {latest})...")
 
             def _on_progress(prog: dict[str, Any]) -> None:
+                if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                    return
                 sid = str(prog.get("sid") or "")
                 with self._active_sid_lock:
                     if sid:
@@ -630,31 +694,46 @@ class SplunkSearchPane(BaseSocPane):
             with self._active_sid_lock:
                 self._active_sid = None
 
-            sid = str(res.get("sid") or "")
-            self._current_sid = sid or None
-            self._total_results = int(res.get("result_count", 0))
-            self._last_duration = float(res.get("duration", 0.0))
-            self._current_offset = 0
+            if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                return
 
+            sid = str(res.get("sid") or "")
             if res.get("status") != "success":
                 err = str(res.get("error_message") or "Search failed.")
+                self._current_sid = sid or None
+                self._total_results = int(res.get("result_count", 0))
+                self._last_duration = float(res.get("duration", 0.0))
+                self._current_offset = 0
                 self.set_status(f"State: FAILED | SID: {sid or '-'} | {err}")
                 self.append_log(f"Splunk search failed: {err}", level="ERROR")
                 return
 
             rows = list(res.get("results") or [])
             fields = list(res.get("fields") or [])
-            self.run_on_ui(self._populate_results_table, rows, fields, mode="results")
+            total_results = int(res.get("result_count", 0))
+            last_duration = float(res.get("duration", 0.0))
+
+            def _apply() -> None:
+                if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                    return
+                self._current_sid = sid or None
+                self._total_results = total_results
+                self._last_duration = last_duration
+                self._current_offset = 0
+                self._populate_results_table(rows, fields, mode="results")
+
+            self.run_on_ui(_apply)
             banner = (
-                f"State: DONE | Results: {self._total_results} | "
-                f"Duration: {self._last_duration:.2f}s | SID: {sid}"
+                f"State: DONE | Results: {total_results} | "
+                f"Duration: {last_duration:.2f}s | SID: {sid}"
             )
             self.set_status(banner)
             self.append_log(banner)
         except Exception as exc:
             with self._active_sid_lock:
                 self._active_sid = None
-            self.report_error("Splunk Search", exc)
+            if not self.is_app_shutting_down() and (not seq or seq == self._request_seq):
+                self.report_error("Splunk Search", exc)
 
     @on(Button.Pressed, "#splunk-search-cancel-btn")
     def handle_cancel_search(self) -> None:
@@ -688,7 +767,14 @@ class SplunkSearchPane(BaseSocPane):
             return
         new_offset = max(0, self._current_offset - self._page_size)
         app_ov = self.query_one("#splunk-search-app", Input).value.strip() or None
-        self._paginate_worker(self._current_sid, self._page_size, new_offset, app_ov)
+        self._request_seq += 1
+        self._paginate_worker(
+            self._current_sid,
+            self._page_size,
+            new_offset,
+            app_ov,
+            seq=self._request_seq,
+        )
 
     @on(Button.Pressed, "#splunk-search-next-btn")
     def handle_next_page(self) -> None:
@@ -698,7 +784,14 @@ class SplunkSearchPane(BaseSocPane):
         if new_offset >= self._total_results:
             return
         app_ov = self.query_one("#splunk-search-app", Input).value.strip() or None
-        self._paginate_worker(self._current_sid, self._page_size, new_offset, app_ov)
+        self._request_seq += 1
+        self._paginate_worker(
+            self._current_sid,
+            self._page_size,
+            new_offset,
+            app_ov,
+            seq=self._request_seq,
+        )
 
     @work(thread=True, exit_on_error=False)
     def _paginate_worker(
@@ -707,62 +800,93 @@ class SplunkSearchPane(BaseSocPane):
         count: int,
         offset: int,
         app_ov: str | None,
+        *,
+        seq: int = 0,
     ) -> None:
         try:
             self.set_status(f"Loading results page (offset={offset}) for SID: {sid}...")
             with self.log_scope("splunk"):
                 with self._build_splunk_client(app_override=app_ov) as splunk:
                     page = splunk.get_job_results(sid, count=count, offset=offset)
-            self._current_offset = offset
+            if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                return
             rows = list(page.get("results") or [])
             fields = list(page.get("fields") or self._current_fields)
-            self.run_on_ui(self._populate_results_table, rows, fields, mode="results")
+
+            def _apply() -> None:
+                if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                    return
+                self._current_offset = offset
+                self._populate_results_table(rows, fields, mode="results")
+
+            self.run_on_ui(_apply)
             self.set_status(
                 f"State: DONE | Results: {self._total_results} | "
                 f"Duration: {self._last_duration:.2f}s | SID: {sid}"
             )
         except Exception as exc:
-            self.report_error("Splunk Pagination", exc)
+            if not self.is_app_shutting_down() and (not seq or seq == self._request_seq):
+                self.report_error("Splunk Pagination", exc)
 
     @on(Button.Pressed, "#splunk-search-saved-btn")
     def handle_load_saved_searches(self) -> None:
         app_ov = self.query_one("#splunk-search-app", Input).value.strip() or None
-        self._load_saved_searches_worker(app_ov)
+        self._request_seq += 1
+        self._load_saved_searches_worker(app_ov, seq=self._request_seq)
 
     @work(thread=True, exit_on_error=False)
-    def _load_saved_searches_worker(self, app_ov: str | None) -> None:
+    def _load_saved_searches_worker(self, app_ov: str | None, *, seq: int = 0) -> None:
         try:
             self.set_status("Loading Splunk saved searches...")
             with self.log_scope("splunk"):
                 with self._build_splunk_client(app_override=app_ov) as splunk:
                     items = splunk.list_saved_searches(app=app_ov, count=100)
+            if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                return
             cols = ["name", "app", "cron_schedule", "earliest_time", "latest_time", "disabled"]
-            self.run_on_ui(self._populate_results_table, items, cols, mode="saved_searches")
+
+            def _apply() -> None:
+                if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                    return
+                self._populate_results_table(items, cols, mode="saved_searches")
+
+            self.run_on_ui(_apply)
             msg = f"Loaded {len(items)} Splunk saved search(es)."
             self.set_status(msg)
             self.append_log(msg)
         except Exception as exc:
-            self.report_error("Load Saved Searches", exc)
+            if not self.is_app_shutting_down() and (not seq or seq == self._request_seq):
+                self.report_error("Load Saved Searches", exc)
 
     @on(Button.Pressed, "#splunk-search-indexes-btn")
     def handle_list_indexes(self) -> None:
         app_ov = self.query_one("#splunk-search-app", Input).value.strip() or None
-        self._list_indexes_worker(app_ov)
+        self._request_seq += 1
+        self._list_indexes_worker(app_ov, seq=self._request_seq)
 
     @work(thread=True, exit_on_error=False)
-    def _list_indexes_worker(self, app_ov: str | None) -> None:
+    def _list_indexes_worker(self, app_ov: str | None, *, seq: int = 0) -> None:
         try:
             self.set_status("Listing Splunk indexes...")
             with self.log_scope("splunk"):
                 with self._build_splunk_client(app_override=app_ov) as splunk:
                     items = splunk.list_indexes()
+            if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                return
             cols = ["name", "total_event_count", "current_db_size_mb", "datatype", "disabled"]
-            self.run_on_ui(self._populate_results_table, items, cols, mode="indexes")
+
+            def _apply() -> None:
+                if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                    return
+                self._populate_results_table(items, cols, mode="indexes")
+
+            self.run_on_ui(_apply)
             msg = f"Loaded {len(items)} Splunk index(es)."
             self.set_status(msg)
             self.append_log(msg)
         except Exception as exc:
-            self.report_error("List Indexes", exc)
+            if not self.is_app_shutting_down() and (not seq or seq == self._request_seq):
+                self.report_error("List Indexes", exc)
 
     @on(Button.Pressed, "#splunk-search-export-json-btn")
     def handle_export_json(self) -> None:
@@ -806,13 +930,16 @@ class SplunkSearchPane(BaseSocPane):
             return
         rows_copy = [dict(r) for r in self._current_rows]
         fields_copy = list(self._current_fields)
-        self._enrich_results_worker(rows_copy, fields_copy)
+        self._request_seq += 1
+        self._enrich_results_worker(rows_copy, fields_copy, seq=self._request_seq)
 
     @work(thread=True, exit_on_error=False)
     def _enrich_results_worker(
         self,
         rows: list[dict[str, Any]],
         fields: list[str],
+        *,
+        seq: int = 0,
     ) -> None:
         try:
             self.set_status(
@@ -822,17 +949,20 @@ class SplunkSearchPane(BaseSocPane):
             with self.log_scope("rf"):
                 enriched = enricher.enrich_events(rows)
 
+            if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                return
+
             enriched_fields = list(fields)
             for extra in ("rf_max_risk_score", "rf_criticality_label", "rf_top_field"):
                 if extra not in enriched_fields:
                     enriched_fields.append(extra)
 
-            self.run_on_ui(
-                self._populate_results_table,
-                enriched,
-                enriched_fields,
-                mode="results",
-            )
+            def _apply() -> None:
+                if self.is_app_shutting_down() or (seq and seq != self._request_seq):
+                    return
+                self._populate_results_table(enriched, enriched_fields, mode="results")
+
+            self.run_on_ui(_apply)
             mapped_cnt = sum(1 for r in enriched if r.get("rf_observables"))
             top_scores = [
                 int(r["rf_max_risk_score"])
@@ -847,4 +977,5 @@ class SplunkSearchPane(BaseSocPane):
             self.set_status(msg)
             self.append_log(msg)
         except Exception as exc:
-            self.report_error("RF Search Enrichment", exc)
+            if not self.is_app_shutting_down() and (not seq or seq == self._request_seq):
+                self.report_error("RF Search Enrichment", exc)

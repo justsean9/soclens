@@ -17,8 +17,11 @@ from soclens.config import (
     DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OPENAI_BASE_URL,
     ConfigurationError,
+    ConfiguredSession,
     LocalLLMConfig,
+    PivotPayload,
     get_local_llm_config,
+    hydrate_secrets_from_store,
 )
 from soclens.llm import (
     SOC_PROMPT_TEMPLATES,
@@ -26,6 +29,14 @@ from soclens.llm import (
     LocalLLMConfigError,
     LocalLLMConnectionError,
     LocalLLMError,
+    build_copilot_prompt,
+    format_llm_copilot_context,
+)
+from soclens.settings import (
+    clear_session_overrides,
+    invalidate_settings_cache,
+    save_profile_settings,
+    set_session_overrides,
 )
 
 
@@ -451,3 +462,238 @@ def test_cli_llm_status_models_chat_and_explain_sigma(
             out = json.loads(capsys.readouterr().out)
             assert out["rule_title"] == "Encoded PowerShell"
             assert out["content"] == "Sigma explanation"
+
+
+# ---------------------------------------------------------------------------
+# ConfiguredSession, vault rf_llm_api_key, CA bundle, and Copilot helpers
+# ---------------------------------------------------------------------------
+
+
+def test_local_llm_client_uses_configured_session_and_proxy_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    invalidate_settings_cache()
+    clear_session_overrides()
+    try:
+        set_session_overrides(
+            {
+                "https_proxy": "http://proxy.example.test:8443",
+                "no_proxy": "127.0.0.1,localhost",
+            }
+        )
+        with patch.object(ConfiguredSession, "close", autospec=True) as mock_close:
+            client = LocalLLMClient(provider="ollama", base_url="http://127.0.0.1:11434")
+            assert isinstance(client.session, ConfiguredSession)
+            merged = client.session.merge_environment_settings(
+                url="https://llm.remote.example.test/api/tags",
+                proxies={},
+                stream=False,
+                verify=True,
+                cert=None,
+            )
+            assert merged["proxies"]["https"] == "http://proxy.example.test:8443"
+            client.close()
+            assert mock_close.call_count == 1
+
+        # Injected external session is not closed by client.close()
+        external = MagicMock(spec=requests.Session)
+        ext_client = LocalLLMClient(provider="ollama", session=external)
+        ext_client.close()
+        external.close.assert_not_called()
+    finally:
+        clear_session_overrides()
+        invalidate_settings_cache()
+
+
+def test_local_llm_config_resolves_rf_llm_api_key_from_session_and_ca_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    monkeypatch.delenv("RF_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("RF_LLM_VERIFY_SSL", raising=False)
+    invalidate_settings_cache()
+    clear_session_overrides()
+    try:
+        set_session_overrides({"rf_llm_api_key": "vault-llm-key-001"}, vault_hydrated=True)
+        cfg = get_local_llm_config(provider="openai")
+        assert cfg.api_key == "vault-llm-key-001"
+        assert "vault-llm-key-001" not in repr(cfg)
+
+        # Env var takes precedence over saved setting and over hydrate(overwrite_existing=False)
+        clear_session_overrides()
+        save_profile_settings({"rf_llm_api_key": "saved-llm-key"})
+        monkeypatch.setenv("RF_LLM_API_KEY", "env-llm-key-999")
+        assert get_local_llm_config(provider="openai").api_key == "env-llm-key-999"
+        assert hydrate_secrets_from_store(force=True, overwrite_existing=False) == {}
+        assert get_local_llm_config(provider="openai").api_key == "env-llm-key-999"
+
+        ca_file = tmp_path / "corp-ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n", encoding="utf-8")
+        monkeypatch.setenv("RF_LLM_VERIFY_SSL", str(ca_file))
+        with LocalLLMClient(provider="openai", model="qwen2.5") as ca_client:
+            assert ca_client.session.verify == str(ca_file)
+    finally:
+        clear_session_overrides()
+        invalidate_settings_cache()
+
+
+def test_copilot_prompt_builders_attack_chain_and_closing_note() -> None:
+    assert "summarize_attack_chain" in SOC_PROMPT_TEMPLATES
+    assert "draft_closing_note" in SOC_PROMPT_TEMPLATES
+
+    full_payload = PivotPayload(
+        source_tab="tab-splunk-es",
+        target_tab="tab-llm",
+        tenant_id="1001",
+        hostname="wkstn-1001-01.example.test",
+        es_finding={"event_id": "fnd-1", "rule_title": "Encoded PowerShell"},
+        s1_threat={"id": "thr-1", "threatName": "Mimikatz.Win64"},
+        rf_enrichment={"rf_max_risk_score": 92},
+    )
+    rendered_full = format_llm_copilot_context(full_payload)
+    assert "Tenant 1001" in rendered_full
+    assert "fnd-1" in rendered_full
+    assert "thr-1" in rendered_full
+    assert "92" in rendered_full
+
+    partial_payload = PivotPayload(
+        source_tab="tab-splunk-es",
+        target_tab="tab-llm",
+        tenant_id="1002",
+        es_finding={"event_id": "fnd-2"},
+        s1_threat=None,
+        rf_enrichment=None,
+    )
+    rendered_partial = format_llm_copilot_context(partial_payload)
+    assert "## Splunk ES Finding" in rendered_partial
+    assert "SentinelOne Threat" not in rendered_partial
+    assert "Recorded Future Enrichment" not in rendered_partial
+    assert "```json\nnull\n```" not in rendered_partial
+
+    sys_prompt, user_msg = build_copilot_prompt(
+        "summarize_attack_chain",
+        full_payload,
+        extra_instruction="Highlight lateral movement.",
+    )
+    assert "attack-chain" in sys_prompt.lower()
+    assert "fnd-1" in user_msg
+    assert "Highlight lateral movement." in user_msg
+
+    for empty_ctx in (
+        "",
+        "   ",
+        {},
+        PivotPayload(source_tab="tab-splunk-es", target_tab="tab-llm"),
+    ):
+        with pytest.raises(LocalLLMConfigError):
+            format_llm_copilot_context(empty_ctx)
+
+    session = MagicMock(spec=requests.Session)
+    session.request.side_effect = [
+        _mock_response(
+            200,
+            json_body={
+                "model": "llama3.2",
+                "message": {"role": "assistant", "content": "Attack chain summary output"},
+                "done": True,
+            },
+        ),
+        _mock_response(
+            200,
+            json_body={
+                "model": "llama3.2",
+                "message": {"role": "assistant", "content": "Closing note draft output"},
+                "done": True,
+            },
+        ),
+    ]
+    with LocalLLMClient(provider="ollama", model="llama3.2", session=session) as llm:
+        r_chain = llm.summarize_attack_chain(full_payload)
+        r_close = llm.draft_closing_note(full_payload)
+
+    assert r_chain["content"] == "Attack chain summary output"
+    assert r_close["content"] == "Closing note draft output"
+    assert session.request.call_count == 2
+    first_messages = session.request.call_args_list[0].kwargs["json"]["messages"]
+    second_messages = session.request.call_args_list[1].kwargs["json"]["messages"]
+    assert "fnd-1" in first_messages[1]["content"]
+    assert "thr-1" in second_messages[1]["content"]
+    assert "92" in second_messages[1]["content"]
+
+
+def test_openai_v1_normalization_and_401_auth_error_handling() -> None:
+    for raw_url in (
+        "http://127.0.0.1:1234",
+        "http://127.0.0.1:1234/",
+        "http://127.0.0.1:1234/v1",
+        "http://127.0.0.1:1234/v1/",
+        "http://127.0.0.1:1234/v1/chat/completions",
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.request.side_effect = [
+            _mock_response(200, json_body={"data": [{"id": "qwen2.5"}]}),
+            _mock_response(
+                200,
+                json_body={
+                    "model": "qwen2.5",
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                },
+            ),
+        ]
+        with LocalLLMClient(
+            provider="openai",
+            base_url=raw_url,
+            model="qwen2.5",
+            api_key="sk-canary-secret-999",
+            session=session,
+        ) as llm:
+            assert llm.list_models() == ["qwen2.5"]
+            res = llm.chat([{"role": "user", "content": "ping"}])
+            assert res["content"] == "ok"
+        assert session.request.call_args_list[0].kwargs["url"] == "http://127.0.0.1:1234/v1/models"
+        assert session.request.call_args_list[1].kwargs["url"] == "http://127.0.0.1:1234/v1/chat/completions"
+
+    # HTTP 401 should fail immediately without retries and never leak api_key
+    auth_session = MagicMock(spec=requests.Session)
+    auth_session.request.return_value = _mock_response(
+        401,
+        json_body={"error": {"message": "Invalid bearer token"}},
+    )
+    canary_key = "sk-bad-canary-token-777"
+    with LocalLLMClient(
+        provider="openai",
+        base_url="http://127.0.0.1:1234/v1",
+        model="qwen2.5",
+        api_key=canary_key,
+        max_retries=2,
+        backoff_base=0.0,
+        session=auth_session,
+    ) as llm_401:
+        with pytest.raises(LocalLLMError) as exc_info:
+            llm_401.chat([{"role": "user", "content": "ping"}])
+        assert exc_info.value.status_code == 401
+        assert canary_key not in str(exc_info.value)
+        assert auth_session.request.call_count == 1
+
+
+def test_format_llm_copilot_context_renders_spl_query() -> None:
+    payload = PivotPayload(
+        source_tab="tab-splunk-es",
+        target_tab="tab-llm",
+        spl_query="index=main | head 5",
+    )
+    rendered = format_llm_copilot_context(payload)
+    assert "## Splunk Query" in rendered
+    assert "index=main | head 5" in rendered
+
+    with pytest.raises(LocalLLMConfigError):
+        format_llm_copilot_context(
+            PivotPayload(
+                source_tab="tab-splunk-es",
+                target_tab="tab-llm",
+                spl_query="   ",
+            )
+        )

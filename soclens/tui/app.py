@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.color import ColorSystem
 from rich.console import RenderableType
-from textual import events, on
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -26,6 +28,8 @@ from soclens.config import (
     IMAGE_VIEWER_OS,
     UI_VIEW_ADMIN,
     UI_VIEW_USER,
+    PivotPayload,
+    classify_site_tier,
     ensure_utf8_console,
     format_image_viewer_status,
     get_image_viewer_mode,
@@ -33,6 +37,7 @@ from soclens.config import (
     get_ui_view_mode,
     get_workspace_dir,
     has_explicit_image_viewer_setting,
+    hydrate_secrets_from_store,
     normalize_image_viewer_mode,
     save_tui_settings,
     suppress_insecure_ssl_warnings,
@@ -51,6 +56,7 @@ from soclens.tui.logging_bridge import (
     classify_log_source,
     infer_print_level,
 )
+from soclens.tui.pivot import build_spl_from_pivot, format_copilot_context
 from soclens.tui.screens import (
     BrandLogosPane,
     DashboardPane,
@@ -579,6 +585,114 @@ class SocLensApp(App[None]):
         padding: 0 1;
         color: #dbe6fa;
     }
+    .search-compact #splunk-search-status {
+        height: 1;
+        min-height: 1;
+    }
+    .search-compact #splunk-search-spl {
+        height: 3;
+        min-height: 3;
+    }
+    .search-compact #splunk-search-time-bar {
+        layout: grid;
+        grid-size: 5;
+        grid-gutter: 0 1;
+        height: 1;
+        padding: 0;
+    }
+    .search-compact #splunk-search-time-bar Select,
+    .search-compact #splunk-search-time-bar Input {
+        width: 1fr;
+        min-width: 6;
+        height: 1;
+        margin-right: 0;
+    }
+    .search-compact #splunk-search-time-bar Select > SelectCurrent {
+        height: 1;
+    }
+    .search-compact #splunk-search-toolbar,
+    .search-toolbar-compact #splunk-search-toolbar {
+        layout: grid;
+        grid-size: 4;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .search-compact #splunk-search-toolbar Button,
+    .search-toolbar-compact #splunk-search-toolbar Button {
+        width: 1fr;
+        min-width: 6;
+        margin-right: 0;
+    }
+    .search-compact #splunk-search-workspace {
+        min-height: 6;
+    }
+    .search-compact #splunk-search-master-pane {
+        min-height: 4;
+    }
+    .search-compact #splunk-search-table {
+        min-height: 3;
+    }
+    .search-compact #splunk-search-detail {
+        min-height: 3;
+    }
+    .rf-compact #rf-status {
+        height: 1;
+        min-height: 1;
+    }
+    .rf-compact #rf-top-toolbar,
+    .rf-compact #rf-filter-bar {
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .rf-compact #rf-top-toolbar Button,
+    .rf-compact #rf-top-toolbar Input,
+    .rf-compact #rf-top-toolbar Select,
+    .rf-compact #rf-filter-bar Select,
+    .rf-compact #rf-filter-bar Button {
+        width: 1fr;
+        min-width: 5;
+        height: 1;
+        margin-right: 0;
+    }
+    .rf-compact #rf-top-toolbar Select > SelectCurrent,
+    .rf-compact #rf-filter-bar Select > SelectCurrent {
+        height: 1;
+    }
+    .rf-compact #rf-detail-toolbar,
+    .rf-detail-compact #rf-detail-toolbar {
+        layout: grid;
+        grid-size: 4;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .rf-compact #rf-detail-toolbar #rf-detail-header,
+    .rf-detail-compact #rf-detail-toolbar #rf-detail-header {
+        width: 1fr;
+        height: 1;
+    }
+    .rf-compact #rf-detail-toolbar Button,
+    .rf-detail-compact #rf-detail-toolbar Button {
+        width: 1fr;
+        min-width: 5;
+        height: 1;
+        margin-left: 0;
+    }
+    .rf-compact #rf-workspace {
+        min-height: 6;
+    }
+    .rf-compact #rf-results-pane,
+    .rf-compact #rf-detail-pane {
+        min-height: 3;
+    }
+    .rf-compact #rf-results-table,
+    .rf-compact #rf-log {
+        min-height: 2;
+    }
     #splunk-bundle-time-preset {
         width: 23;
     }
@@ -929,6 +1043,7 @@ class SocLensApp(App[None]):
         workspace_dir: Path | str | None = None,
         image_viewer: str | None = None,
         view_mode: str | None = None,
+        no_secret_store: bool = False,
     ) -> None:
         ensure_utf8_console()
         super().__init__()
@@ -952,6 +1067,7 @@ class SocLensApp(App[None]):
         )
         self.s1_client = s1_client
         self.dry_run = dry_run
+        self.no_secret_store: bool = bool(no_secret_store)
         if view_mode is not None:
             resolved_view = get_ui_view_mode(explicit=view_mode)
         elif initial_tab and initial_tab in ADMIN_ONLY_TABS:
@@ -1402,6 +1518,70 @@ class SocLensApp(App[None]):
         with contextlib.suppress(Exception):
             self.activate_tab("tab-splunk-search", on_ready=_apply)
 
+    def dispatch_pivot(self, payload: PivotPayload) -> bool:
+        """Route a ``PivotPayload`` across workbenches, lazy-mounting the target tab if needed."""
+        if not self._ui_mounted or self._shutting_down:
+            return False
+        if not isinstance(payload, PivotPayload):
+            return False
+        target_tab = str(payload.target_tab or "").strip()
+        if target_tab not in ALL_TABS:
+            return False
+
+        effective_payload = payload
+        clean_site_name = (payload.site_name or "").strip()
+        clean_site_id = (payload.site_id or "").strip()
+        if (clean_site_name or clean_site_id) and (not payload.tenant_id or not payload.tier):
+            try:
+                tier, tenant = classify_site_tier(
+                    clean_site_name,
+                    site_id=clean_site_id or None,
+                )
+                effective_payload = replace(
+                    payload,
+                    tenant_id=payload.tenant_id or tenant,
+                    tier=payload.tier or (tier if clean_site_name else None),
+                )
+            except Exception:
+                effective_payload = payload
+
+        def _deliver(pane: BaseSocPane) -> None:
+            try:
+                accept_fn = getattr(pane, "accept_pivot", None)
+                if callable(accept_fn):
+                    accept_fn(effective_payload)
+                elif target_tab == "tab-llm":
+                    analyze_fn = getattr(pane, "analyze_context", None)
+                    if callable(analyze_fn):
+                        title, content = format_copilot_context(effective_payload)
+                        analyze_fn(
+                            title,
+                            content,
+                            template="triage_alert",
+                            auto_send=False,
+                        )
+                elif target_tab == "tab-splunk-search":
+                    load_fn = getattr(pane, "load_query", None)
+                    if callable(load_fn):
+                        spl, auto_run = build_spl_from_pivot(effective_payload)
+                        load_fn(spl, auto_run=auto_run)
+            except Exception as exc:
+                self.record_log(
+                    f"Pivot delivery to {target_tab} failed: {exc}",
+                    level="ERROR",
+                    source="tui",
+                    logger_name="SocLensApp",
+                )
+
+        ok = self.activate_tab(target_tab, auto_enable_admin=False, on_ready=_deliver)
+        if ok:
+            self.record_log(
+                f"Dispatched pivot {effective_payload.source_tab or '-'} -> {target_tab}",
+                source="tui",
+                logger_name="SocLensApp",
+            )
+        return ok
+
     def open_settings_tab(self) -> None:
         """Switch to the Settings & Credentials tab."""
         with contextlib.suppress(Exception):
@@ -1458,6 +1638,56 @@ class SocLensApp(App[None]):
             self._apply_view_mode_to_ui()
             self._sync_responsive_chrome()
             self._focus_main_tabs()
+        if not self.no_secret_store:
+            self._hydrate_secrets_worker()
+
+    @work(thread=True, exit_on_error=False)
+    def _hydrate_secrets_worker(self) -> None:
+        """Hydrate mapped vault secrets into memory in a background thread."""
+        if self.no_secret_store or self._stop_event.is_set() or self.is_shutting_down:
+            return
+        try:
+            hydrated = hydrate_secrets_from_store(
+                force=False,
+                overwrite_existing=False,
+                stop_event=self._stop_event,
+            )
+        except Exception as exc:
+            if self._stop_event.is_set() or self.is_shutting_down:
+                return
+            with contextlib.suppress(Exception):
+                self.call_from_thread(
+                    self._log_hydration_warning,
+                    f"Startup secret hydration failed: {exc}",
+                )
+            return
+        if not hydrated or self._stop_event.is_set() or self.is_shutting_down:
+            return
+        with contextlib.suppress(Exception):
+            self.call_from_thread(self._apply_hydrated_secrets, hydrated)
+
+    def _log_hydration_warning(self, message: str) -> None:
+        """Log a non-fatal startup hydration warning on the UI thread."""
+        if self._stop_event.is_set() or self.is_shutting_down:
+            return
+        self.record_log(
+            message,
+            level="WARNING",
+            source="secrets",
+            logger_name="SocLensApp",
+        )
+
+    def _apply_hydrated_secrets(self, hydrated: dict[str, str]) -> None:
+        """Reload settings/clients after non-blocking vault secret hydration."""
+        if self._stop_event.is_set() or self.is_shutting_down:
+            return
+        self.reload_settings()
+        keys_summary = ", ".join(sorted(hydrated))
+        self.record_log(
+            f"Hydrated {len(hydrated)} secret(s) from vault into session memory: {keys_summary}.",
+            source="secrets",
+            logger_name="SocLensApp",
+        )
 
     def on_resize(self) -> None:
         """Update narrow-viewport chrome classes when terminal dimensions change."""
@@ -1599,6 +1829,31 @@ class SocLensApp(App[None]):
         self._refresh_subtitle()
         if self._ui_mounted:
             self._apply_view_mode_to_ui()
+            for pane in self.query(BaseSocPane):
+                if isinstance(pane, SentinelOnePane):
+                    with contextlib.suppress(Exception):
+                        pane._sync_admin_badge()
+                hook = getattr(pane, "on_view_mode_changed", None)
+                if callable(hook):
+                    with contextlib.suppress(Exception):
+                        params = inspect.signature(hook).parameters
+                        positional = [
+                            p
+                            for p in params.values()
+                            if p.kind
+                            in (
+                                inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            )
+                        ]
+                        has_varargs = any(
+                            p.kind == inspect.Parameter.VAR_POSITIONAL
+                            for p in params.values()
+                        )
+                        if positional or has_varargs:
+                            hook(normalized)
+                        else:
+                            hook()
         self.record_log(
             f"Switched UI view to {normalized.upper()} mode.",
             source="tui",
@@ -1757,6 +2012,7 @@ def create_app(
     workspace_dir: Path | str | None = None,
     image_viewer: str | None = None,
     view_mode: str | None = None,
+    no_secret_store: bool = False,
 ) -> SocLensApp:
     """Factory returning a configured ``SocLensApp`` instance."""
     return SocLensApp(
@@ -1767,6 +2023,7 @@ def create_app(
         workspace_dir=workspace_dir,
         image_viewer=image_viewer,
         view_mode=view_mode,
+        no_secret_store=no_secret_store,
     )
 
 

@@ -32,6 +32,7 @@ from soclens.research import (
     research_target,
 )
 from soclens.tui.filters import SPLUNK_TIME_PRESETS
+from soclens.tui.pivot import PivotPayload
 from soclens.tui.research_formatters import (
     build_research_findings,
     build_search_summary_bar,
@@ -334,8 +335,48 @@ class ResearchPane(BaseSocPane):
             return
         valid_types = {val for _, val in _TARGET_TYPE_OPTIONS}
         resolved_type = target_type if target_type in valid_types else "auto"
-        self.query_one("#res-target-type", Select).value = resolved_type
-        self.query_one("#res-target-input", Input).value = clean
+        sel = self.query_one("#res-target-type", Select)
+        inp = self.query_one("#res-target-input", Input)
+        with sel.prevent(Select.Changed):
+            sel.value = resolved_type
+        with inp.prevent(Input.Changed):
+            inp.value = clean
+        self._start_investigation(clean, resolved_type, record_history=True)
+
+    def accept_pivot(self, payload: PivotPayload) -> None:
+        """Accept a ``PivotPayload`` and auto-run a scoped Threat Research investigation."""
+        primary = payload.primary_ioc()
+        if primary is None:
+            self.set_status("Pivot payload contained no IOC or entity to research.")
+            return
+        raw_kind, raw_val = primary
+        clean = raw_val.strip()
+        if not clean:
+            self.set_status("Pivot payload contained an empty IOC or entity to research.")
+            return
+
+        norm_kind = raw_kind.strip().lower()
+        aliases = {
+            "ipaddress": "ip",
+            "ip_address": "ip",
+            "internetdomainname": "domain",
+            "cybervulnerability": "vulnerability",
+            "cve": "vulnerability",
+            "file_hash": "hash",
+            "sha1": "hash",
+            "sha256": "hash",
+            "md5": "hash",
+        }
+        mapped_kind = aliases.get(norm_kind, norm_kind)
+        valid_types = {val for _, val in _TARGET_TYPE_OPTIONS}
+        resolved_type = mapped_kind if mapped_kind in valid_types else "auto"
+
+        sel = self.query_one("#res-target-type", Select)
+        inp = self.query_one("#res-target-input", Input)
+        with sel.prevent(Select.Changed):
+            sel.value = resolved_type
+        with inp.prevent(Input.Changed):
+            inp.value = clean
         self._start_investigation(clean, resolved_type, record_history=True)
 
     # ------------------------------------------------------------------

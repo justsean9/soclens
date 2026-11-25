@@ -76,6 +76,7 @@ from soclens.tui.modals import (
     ScreenshotViewerModal,
     TriageItemModal,
 )
+from soclens.tui.pivot import PivotPayload
 from soclens.tui.rf_formatters import (
     PLAYBOOK_API_STATUS_MAP,
     STATUS_FILTER_CHOICES,
@@ -163,6 +164,16 @@ _WATCHLIST_TO_V2_TYPE: dict[str, str] = {
     "url": "url",
     "cybervulnerability": "vulnerability",
     "vulnerability": "vulnerability",
+}
+
+_PIVOT_V2_TYPE_ALIASES: dict[str, str] = {
+    **_WATCHLIST_TO_V2_TYPE,
+    "ip_address": "ip",
+    "file_hash": "hash",
+    "sha1": "hash",
+    "sha256": "hash",
+    "md5": "hash",
+    "cve": "vulnerability",
 }
 
 _VIEW_LABELS: dict[str, str] = {
@@ -409,7 +420,7 @@ class RFIntelPane(BaseSocPane):
             markup=False,
         )
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="rf-top-toolbar", classes="action-row toolbar-row"):
             yield Button("Load Alerts v3", id="rf-alerts-btn", variant="primary", compact=True)
             yield Button("Load Playbook Alerts", id="rf-pb-btn", compact=True)
             yield Button("Load Cases", id="rf-cases-btn", compact=True)
@@ -651,8 +662,15 @@ class RFIntelPane(BaseSocPane):
             self._update_responsive_layout()
 
     def _update_responsive_layout(self) -> None:
+        compact = self.size.width < 110 or self.size.height <= 26
+        split_horizontal = self.size.width >= 130
+        self.set_class(compact, "rf-compact")
+        self.set_class(
+            compact or (split_horizontal and self.size.width < 225),
+            "rf-detail-compact",
+        )
         workspace = self.query_one("#rf-workspace", Container)
-        if self.size.width >= 130:
+        if split_horizontal:
             workspace.add_class("split-horizontal")
         else:
             workspace.remove_class("split-horizontal")
@@ -712,11 +730,90 @@ class RFIntelPane(BaseSocPane):
             return
         mapped = _WATCHLIST_TO_V2_TYPE.get(entity_type.strip().lower())
         if mapped:
-            self.query_one("#rf-v2-type", Select).value = mapped
-            self.query_one("#rf-ioc-input", Input).value = value
+            sel = self.query_one("#rf-v2-type", Select)
+            inp = self.query_one("#rf-ioc-input", Input)
+            with sel.prevent(Select.Changed):
+                sel.value = mapped
+            with inp.prevent(Input.Changed):
+                inp.value = value
             self.handle_v2_lookup()
         else:
-            self.query_one("#rf-query-input", Input).value = value
+            q_inp = self.query_one("#rf-query-input", Input)
+            with q_inp.prevent(Input.Changed):
+                q_inp.value = value
+            self.handle_entity_match()
+
+    @staticmethod
+    def _classify_pivot_v2_ioc(norm_kind: str, clean_val: str) -> tuple[str, str] | None:
+        """Return ``(v2_type, ioc_value)`` for IOC pivots, or ``None`` for entity match."""
+        lower = clean_val.lower()
+        for prefix, mapped in (
+            ("ip:", "ip"),
+            ("idn:", "domain"),
+            ("hash:", "hash"),
+            ("url:", "url"),
+        ):
+            if lower.startswith(prefix):
+                stripped = clean_val[len(prefix) :].strip()
+                return (mapped, stripped) if stripped else None
+
+        if norm_kind in _PIVOT_V2_TYPE_ALIASES:
+            return _PIVOT_V2_TYPE_ALIASES[norm_kind], clean_val
+
+        is_dotted_domain = (
+            "." in clean_val
+            and " " not in clean_val
+            and not clean_val.startswith(".")
+            and not clean_val.endswith(".")
+        )
+        if norm_kind in ("host", "system"):
+            return ("domain", clean_val) if is_dotted_domain else None
+
+        if norm_kind in ("", "auto"):
+            if lower.startswith(("http://", "https://")):
+                return "url", clean_val
+            if lower.startswith("cve-"):
+                return "vulnerability", clean_val
+            try:
+                ipaddress.ip_address(clean_val)
+                return "ip", clean_val
+            except ValueError:
+                pass
+            if len(clean_val) in (32, 40, 64) and re.fullmatch(r"[0-9a-fA-F]+", clean_val):
+                return "hash", clean_val
+            if is_dotted_domain:
+                return "domain", clean_val
+            return None
+
+        return None
+
+    def accept_pivot(self, payload: PivotPayload) -> None:
+        """Accept a ``PivotPayload`` and auto-run Connect v2 lookup or Entity Match."""
+        primary = payload.primary_ioc()
+        if primary is None:
+            self.set_status("Pivot payload contained no IOC or entity to look up.")
+            return
+        raw_kind, raw_val = primary
+        clean_val = raw_val.strip()
+        if not clean_val:
+            self.set_status("Pivot payload contained an empty IOC or entity.")
+            return
+
+        norm_kind = raw_kind.strip().lower()
+        classified = self._classify_pivot_v2_ioc(norm_kind, clean_val)
+        if classified is not None:
+            v2_type, ioc_val = classified
+            sel = self.query_one("#rf-v2-type", Select)
+            inp = self.query_one("#rf-ioc-input", Input)
+            with sel.prevent(Select.Changed):
+                sel.value = v2_type
+            with inp.prevent(Input.Changed):
+                inp.value = ioc_val
+            self.handle_v2_lookup()
+        else:
+            q_inp = self.query_one("#rf-query-input", Input)
+            with q_inp.prevent(Input.Changed):
+                q_inp.value = clean_val
             self.handle_entity_match()
 
     def report_error(self, context: str, exc: Exception) -> None:
@@ -1187,7 +1284,9 @@ class RFIntelPane(BaseSocPane):
             )
         return (Text(str(item)),)
 
-    def _render_view(self, *, preserve_id: str | None = None) -> None:
+    def _render_view(
+        self, *, preserve_id: str | None = None, schedule_auto_enrich: bool = True
+    ) -> None:
         self._last_error_payload = None
         self._sync_view_selector()
         self._update_filter_title()
@@ -1252,7 +1351,8 @@ class RFIntelPane(BaseSocPane):
         self._update_toolbar_state()
         self._render_detail_panel()
         self.call_after_refresh(self._fit_results_table)
-        self.call_after_refresh(self._schedule_visible_enrichment)
+        if schedule_auto_enrich:
+            self.call_after_refresh(self._schedule_visible_enrichment)
 
     def _update_toolbar_state(self) -> None:
         overview_btn = self.query_one("#rf-view-overview-btn", Button)
@@ -2871,7 +2971,10 @@ class RFIntelPane(BaseSocPane):
         if not raw_ioc:
             self.set_status("Enter an IOC value for Connect v2 lookup.")
             return
-        first_ioc = raw_ioc.split(",")[0].strip()
+        first_ioc = raw_ioc if ent_type == "url" else raw_ioc.split(",")[0].strip()
+        if not first_ioc:
+            self.set_status("Enter an IOC value for Connect v2 lookup.")
+            return
         self._request_seq += 1
         self._v2_lookup_worker(ent_type, first_ioc, seq=self._request_seq)
 
@@ -3067,16 +3170,18 @@ class RFIntelPane(BaseSocPane):
             return not item.get("assignee") or not item.get("description")
         return False
 
-    def _schedule_visible_enrichment(self) -> None:
+    def _claim_visible_enrichment_targets(
+        self, expected_mode: str | None = None
+    ) -> tuple[list[dict[str, Any]], int]:
         if (
             not self._tables_ready
             or self.is_app_shutting_down()
             or not self._auto_enrich_enabled
         ):
-            return
-        mode = self._active_mode
-        if mode not in ("alerts_v3", "playbook", "cases"):
-            return
+            return [], 0
+        mode = expected_mode or self._active_mode
+        if mode != self._active_mode or mode not in ("alerts_v3", "playbook", "cases"):
+            return [], 0
         on_screen = self._get_on_screen_items(max_items=20)
         targets: list[dict[str, Any]] = []
         for item in on_screen:
@@ -3089,14 +3194,25 @@ class RFIntelPane(BaseSocPane):
             if self._needs_auto_enrich(mode, item):
                 targets.append(dict(item))
         if not targets:
-            return
+            return [], 0
         for item in targets:
             self._auto_enriched_keys.add((mode, str(item.get("id") or "").strip()))
         self._enrich_seq += 1
-        self._auto_enrich_visible_worker(mode, targets, self._enrich_seq)
+        return targets, self._enrich_seq
 
-    @work(thread=True, exit_on_error=False, exclusive=True, group="rf-auto-enrich")
+    def _schedule_visible_enrichment(self) -> None:
+        targets, seq = self._claim_visible_enrichment_targets()
+        if not targets:
+            return
+        self._auto_enrich_visible_worker(self._active_mode, targets, seq)
+
+    @work(thread=True, exit_on_error=False)
     def _auto_enrich_visible_worker(
+        self, mode: str, targets: list[dict[str, Any]], seq: int
+    ) -> None:
+        self._run_auto_enrich_sync(mode, targets, seq)
+
+    def _run_auto_enrich_sync(
         self, mode: str, targets: list[dict[str, Any]], seq: int
     ) -> None:
         if self.is_app_shutting_down() or seq != self._enrich_seq or not targets:
@@ -3273,7 +3389,7 @@ class RFIntelPane(BaseSocPane):
             preserve = str(selected.get("id") or "") if selected is not None else None
             self._refresh_assignee_options()
             if self._active_mode == mode:
-                self._render_view(preserve_id=preserve)
+                self._render_view(preserve_id=preserve, schedule_auto_enrich=False)
                 label = _VIEW_LABELS.get(mode, mode)
                 self.set_status(
                     f"Auto-enriched {len(updates)} on-screen {label} row(s) (assignee & status)."
@@ -3300,6 +3416,7 @@ class RFIntelPane(BaseSocPane):
         statuses = list(self._selected_statuses)
         filters = self._current_server_filter_snapshot()
         self._auto_enriched_keys = {k for k in self._auto_enriched_keys if k[0] != "alerts_v3"}
+        self._enrich_seq += 1
         self._request_seq += 1
         self._alerts_worker(limit, self._request_seq, statuses=statuses, filters=filters)
 
@@ -3396,17 +3513,24 @@ class RFIntelPane(BaseSocPane):
 
             normalized = [normalize_alert_v3(item) for item in raw_items]
 
-            def _apply() -> None:
+            def _apply() -> tuple[list[dict[str, Any]], int] | None:
                 if seq != self._request_seq:
-                    return
+                    return None
                 self._datasets["alerts_v3"] = normalized
                 self._dataset_totals["alerts_v3"] = total
                 self._active_mode = "alerts_v3"
                 self._refresh_assignee_options()
-                self._render_view()
+                self._render_view(schedule_auto_enrich=False)
+                return self._claim_visible_enrichment_targets("alerts_v3")
 
-            self.run_on_ui(_apply)
+            enrich_info = self.run_on_ui(_apply)
+            if seq != self._request_seq or self.is_app_shutting_down():
+                return
             self.set_status(f"Loaded {len(normalized)} classic alert(s) via Alerts v3.")
+            if enrich_info:
+                targets, enrich_seq = enrich_info
+                if targets:
+                    self._run_auto_enrich_sync("alerts_v3", targets, enrich_seq)
         except Exception as exc:
             self.report_error("Alerts v3 Search", exc)
 
@@ -3467,6 +3591,7 @@ class RFIntelPane(BaseSocPane):
         statuses = list(self._selected_statuses)
         filters = self._current_server_filter_snapshot()
         self._auto_enriched_keys = {k for k in self._auto_enriched_keys if k[0] != "playbook"}
+        self._enrich_seq += 1
         self._request_seq += 1
         self._playbook_worker(
             categories, limit, self._request_seq, statuses=statuses, filters=filters
@@ -3547,17 +3672,24 @@ class RFIntelPane(BaseSocPane):
             raw_items, total = extract_playbook_alerts(data)
             normalized = [normalize_playbook_alert(item) for item in raw_items]
 
-            def _apply() -> None:
+            def _apply() -> tuple[list[dict[str, Any]], int] | None:
                 if seq != self._request_seq:
-                    return
+                    return None
                 self._datasets["playbook"] = normalized
                 self._dataset_totals["playbook"] = total
                 self._active_mode = "playbook"
                 self._refresh_assignee_options()
-                self._render_view()
+                self._render_view(schedule_auto_enrich=False)
+                return self._claim_visible_enrichment_targets("playbook")
 
-            self.run_on_ui(_apply)
+            enrich_info = self.run_on_ui(_apply)
+            if seq != self._request_seq or self.is_app_shutting_down():
+                return
             self.set_status(f"Loaded {len(normalized)} Playbook Alert(s).")
+            if enrich_info:
+                targets, enrich_seq = enrich_info
+                if targets:
+                    self._run_auto_enrich_sync("playbook", targets, enrich_seq)
         except Exception as exc:
             self.report_error("Playbook Alerts Search", exc)
 
@@ -3685,6 +3817,7 @@ class RFIntelPane(BaseSocPane):
         statuses = list(self._selected_statuses)
         filters = self._current_server_filter_snapshot()
         self._auto_enriched_keys = {k for k in self._auto_enriched_keys if k[0] != "cases"}
+        self._enrich_seq += 1
         self._request_seq += 1
         self._cases_worker(limit, self._request_seq, statuses=statuses, filters=filters)
 
@@ -3742,17 +3875,24 @@ class RFIntelPane(BaseSocPane):
             raw_items, total = extract_cases(data)
             normalized = [normalize_case(item) for item in raw_items]
 
-            def _apply() -> None:
+            def _apply() -> tuple[list[dict[str, Any]], int] | None:
                 if seq != self._request_seq:
-                    return
+                    return None
                 self._datasets["cases"] = normalized
                 self._dataset_totals["cases"] = total
                 self._active_mode = "cases"
                 self._refresh_assignee_options()
-                self._render_view()
+                self._render_view(schedule_auto_enrich=False)
+                return self._claim_visible_enrichment_targets("cases")
 
-            self.run_on_ui(_apply)
+            enrich_info = self.run_on_ui(_apply)
+            if seq != self._request_seq or self.is_app_shutting_down():
+                return
             self.set_status(f"Loaded {len(normalized)} Case(s).")
+            if enrich_info:
+                targets, enrich_seq = enrich_info
+                if targets:
+                    self._run_auto_enrich_sync("cases", targets, enrich_seq)
         except Exception as exc:
             self.report_error("Cases Search", exc)
 
