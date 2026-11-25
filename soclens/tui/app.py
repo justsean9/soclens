@@ -71,7 +71,11 @@ from soclens.tui.logging_bridge import (
     classify_log_source,
     infer_print_level,
 )
-from soclens.tui.pivot import build_spl_from_pivot, format_copilot_context
+from soclens.tui.pivot import (
+    build_keyword_spl,
+    build_spl_from_pivot,
+    format_copilot_context,
+)
 from soclens.tui.screens import (
     BrandLogosPane,
     DashboardPane,
@@ -1118,6 +1122,10 @@ class SocLensApp(App[None]):
         Binding("9", "switch_tab('tab-sentinelone')", "SentinelOne"),
         Binding("0", "switch_tab('tab-settings')", "Settings"),
         Binding("f2", "toggle_admin_view", "Toggle Admin"),
+        Binding("f3", "choose_timezone", "Timezone"),
+        Binding("f4", "research_selection", "Research Sel"),
+        Binding("f5", "splunk_selection", "Splunk Sel"),
+        Binding("f6", "pivot_selection", "Pivot Sel"),
         Binding("f7", "switch_tab('tab-llm')", "Local LLM"),
         Binding("f8", "switch_tab('tab-splunk-search')", "Splunk Search"),
         Binding("f9", "switch_tab('tab-splunk-es')", "Splunk ES"),
@@ -1126,7 +1134,6 @@ class SocLensApp(App[None]):
         Binding("escape", "collapse_watchlist_filter", "Close Filter", show=False),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+q", "quit", "Quit"),
-        Binding("f3", "choose_timezone", "Timezone"),
     ]
 
     def __init__(
@@ -1616,6 +1623,151 @@ class SocLensApp(App[None]):
 
         with contextlib.suppress(Exception):
             self.activate_tab("tab-llm", on_ready=_apply)
+
+    def get_selected_text(self) -> str:
+        """Return currently highlighted text from any widget or screen across all dashboards."""
+        if not self._ui_mounted or self._shutting_down:
+            return ""
+        # 1. Textual global screen text selection (mouse drag in RichLog, Static, DataTable, etc.)
+        with contextlib.suppress(Exception):
+            screen_sel = self.screen.get_selected_text()
+            if isinstance(screen_sel, str) and screen_sel.strip():
+                return " ".join(screen_sel.strip().splitlines()).strip()
+        # 2. Focused Input / TextArea selection
+        with contextlib.suppress(Exception):
+            focused = self.focused
+            if focused is not None:
+                widget_sel = getattr(focused, "selected_text", None)
+                if isinstance(widget_sel, str) and widget_sel.strip():
+                    return " ".join(widget_sel.strip().splitlines()).strip()
+        return ""
+
+    def open_selection_pivot_menu(
+        self,
+        selected_text: str,
+        *,
+        origin: tuple[int, int] = (4, 4),
+    ) -> None:
+        """Open a floating Pivot menu for any highlighted text across all dashboards."""
+        clean_val = " ".join(str(selected_text or "").strip().splitlines()).strip()
+        if not clean_val:
+            return
+        from soclens.tui.clipboard import copy_text_to_clipboard
+        from soclens.tui.modals import ContextMenuModal
+
+        short_val = clean_val if len(clean_val) <= 34 else f"{clean_val[:31]}..."
+        spl_preview = build_keyword_spl(short_val)
+        items: list[tuple[str, str]] = [
+            ("research", f"Deep Research (RF + OSINT): {short_val}"),
+            ("splunk_keyword", f"Splunk Search: {spl_preview}"),
+            ("rf_intel", "RF Intel Lookup (v2 / Entity Match)"),
+            ("splunk_es", "Search Splunk ES Notables"),
+            ("sentinelone", "Search SentinelOne"),
+            ("llm", "Analyze in Local LLM (F7)"),
+            ("copy_value", "Copy Highlighted Text"),
+        ]
+
+        active_tab = ""
+        with contextlib.suppress(Exception):
+            active_tab = str(self.query_one("#main-tabs", TabbedContent).active or "")
+
+        def _on_select(action_id: str | None) -> None:
+            if not action_id:
+                return
+            if action_id == "copy_value":
+                res = copy_text_to_clipboard(clean_val, app=self)
+                if res.success:
+                    self.notify(f"Copied selection ({res.char_count:,} chars).", title="Clipboard")
+                return
+            if action_id == "splunk_keyword":
+                self.open_splunk_search(build_keyword_spl(clean_val), auto_run=False)
+                return
+            target_map = {
+                "research": "tab-research",
+                "rf_intel": "tab-rf-intel",
+                "splunk_es": "tab-splunk-es",
+                "sentinelone": "tab-sentinelone",
+                "llm": "tab-llm",
+            }
+            target_tab = target_map.get(action_id)
+            if target_tab:
+                self.dispatch_pivot(
+                    PivotPayload(
+                        source_tab=active_tab or "selection",
+                        target_tab=target_tab,
+                        entity=clean_val,
+                        entity_type="auto",
+                        summary=f"Highlighted selection: {clean_val}",
+                    )
+                )
+
+        self.push_screen(
+            ContextMenuModal(items, title=f"Selection: {short_val}", origin=origin),
+            _on_select,
+        )
+
+    def action_research_selection(self) -> None:
+        """Send any highlighted text directly to the Research tab (F4)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        selected = self.get_selected_text()
+        if not selected:
+            self.notify(
+                "Highlight any text first, then press F4 (Research), F5 (Splunk), F6 (Pivot), or right-click.",
+                title="No Text Highlighted",
+                severity="warning",
+            )
+            return
+        active_tab = ""
+        with contextlib.suppress(Exception):
+            active_tab = str(self.query_one("#main-tabs", TabbedContent).active or "")
+        self.dispatch_pivot(
+            PivotPayload(
+                source_tab=active_tab or "selection",
+                target_tab="tab-research",
+                entity=selected,
+                entity_type="auto",
+                summary=f"Highlighted selection: {selected}",
+            )
+        )
+
+    def action_splunk_selection(self) -> None:
+        """Send any highlighted text directly to Splunk Search as ``index=* "<text>"`` (F5)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        selected = self.get_selected_text()
+        if not selected:
+            self.notify(
+                "Highlight any text first, then press F4 (Research), F5 (Splunk), F6 (Pivot), or right-click.",
+                title="No Text Highlighted",
+                severity="warning",
+            )
+            return
+        self.open_splunk_search(build_keyword_spl(selected), auto_run=False)
+
+    def action_pivot_selection(self) -> None:
+        """Open the floating Pivot menu for any highlighted text (F6)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        selected = self.get_selected_text()
+        if not selected:
+            self.notify(
+                "Highlight any text first, then press F4 (Research), F5 (Splunk), F6 (Pivot), or right-click.",
+                title="No Text Highlighted",
+                severity="warning",
+            )
+            return
+        self.open_selection_pivot_menu(selected, origin=(6, 4))
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        """Right-clicking anywhere while text is highlighted opens the global Pivot menu."""
+        if event.button != 3 or isinstance(self.screen, ModalScreen):
+            return
+        selected = self.get_selected_text()
+        if not selected:
+            return
+        event.stop()
+        self.open_selection_pivot_menu(selected, origin=(event.screen_x, event.screen_y))
 
     def open_splunk_search(self, spl: str, *, auto_run: bool = False) -> None:
         """Switch to the Splunk Search tab and load an SPL query."""

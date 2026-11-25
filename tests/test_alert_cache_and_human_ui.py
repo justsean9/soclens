@@ -422,3 +422,48 @@ def test_any_field_right_click_pivot_and_keyword_spl(tmp_path: Path) -> None:
             assert spl_val == 'index=* "services.exe"'
 
     asyncio.run(_run())
+
+
+def test_global_highlight_selection_pivots_to_research_and_splunk(tmp_path: Path) -> None:
+    from textual.widgets import Input, TextArea
+
+    from soclens.tui.modals import ContextMenuModal
+    from soclens.tui.screens.research import ResearchPane
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-logs",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+
+            # Simulate highlighted text anywhere on screen (works across all 13 dashboards)
+            app.get_selected_text = lambda: "svchost.exe"  # type: ignore[method-assign]
+
+            # F5 -> Splunk Search with index=* "svchost.exe"
+            await pilot.press("f5")
+            await pilot.pause()
+            await pilot.pause()
+            search_pane = app.query_one(SplunkSearchPane)
+            assert search_pane.query_one("#splunk-search-spl", TextArea).text == 'index=* "svchost.exe"'
+
+            # F4 -> Research tab with svchost.exe populated
+            await pilot.press("f4")
+            await pilot.pause()
+            await pilot.pause()
+            res_pane = app.query_one(ResearchPane)
+            assert res_pane.query_one("#res-target-input", Input).value == "svchost.exe"
+
+            # F6 -> Floating transparent Pivot menu for highlighted text
+            await pilot.press("f6")
+            await pilot.pause()
+            assert isinstance(app.screen, ContextMenuModal)
+            app.screen.dismiss(None)
+            await pilot.pause()
+
+    asyncio.run(_run())

@@ -509,9 +509,21 @@ class BaseSocPane(VerticalScroll):
         *,
         source_tab: str = "",
     ) -> bool:
-        """If ``event`` is a right-click on a pivotable field value, open the pivot menu."""
+        """If ``event`` is a right-click with highlighted text or on a pivotable field, open the menu."""
         if event.button != 3:
             return False
+        get_sel = getattr(self.app, "get_selected_text", None)
+        if callable(get_sel):
+            selected = str(get_sel() or "").strip()
+            if selected:
+                event.stop()
+                self.open_field_pivot_menu(
+                    "Selection",
+                    selected,
+                    origin=(event.screen_x, event.screen_y),
+                    source_tab=source_tab,
+                )
+                return True
         hit = extract_pivot_from_click(event)
         if hit is None:
             return False
