@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-25
+
+### Added
+- **Akeyless Vault Secret Manager / PAM Provider (`soclens.secret_stores.akeyless`)**:
+  - Native `ConfiguredSession()` integration for Akeyless SaaS and self-hosted Gateway supporting `access_key` and `token` authentication modes, static/dynamic/rotated secrets, path-prefix catalog discovery, and Settings UI / dynamic vault dropdown support with zero new runtime dependencies.
+- **24-Hour Local Alert Cache, Background Preloading & Human-Readable Inspectors (`soclens.alert_cache`, `soclens.tui`)**:
+  - Local 24-hour alert caching and background preloading for Recorded Future alerts, full Playbook Alert details and cached screenshot images, SentinelOne MDR alert defaults, full-line row hover tooltip popups across `DoubleClickDataTable` tables, and structured table formatting for SentinelOne `mitigationStatus` action lists.
+- **Global Text Selection Highlighting, Clickable Structured Fields & Right-Click RF/Splunk Search Pivot (`soclens.tui.pivot`, `soclens.tui.screens.base`)**:
+  - Added `SelectableRichLog` across all 13 TUI dashboards with high-contrast word-accurate gold selection highlights, clickable cyan/blue structured field search buttons, streamlined right-click menus restricted to Recorded Future and Splunk (`index=* "KEYWORD"`) searches, and transparent/translucent modal overlays that preserve background visibility.
+- **Threat Research Search-to-Initial-Thoughts Banner & Opt-in ASCII Art (`soclens.tui.research_art`)**:
+  - Live Threat Research status banner that stays hidden while idle, displays search progress (`SCANNING...`) transitioning into initial threat verdict and top RF/OSINT signals, and auto-hides after 10 seconds — with ASCII art disabled by default and optionally unlockable via Settings (`soclens_ascii_art_enabled` / `SOCLENS_ASCII_ART`).
+
+### Fixed
+- **SentinelOne Full Cursor Pagination & Newest-First Default Sorting (`soclens.sentinelone`)**:
+  - Traversed all cursor pages (`MAX_PAGE_SIZE=100`) with cycle and null guards and default newest-first sorting across API and client fallback.
+- **TUI Text Selection & Bottom-Panel Highlighting**:
+  - Fixed character offset mapping (`Strip.apply_offsets`) and cell-accurate selection highlighting so only selected words highlight cleanly across all panels.
+- **CI & README Hygiene**:
+  - Disabled automatic GitHub CI workflow triggers on push/PR (retaining tag-triggered releases) and removed the CI status badge from `README.md`.
+
 ## [2.1.0] - 2026-11-25
 
 ### Added
