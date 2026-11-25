@@ -949,7 +949,7 @@ class MockRFServer:
             return 200, matched[:limit], {}, None
 
         if path.startswith("/entity-match/entity/") and method == "GET":
-            eid = urllib.parse.unquote(path[len("/entity-match/entity/") :])
+            eid = urllib.parse.unquote(path[len("/entity-match/entity/") :].rstrip("/"))
             for ent in self.state["entity_matches"]:
                 if ent["id"] == eid:
                     return 200, copy.deepcopy(ent), {}, None
@@ -1002,7 +1002,10 @@ class MockRFServer:
 
         # 5. Connect API v2
         if path.startswith("/v2/"):
-            parts = [urllib.parse.unquote(p) for p in path[len("/v2/") :].split("/")]
+            parts = [
+                urllib.parse.unquote(p)
+                for p in path[len("/v2/") :].rstrip("/").split("/")
+            ]
             if len(parts) == 3 and parts[0] == "company" and parts[1] == "by_domain" and method == "GET":
                 domain = parts[2]
                 entry = self.state["v2_entities"].get(("company", f"by_domain:{domain}"))

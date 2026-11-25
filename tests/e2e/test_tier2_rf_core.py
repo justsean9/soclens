@@ -1095,3 +1095,44 @@ def test_f6_entity_match_unknown_type_and_empty_query_validation(
     ):
         with pytest.raises(ValueError):
             call()
+
+
+@pytest.mark.feature("F6")
+def test_f6_proxysg_safe_trailing_slash_for_domain_and_url_lookups(
+    mock_rf_server: MockRFServer,
+) -> None:
+    from soclens.client import RecordedFutureClient
+
+    mock_rf_server.state["v2_entities"][("domain", "acme.com")] = {
+        "entity": {"id": "idn:acme.com", "name": "acme.com", "type": "InternetDomainName"},
+        "risk": {"score": 5, "level": 0, "riskString": "0/10", "evidenceDetails": []},
+    }
+    mock_rf_server.state["v2_entities"][("company", "by_domain:acme.com")] = {
+        "entity": {"id": "company:acme", "name": "Acme Corp", "type": "Company"},
+        "risk": {"score": 5, "level": 0, "riskString": "0/10", "evidenceDetails": []},
+    }
+    mock_rf_server.state["v2_entities"][("url", "url:https://acme.com")] = {
+        "entity": {"id": "url:https://acme.com", "name": "https://acme.com", "type": "URL"},
+        "risk": {"score": 5, "level": 0, "riskString": "0/10", "evidenceDetails": []},
+    }
+    mock_rf_server.state["entity_matches"].append(
+        {"id": "idn:acme.com", "name": "acme.com", "type": "InternetDomainName", "aliases": []}
+    )
+
+    client = RecordedFutureClient()
+
+    dom_res = client.v2_lookup("domain", "acme.com")
+    assert dom_res["data"]["entity"]["name"] == "acme.com"
+    assert mock_rf_server.requests_log[-1]["path"] == "/v2/domain/acme.com/"
+
+    comp_res = client.v2_company_by_domain("acme.com")
+    assert comp_res["data"]["entity"]["name"] == "Acme Corp"
+    assert mock_rf_server.requests_log[-1]["path"] == "/v2/company/by_domain/acme.com/"
+
+    url_res = client.v2_lookup("url", "https://acme.com")
+    assert url_res["data"]["entity"]["name"] == "https://acme.com"
+    assert mock_rf_server.requests_log[-1]["path"] == "/v2/url/url:https%3A%2F%2Facme.com/"
+
+    ent_res = client.entity_lookup("idn:acme.com")
+    assert ent_res["name"] == "acme.com"
+    assert mock_rf_server.requests_log[-1]["path"] == "/entity-match/entity/idn:acme.com/"

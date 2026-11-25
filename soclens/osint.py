@@ -717,6 +717,18 @@ class OSINTClient:
             hint = f" (retry after {retry}s)" if retry else ""
             return 429, None, f"Rate limited (HTTP 429){hint}"
         if code in (401, 403):
+            if code == 403:
+                ctype = str(resp.headers.get("Content-Type") or "").lower()
+                body_lower = (resp.text or "")[:1024].lower()
+                if "text/html" in ctype or any(
+                    marker in body_lower
+                    for marker in ("<html", "<!doctype html", "proxysg", "blue coat", "bluecoat", "policy_denied")
+                ):
+                    return (
+                        403,
+                        None,
+                        "Blocked by proxy/gateway (HTTP 403) — check proxy URL/extension policy",
+                    )
             return code, None, f"Authentication required / denied (HTTP {code})"
         if code >= 400:
             snippet = (resp.text or "").strip().replace("\n", " ")[:160]

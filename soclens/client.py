@@ -390,12 +390,46 @@ class RecordedFutureAPIError(RecordedFutureError):
         )
 
 
+_PROXY_BLOCK_MARKERS: tuple[str, ...] = (
+    "<html",
+    "<!doctype html",
+    "proxysg",
+    "blue coat",
+    "bluecoat",
+    "edge swg",
+    "policy_denied",
+    "symantec web security",
+)
+
+# Trailing alphabetic extension (e.g. ".com", ".exe", ".bat", ".sh") on the final
+# URL path segment triggers ProxySG/Edge SWG executable-extension blocks (HTTP 403).
+_TRAILING_PATH_EXT_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9-]{0,62}$")
+
+
+def _append_proxysg_safe_slash(endpoint: str, *, always: bool = False) -> str:
+    """Append a trailing ``/`` so ProxySG does not treat ``.com``/``.exe`` as a file download.
+
+    Broadcom/Symantec ProxySG (Edge SWG) evaluates ``url.extension`` on the final
+    URL path segment, so paths like ``/v2/domain/example.com`` are blocked with HTTP
+    403 as DOS ``.com`` executable downloads. Appending ``/`` makes
+    ``url.extension`` empty while remaining valid for Recorded Future REST paths.
+    """
+    if endpoint.endswith("/"):
+        return endpoint
+    if always:
+        return f"{endpoint}/"
+    last_segment = endpoint.rsplit("/", 1)[-1]
+    if _TRAILING_PATH_EXT_RE.search(last_segment):
+        return f"{endpoint}/"
+    return endpoint
+
+
 def classify_403_permission(
     message: str | None,
     reason: str | None = None,
     payload: Any = None,
 ) -> str:
-    """Classify HTTP 403 errors into RF entitlement vs data-group ACL categories."""
+    """Classify HTTP 403 errors into RF entitlement, data-group ACL, or proxy-block categories."""
     parts: list[str] = []
     if isinstance(message, str):
         parts.append(message)
@@ -411,6 +445,8 @@ def classify_403_permission(
         return "missing_api_privileges"
     if "missing data permissions" in combined:
         return "missing_data_permissions"
+    if payload is None and any(marker in combined for marker in _PROXY_BLOCK_MARKERS):
+        return "proxy_blocked"
     return "unauthorized"
 
 
@@ -1607,8 +1643,10 @@ class RecordedFutureClient:
     def entity_lookup(self, entity_id: str) -> dict[str, Any]:
         """Fetch metadata and aliases for a known Recorded Future entity ID."""
         clean_id = _require_non_empty(entity_id, "entity_id")
+        if clean_id.lower().startswith("idn:"):
+            clean_id = clean_id.rstrip("/")
         encoded_id = quote(clean_id, safe=":")
-        endpoint = f"/entity-match/entity/{encoded_id}"
+        endpoint = _append_proxysg_safe_slash(f"/entity-match/entity/{encoded_id}")
         response = self._request("GET", endpoint)
         data = self._json_or_raise(response, endpoint)
         return data if isinstance(data, dict) else {}
@@ -1688,6 +1726,10 @@ class RecordedFutureClient:
 
     def _encode_v2_entity_id(self, norm_type: str, entity_id: str) -> str:
         clean_id = _require_non_empty(entity_id, "entity_id")
+        if norm_type == "domain":
+            clean_id = clean_id.rstrip("/")
+            if not clean_id:
+                raise ValueError("entity_id cannot be empty.")
         if norm_type == "url":
             raw_url = clean_id[4:] if clean_id.lower().startswith("url:") else clean_id
             encoded_url = raw_url if "/" not in raw_url else quote(raw_url, safe="")
@@ -1716,6 +1758,10 @@ class RecordedFutureClient:
             params["taggedText"] = "true"
 
         endpoint = f"/v2/{norm_type}/{encoded_id}"
+        if norm_type == "domain":
+            endpoint = _append_proxysg_safe_slash(endpoint, always=True)
+        elif norm_type == "url":
+            endpoint = _append_proxysg_safe_slash(endpoint)
         response = self._request("GET", endpoint, params=params or None)
         data = self._json_or_raise(response, endpoint)
         return data if isinstance(data, dict) else {}
@@ -1756,7 +1802,7 @@ class RecordedFutureClient:
         metadata: bool = False,
     ) -> dict[str, Any]:
         """Resolve a domain name to its owning company via Connect v2."""
-        clean_domain = domain.strip()
+        clean_domain = domain.strip().rstrip("/")
         if not clean_domain:
             raise ValueError("Domain cannot be empty.")
         params: dict[str, Any] = {}
@@ -1765,7 +1811,10 @@ class RecordedFutureClient:
         if metadata:
             params["metadata"] = "true"
 
-        endpoint = f"/v2/company/by_domain/{quote(clean_domain, safe='')}"
+        endpoint = _append_proxysg_safe_slash(
+            f"/v2/company/by_domain/{quote(clean_domain, safe='')}",
+            always=True,
+        )
         response = self._request("GET", endpoint, params=params or None)
         data = self._json_or_raise(response, endpoint)
         return data if isinstance(data, dict) else {}

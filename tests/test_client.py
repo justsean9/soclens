@@ -1253,6 +1253,101 @@ class TestRecordedFutureClient(unittest.TestCase):
             )
         )
 
+    def test_proxysg_trailing_slash_for_domain_url_and_entity_paths(self) -> None:
+        self.mock_session.request.return_value = _make_response(200, {"data": {}})
+
+        # Connect v2 domain lookups always include trailing '/' to avoid ProxySG
+        # blocking '.com' / '.sh' / '.zip' paths as executable downloads.
+        self.client.v2_lookup("domain", "example.com", fields=["entity", "risk"])
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith("/v2/domain/example.com/")
+        )
+
+        # User-supplied trailing '/' on a domain is normalized without '%2F' or '//'.
+        self.client.v2_lookup("domain", "example.com/")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith("/v2/domain/example.com/")
+        )
+
+        self.client.v2_lookup("domain", "idn:example.com")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/v2/domain/idn:example.com/"
+            )
+        )
+
+        # Company-by-domain also ends in a domain TLD and gets a trailing '/'.
+        self.client.v2_company_by_domain("example.com")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/v2/company/by_domain/example.com/"
+            )
+        )
+        self.client.v2_company_by_domain("example.com/")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/v2/company/by_domain/example.com/"
+            )
+        )
+
+        # URL lookups whose encoded path ends in a TLD/file extension (e.g. '.com', '.exe')
+        # get a trailing '/', while non-extension paths stay unchanged.
+        self.client.v2_lookup("url", "https://example.com")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/v2/url/url:https%3A%2F%2Fexample.com/"
+            )
+        )
+        self.client.v2_lookup("url", "https://evil.org/dropper.exe")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/v2/url/url:https%3A%2F%2Fevil.org%2Fdropper.exe/"
+            )
+        )
+
+        # IP lookups do NOT receive a trailing '/' (numeric octet, not file extension).
+        self.client.v2_lookup("ip", "8.8.8.8")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith("/v2/ip/8.8.8.8")
+        )
+
+        # Entity lookup appends '/' for domain/email/url IDs ending in extensions,
+        # but leaves opaque IDs untouched.
+        self.client.entity_lookup("idn:example.com")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/entity-match/entity/idn:example.com/"
+            )
+        )
+        self.client.entity_lookup("idn:example.com/")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/entity-match/entity/idn:example.com/"
+            )
+        )
+        self.client.entity_lookup("email:analyst@example.com")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/entity-match/entity/email:analyst%40example.com/"
+            )
+        )
+        self.client.entity_lookup("company:abc123")
+        self.assertTrue(
+            self.mock_session.request.call_args.kwargs["url"].endswith(
+                "/entity-match/entity/company:abc123"
+            )
+        )
+
+    def test_classify_403_detects_proxysg_html_block_page(self) -> None:
+        self.mock_session.request.return_value = _make_response(
+            403,
+            text="<html><head><title>Access Denied</title></head><body>ProxySG policy_denied: .com executable blocked</body></html>",
+        )
+        with self.assertRaises(RecordedFutureAuthError) as ctx:
+            self.client._request("GET", "/v2/domain/example.com")
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.permission_type, "proxy_blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

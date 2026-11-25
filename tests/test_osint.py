@@ -896,3 +896,23 @@ def test_cli_research_osint_and_unified_flags(
             cli_main()
         parsed2 = json.loads(capsys.readouterr().out)
         assert list(parsed2["sections"].keys()) == ["osint_dns"]
+
+
+def test_osint_request_json_detects_proxysg_html_403(tmp_path: Path) -> None:
+    client = OSINTClient(OSINTConfig(enabled=True, timeout=5.0), workspace_dir=tmp_path)
+
+    class _FakeResp:
+        status_code = 403
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        text = "<html><body><h1>Access Denied</h1><p>ProxySG policy_denied</p></body></html>"
+
+        def json(self) -> dict[str, str]:
+            raise ValueError("not json")
+
+    with patch.object(client._session, "request", return_value=_FakeResp()):
+        code, payload, err = client._request_json("GET", "https://rdap.org/domain/example.com")
+
+    assert code == 403
+    assert payload is None
+    assert err is not None
+    assert "Blocked by proxy/gateway (HTTP 403)" in err
