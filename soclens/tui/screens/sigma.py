@@ -143,7 +143,7 @@ class SigmaPane(BaseSocPane):
             markup=False,
         )
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="sigma-toolbar", classes="action-row toolbar-row"):
             yield Button(
                 "Load Cached Rules",
                 id="sigma-load-btn",

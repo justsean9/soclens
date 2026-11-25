@@ -288,6 +288,9 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
 
 _SSL_VERIFY_TRUE = frozenset({"1", "true", "yes", "on"})
 _SSL_VERIFY_FALSE = frozenset({"0", "false", "no", "off"})
+_NON_SETTING_CONTROL_IDS: frozenset[str] = frozenset(
+    {"settings-show-secrets", "set-profile-select", "set-new-profile-input"}
+)
 
 
 def _label_id(key: str) -> str:
@@ -325,6 +328,20 @@ class SettingsPane(BaseSocPane):
         border: none;
         overflow-y: auto;
     }
+    SettingsPane.settings-compact #settings-toolbar {
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    SettingsPane.settings-compact #settings-toolbar Button,
+    SettingsPane.settings-compact #settings-toolbar Checkbox {
+        width: 1fr;
+        min-width: 6;
+        height: 1;
+        margin-right: 0;
+    }
     """
 
     STATUS_ID = "settings-status"
@@ -335,6 +352,8 @@ class SettingsPane(BaseSocPane):
         super().__init__(*args, **kwargs)
         self._populating_form = False
         self._internal_reloading = False
+        self._dirty = False
+        self._baseline_values: dict[str, Any] = {}
         self._catalog_entries: list[SecretCatalogEntry] = []
         self._catalog_provider: str = ""
 
@@ -358,7 +377,7 @@ class SettingsPane(BaseSocPane):
         )
         yield Static("", id="settings-storage-info", classes="info-box", markup=False)
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="settings-toolbar", classes="action-row toolbar-row"):
             yield Button(
                 "Save Settings",
                 id="settings-save-btn",
@@ -1228,6 +1247,11 @@ class SettingsPane(BaseSocPane):
     def on_settings_updated(self) -> None:
         if self._internal_reloading:
             return
+        if self._dirty:
+            self._refresh_field_badges()
+            self._refresh_secrets_summary()
+            self._refresh_storage_banners()
+            return
         self._load_form_from_store()
 
     def _update_responsive_layout(self) -> None:
@@ -1470,7 +1494,8 @@ class SettingsPane(BaseSocPane):
             for key, widget_id, placeholder in _INPUT_SPECS_SIMPLE:
                 inp = self.query_one(f"#{widget_id}", Input)
                 val = self._form_value_for_display(key, saved_map)
-                inp.value = val or ""
+                with inp.prevent(Input.Changed):
+                    inp.value = val or ""
                 env_hit = get_env_override_for_setting(key)
                 if env_hit is not None and val is None:
                     inp.placeholder = f"Active from ENV ({env_hit[0]}) - click Import from Env or enter value"
@@ -1508,7 +1533,7 @@ class SettingsPane(BaseSocPane):
             ss_verify_val = self._form_value_for_display("secret_store_verify_ssl", saved_map)
             ss_sel = self.query_one("#set-secret-store-verify-ssl", Select)
             ss_ca = self.query_one("#set-pam-ca-bundle", Input)
-            with ss_sel.prevent(Select.Changed):
+            with ss_sel.prevent(Select.Changed), ss_ca.prevent(Input.Changed):
                 if ss_verify_val is None:
                     ss_sel.value = ""
                     ss_ca.value = ""
@@ -1529,7 +1554,7 @@ class SettingsPane(BaseSocPane):
             rf_ca_val = self._form_value_for_display("rf_ca_bundle", saved_map)
             rf_verify_sel = self.query_one("#set-rf-verify-ssl", Select)
             rf_ca_input = self.query_one("#set-rf-ca-bundle", Input)
-            with rf_verify_sel.prevent(Select.Changed):
+            with rf_verify_sel.prevent(Select.Changed), rf_ca_input.prevent(Input.Changed):
                 if rf_ca_val:
                     rf_verify_sel.value = "custom"
                     rf_ca_input.value = rf_ca_val
@@ -1552,7 +1577,7 @@ class SettingsPane(BaseSocPane):
             sp_verify_val = self._form_value_for_display("splunk_verify_ssl", saved_map)
             sp_sel = self.query_one("#set-splunk-verify-ssl", Select)
             sp_ca = self.query_one("#set-splunk-ca-bundle", Input)
-            with sp_sel.prevent(Select.Changed):
+            with sp_sel.prevent(Select.Changed), sp_ca.prevent(Input.Changed):
                 if sp_verify_val is None:
                     sp_sel.value = "false"
                     sp_ca.value = ""
@@ -1572,7 +1597,7 @@ class SettingsPane(BaseSocPane):
             s1_verify_val = self._form_value_for_display("s1_verify_ssl", saved_map)
             s1_sel = self.query_one("#set-s1-verify-ssl", Select)
             s1_ca = self.query_one("#set-s1-ca-bundle", Input)
-            with s1_sel.prevent(Select.Changed):
+            with s1_sel.prevent(Select.Changed), s1_ca.prevent(Input.Changed):
                 if s1_verify_val is None:
                     s1_sel.value = ""
                     s1_ca.value = ""
@@ -1599,9 +1624,9 @@ class SettingsPane(BaseSocPane):
 
             # Auto-approve
             auto_val = self._form_value_for_display("soclens_auto_approve", saved_map)
-            self.query_one("#set-auto-approve", Checkbox).value = (
-                (auto_val or "").strip().lower() in _SSL_VERIFY_TRUE
-            )
+            auto_cb = self.query_one("#set-auto-approve", Checkbox)
+            with auto_cb.prevent(Checkbox.Changed):
+                auto_cb.value = (auto_val or "").strip().lower() in _SSL_VERIFY_TRUE
 
             # Profiles dropdown & vault controls
             self._refresh_profile_selector(active_profile)
@@ -1615,6 +1640,8 @@ class SettingsPane(BaseSocPane):
             self._refresh_field_badges()
             self._refresh_secrets_summary(saved_map)
             self._refresh_storage_banners()
+            self._baseline_values = self._snapshot_control_values()
+            self._dirty = False
         finally:
             self._populating_form = False
 
@@ -1740,6 +1767,41 @@ class SettingsPane(BaseSocPane):
                 self.query_one(f"#{widget_id}", Input).password = hide
             except Exception:
                 pass
+
+    def _snapshot_control_values(self) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {}
+        for widget in self.query("Input, Select, Checkbox"):
+            wid = widget.id or ""
+            if not wid or wid in _NON_SETTING_CONTROL_IDS:
+                continue
+            snapshot[wid] = getattr(widget, "value", None)
+        return snapshot
+
+    def _update_dirty_from_change(self, control_id: str | None, new_value: Any) -> None:
+        if self._populating_form:
+            return
+        wid = control_id or ""
+        if wid in _NON_SETTING_CONTROL_IDS:
+            return
+        if not self._baseline_values:
+            self._dirty = True
+            return
+        if wid not in self._baseline_values or new_value != self._baseline_values[wid]:
+            self._dirty = True
+            return
+        self._dirty = self._snapshot_control_values() != self._baseline_values
+
+    @on(Input.Changed)
+    def _handle_setting_input_changed(self, event: Input.Changed) -> None:
+        self._update_dirty_from_change(event.input.id, event.value)
+
+    @on(Select.Changed)
+    def _handle_setting_select_changed(self, event: Select.Changed) -> None:
+        self._update_dirty_from_change(event.select.id, event.value)
+
+    @on(Checkbox.Changed)
+    def _handle_setting_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        self._update_dirty_from_change(event.checkbox.id, event.value)
 
     def _switch_to_widget(self, cat_id: str, widget_id: str, *, key: str = "") -> None:
         try:
@@ -2019,6 +2081,8 @@ class SettingsPane(BaseSocPane):
                     except Exception:
                         pass
 
+        self._baseline_values = self._snapshot_control_values()
+        self._dirty = False
         self._reload_app_after_session_update()
         self._refresh_field_badges()
         self._refresh_secrets_summary(get_profile_settings(profile=active_profile))
@@ -2258,7 +2322,9 @@ class SettingsPane(BaseSocPane):
             self.query_one("#set-new-profile-input", Input).focus()
             return
         set_active_profile(prof_name, create=True)
-        self.query_one("#set-new-profile-input", Input).value = ""
+        new_prof_inp = self.query_one("#set-new-profile-input", Input)
+        with new_prof_inp.prevent(Input.Changed):
+            new_prof_inp.value = ""
         clear_session_overrides()
         self._catalog_entries = []
         self._catalog_provider = ""

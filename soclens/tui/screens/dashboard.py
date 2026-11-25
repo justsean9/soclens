@@ -96,7 +96,7 @@ class DashboardPane(BaseSocPane):
             classes="status-bar",
             markup=False,
         )
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="dash-toolbar", classes="action-row toolbar-row"):
             yield Button(
                 "Refresh Diagnostics",
                 id="dash-refresh-btn",

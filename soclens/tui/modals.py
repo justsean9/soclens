@@ -113,6 +113,8 @@ class ContextMenuModal(ModalScreen[str | None]):
             )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         box = self.query_one("#ctx-menu-box", Vertical)
         max_label = max((len(label) for _, label in self._items), default=20)
         max_title = len(self._title[:44]) if self._title else 0
@@ -232,6 +234,8 @@ class ConfirmActionModal(ModalScreen[bool]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#confirm-cancel-btn", Button).focus()
 
     @on(Button.Pressed, "#confirm-cancel-btn")
@@ -428,6 +432,8 @@ class TriageItemModal(ModalScreen[dict[str, str] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#triage-status-select", Select).focus()
 
     @on(Button.Pressed, "#triage-cancel-btn")
@@ -573,6 +579,8 @@ class CreateCaseModal(ModalScreen[dict[str, str] | None]):
                 yield Button("Create Case", id="case-create-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#case-title-input", Input).focus()
 
     @on(Button.Pressed, "#case-cancel-btn")
@@ -722,6 +730,8 @@ class ScreenshotViewerModal(ModalScreen[str | None]):
                 yield Button("Close", id="shot-close-btn", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self._blurred = bool(getattr(self.app, "blur_images", True))
         self._protocol = detect_terminal_graphics_protocol(
             is_headless=self.app.is_headless,
@@ -1534,6 +1544,8 @@ class S1ThreatTriageModal(ModalScreen[dict[str, str] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-triage-verdict-select", Select).focus()
 
     @on(Button.Pressed, "#s1-triage-cancel-btn")
@@ -1685,6 +1697,8 @@ class S1CreateExclusionModal(ModalScreen[dict[str, str] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-excl-value-input", Input).focus()
 
     @on(Button.Pressed, "#s1-excl-cancel-btn")
@@ -1815,6 +1829,8 @@ class S1AddBlocklistModal(ModalScreen[dict[str, str] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#s1-block-hash-input", Input).focus()
 
     @on(Button.Pressed, "#s1-block-cancel-btn")
@@ -1938,6 +1954,8 @@ class TimezoneModal(ModalScreen[str | None]):
                 yield Button("Apply", id="tz-apply-btn", variant="primary", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self._update_preview(self._current_tz)
 
     def _effective_candidate(self) -> str:
@@ -2189,6 +2207,8 @@ class SplunkNotableTriageModal(ModalScreen[dict[str, Any] | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#es-triage-status-select", Select).focus()
 
     @on(Button.Pressed, "#es-triage-cancel-btn")
@@ -2323,6 +2343,8 @@ class CopyTextModal(ModalScreen[None]):
                 yield Button("Close", id="copy-modal-close-btn", compact=True)
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         ta = self.query_one("#copy-modal-textarea", TextArea)
         if self._language:
             try:
@@ -2465,6 +2487,8 @@ class SaveFilterPresetModal(ModalScreen[str | None]):
                 )
 
     def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
         self.query_one("#preset-name-input", Input).focus()
 
     @on(Input.Submitted, "#preset-name-input")

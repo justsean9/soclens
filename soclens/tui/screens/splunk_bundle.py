@@ -72,7 +72,7 @@ class SplunkBundlePane(BaseSocPane):
                 compact=True,
             )
 
-        with Horizontal(classes="action-row toolbar-row"):
+        with Horizontal(id="splunk-bundle-toolbar", classes="action-row toolbar-row"):
             yield Select(
                 list(SPLUNK_TIME_PRESETS),
                 allow_blank=False,

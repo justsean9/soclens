@@ -460,6 +460,32 @@ class SocLensApp(App[None]):
     .-compact-narrow .filter-bar {
         padding: 0;
     }
+    .-compact-narrow #dash-toolbar,
+    .-compact-narrow #sigma-toolbar,
+    .-compact-narrow #splunk-bundle-toolbar {
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .-compact-narrow #dash-toolbar Button,
+    .-compact-narrow #sigma-toolbar Button,
+    .-compact-narrow #sigma-toolbar Input,
+    .-compact-narrow #sigma-toolbar Select,
+    .-compact-narrow #splunk-bundle-toolbar Button,
+    .-compact-narrow #splunk-bundle-toolbar Input,
+    .-compact-narrow #splunk-bundle-toolbar Select,
+    .-compact-narrow #splunk-bundle-toolbar Checkbox {
+        width: 1fr;
+        min-width: 6;
+        height: 1;
+        margin-right: 0;
+    }
+    .-compact-narrow #sigma-toolbar Select > SelectCurrent,
+    .-compact-narrow #splunk-bundle-toolbar Select > SelectCurrent {
+        height: 1;
+    }
     Checkbox.-textual-compact {
         background: #182133;
         color: #e6edf7;
@@ -1892,7 +1918,15 @@ class SocLensApp(App[None]):
             if not already_active:
                 tabs.active = tab_id
             if on_ready is not None:
-                on_ready(pane)
+                try:
+                    on_ready(pane)
+                except Exception as exc:
+                    self.record_log(
+                        f"Tab activation callback failed for {tab_id}: {exc}",
+                        level="ERROR",
+                        source="tui",
+                        logger_name="SocLensApp",
+                    )
             return True
 
         if on_ready is not None:
@@ -1908,8 +1942,15 @@ class SocLensApp(App[None]):
                 mounted.on_tab_activated()
                 callbacks = self._pending_tab_callbacks.pop(tab_id, [])
                 for cb in callbacks:
-                    with contextlib.suppress(Exception):
+                    try:
                         cb(mounted)
+                    except Exception as exc:
+                        self.record_log(
+                            f"Tab activation callback failed for {tab_id}: {exc}",
+                            level="ERROR",
+                            source="tui",
+                            logger_name="SocLensApp",
+                        )
 
             self.run_worker(_mount_and_dispatch(), exclusive=False)
         return True
@@ -1945,8 +1986,15 @@ class SocLensApp(App[None]):
         pane.on_tab_activated()
         callbacks = self._pending_tab_callbacks.pop(tab_id, [])
         for cb in callbacks:
-            with contextlib.suppress(Exception):
+            try:
                 cb(pane)
+            except Exception as exc:
+                self.record_log(
+                    f"Tab activation callback failed for {tab_id}: {exc}",
+                    level="ERROR",
+                    source="tui",
+                    logger_name="SocLensApp",
+                )
 
     def action_switch_tab(self, tab_id: str) -> None:
         """Activate a top-level workflow tab by ID when accessible in the active view."""
