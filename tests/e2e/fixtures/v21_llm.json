@@ -1,0 +1,29 @@
+{
+  "ollama_models": [
+    {"name": "llama3.2:latest", "model": "llama3.2:latest", "size": 2048000000},
+    {"name": "qwen2.5-coder:7b", "model": "qwen2.5-coder:7b", "size": 4500000000}
+  ],
+  "openai_models": [
+    {"id": "qwen2.5-coder:7b", "object": "model", "owned_by": "local.example.test"},
+    {"id": "llama3.2:latest", "object": "model", "owned_by": "local.example.test"}
+  ],
+  "default_api_key": "e2e-llm-api-key-001",
+  "canned_responses": {
+    "default": {
+      "content": "Attack chain summary: Initial execution observed on synthetic host. Recommend host isolation and IOC watchlist update.",
+      "chunks": [
+        "Attack chain summary: ",
+        "Initial execution observed on synthetic host. ",
+        "Recommend host isolation and IOC watchlist update."
+      ]
+    },
+    "copilot_triage": {
+      "content": "Attack Chain Summary: Encoded PowerShell observed in Splunk ES correlated with SentinelOne threat and RF malicious IP (198.51.100.10).\nClosing Note: Host isolated in SentinelOne, artifact quarantined, and notable triaged as True Positive.",
+      "chunks": [
+        "Attack Chain Summary: Encoded PowerShell observed in Splunk ES ",
+        "correlated with SentinelOne threat and RF malicious IP (198.51.100.10).\n",
+        "Closing Note: Host isolated in SentinelOne, artifact quarantined, and notable triaged as True Positive."
+      ]
+    }
+  }
+}

@@ -1,0 +1,813 @@
+{
+  "accounts": [
+    {
+      "id": "acc-100",
+      "name": "SOCLens Managed Org",
+      "accountType": "Paid",
+      "usageType": "mssp",
+      "totalLicenses": 1000,
+      "activeLicenses": 240,
+      "state": "active",
+      "unlimitedExpiration": true
+    },
+    {
+      "id": "acc-200",
+      "name": "Corp Direct Org",
+      "accountType": "Paid",
+      "usageType": "customer",
+      "totalLicenses": 200,
+      "activeLicenses": 45,
+      "state": "active",
+      "unlimitedExpiration": true
+    }
+  ],
+  "sites": [
+    {
+      "id": "100101",
+      "name": "MDR-1001",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "state": "active",
+      "siteType": "Paid",
+      "sku": "Complete",
+      "suite": "Complete",
+      "totalLicenses": 100,
+      "activeLicenses": 32,
+      "unlimitedLicenses": false,
+      "unlimitedExpiration": true,
+      "inherits": false,
+      "isDefault": false,
+      "description": "Primary MDR template tenant 1001",
+      "registrationToken": "reg-tok-mdr-1001"
+    },
+    {
+      "id": "100102",
+      "name": "MDR-1002",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "state": "active",
+      "siteType": "Paid",
+      "sku": "Complete",
+      "suite": "Complete",
+      "totalLicenses": 50,
+      "activeLicenses": 12,
+      "unlimitedLicenses": false,
+      "unlimitedExpiration": true,
+      "inherits": true,
+      "isDefault": false,
+      "description": "MDR tenant 1002 clone target",
+      "registrationToken": "reg-tok-mdr-1002"
+    },
+    {
+      "id": "200101",
+      "name": "MSSP-2001",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "state": "active",
+      "siteType": "Paid",
+      "sku": "Control",
+      "suite": "Control",
+      "totalLicenses": 80,
+      "activeLicenses": 18,
+      "unlimitedLicenses": false,
+      "unlimitedExpiration": true,
+      "inherits": true,
+      "isDefault": false,
+      "description": "MSSP tenant 2001",
+      "registrationToken": "reg-tok-mssp-2001"
+    },
+    {
+      "id": "300101",
+      "name": "Corp-Sandbox-3001",
+      "accountId": "acc-200",
+      "accountName": "Corp Direct Org",
+      "state": "active",
+      "siteType": "Trial",
+      "sku": "Core",
+      "suite": "Core",
+      "totalLicenses": 25,
+      "activeLicenses": 5,
+      "unlimitedLicenses": false,
+      "unlimitedExpiration": true,
+      "inherits": true,
+      "isDefault": true,
+      "description": "Internal corp sandbox mapped to Other tier",
+      "registrationToken": "reg-tok-corp-3001"
+    },
+    {
+      "id": "100999",
+      "name": "MDR-9999-Expired",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "state": "expired",
+      "siteType": "Trial",
+      "sku": "Core",
+      "suite": "Core",
+      "totalLicenses": 10,
+      "activeLicenses": 0,
+      "unlimitedLicenses": false,
+      "unlimitedExpiration": false,
+      "expiration": "2026-01-01T00:00:00Z",
+      "inherits": true,
+      "isDefault": false,
+      "description": "Expired MDR trial site",
+      "registrationToken": "reg-tok-exp-9999"
+    }
+  ],
+  "default_policy": {
+    "mitigationMode": "protect",
+    "mitigationModeSuspicious": "detect",
+    "networkQuarantineOn": true,
+    "autoImmuneOn": true,
+    "researchOn": true,
+    "monitorOnExecute": true,
+    "monitorOnWrite": true,
+    "inherits": true,
+    "createdAt": "2026-01-01T00:00:00Z",
+    "updatedAt": "2026-11-25T00:00:00Z",
+    "userId": "usr-acct-admin",
+    "inheritedFrom": "account"
+  },
+  "policies": {
+    "100101": {
+      "mitigationMode": "protect",
+      "mitigationModeSuspicious": "protect",
+      "networkQuarantineOn": true,
+      "autoImmuneOn": true,
+      "researchOn": true,
+      "monitorOnExecute": true,
+      "monitorOnWrite": true,
+      "inherits": false,
+      "createdAt": "2026-02-01T00:00:00Z",
+      "updatedAt": "2026-11-25T00:00:00Z",
+      "userId": "usr-mdr-lead",
+      "inheritedFrom": "site"
+    },
+    "100102": {
+      "mitigationMode": "protect",
+      "mitigationModeSuspicious": "detect",
+      "networkQuarantineOn": true,
+      "autoImmuneOn": true,
+      "researchOn": true,
+      "monitorOnExecute": true,
+      "monitorOnWrite": true,
+      "inherits": true,
+      "createdAt": "2026-02-02T00:00:00Z",
+      "updatedAt": "2026-11-25T00:00:00Z",
+      "userId": "usr-acct-admin",
+      "inheritedFrom": "account"
+    },
+    "200101": {
+      "mitigationMode": "protect",
+      "mitigationModeSuspicious": "detect",
+      "networkQuarantineOn": false,
+      "autoImmuneOn": true,
+      "researchOn": true,
+      "monitorOnExecute": true,
+      "monitorOnWrite": true,
+      "inherits": true,
+      "createdAt": "2026-02-03T00:00:00Z",
+      "updatedAt": "2026-11-25T00:00:00Z",
+      "userId": "usr-acct-admin",
+      "inheritedFrom": "account"
+    },
+    "300101": {
+      "mitigationMode": "detect",
+      "mitigationModeSuspicious": "detect",
+      "networkQuarantineOn": false,
+      "autoImmuneOn": false,
+      "researchOn": true,
+      "monitorOnExecute": true,
+      "monitorOnWrite": false,
+      "inherits": true,
+      "createdAt": "2026-02-04T00:00:00Z",
+      "updatedAt": "2026-11-25T00:00:00Z",
+      "userId": "usr-acct-admin",
+      "inheritedFrom": "account"
+    }
+  },
+  "groups": [
+    {
+      "id": "grp-100101-ws",
+      "name": "MDR-1001 Workstations",
+      "siteId": "100101",
+      "accountId": "acc-100",
+      "isDefault": true,
+      "type": "static",
+      "totalAgents": 24
+    },
+    {
+      "id": "grp-100102-ws",
+      "name": "MDR-1002 Workstations",
+      "siteId": "100102",
+      "accountId": "acc-100",
+      "isDefault": true,
+      "type": "static",
+      "totalAgents": 12
+    },
+    {
+      "id": "grp-200101-srv",
+      "name": "MSSP-2001 Servers",
+      "siteId": "200101",
+      "accountId": "acc-100",
+      "isDefault": true,
+      "type": "static",
+      "totalAgents": 18
+    },
+    {
+      "id": "grp-300101-ws",
+      "name": "Corp-Sandbox Workstations",
+      "siteId": "300101",
+      "accountId": "acc-200",
+      "isDefault": true,
+      "type": "static",
+      "totalAgents": 5
+    }
+  ],
+  "users": [
+    {
+      "id": "usr-mdr-lead",
+      "email": "alice.mdr@example.test",
+      "fullName": "Alice MDR Lead",
+      "scope": "site",
+      "twoFaEnabled": true,
+      "twoFaConfigured": true,
+      "canGenerateApiToken": true,
+      "scopeRoles": [
+        {"id": "100101", "name": "MDR-1001", "roleId": "role-admin", "roleName": "Admin"}
+      ]
+    },
+    {
+      "id": "usr-mssp-ops",
+      "email": "bob.mssp@example.test",
+      "fullName": "Bob MSSP Ops",
+      "scope": "site",
+      "twoFaEnabled": false,
+      "twoFaConfigured": false,
+      "canGenerateApiToken": false,
+      "scopeRoles": [
+        {"id": "200101", "name": "MSSP-2001", "roleId": "role-soc", "roleName": "SOC Analyst"}
+      ]
+    },
+    {
+      "id": "usr-acct-admin",
+      "email": "carol.acct@example.test",
+      "fullName": "Carol Account Admin",
+      "scope": "account",
+      "twoFaEnabled": true,
+      "twoFaConfigured": true,
+      "canGenerateApiToken": true,
+      "scopeRoles": [
+        {"id": "acc-100", "name": "SOCLens Managed Org", "roleId": "role-admin", "roleName": "Admin"}
+      ]
+    }
+  ],
+  "service_users": [
+    {
+      "id": "svc-soar-1001",
+      "name": "soar-mdr-1001",
+      "description": "Automated SOAR connector for MDR-1001",
+      "scope": "site",
+      "expirationDate": "2027-11-25T00:00:00Z",
+      "scopeRoles": [
+        {"id": "100101", "name": "MDR-1001", "roleId": "role-ir", "roleName": "IR Team"}
+      ]
+    },
+    {
+      "id": "svc-siem-acct",
+      "name": "siem-acct-reader",
+      "description": "Account-wide read-only SIEM forwarder",
+      "scope": "account",
+      "expirationDate": "2027-11-25T00:00:00Z",
+      "scopeRoles": [
+        {"id": "acc-100", "name": "SOCLens Managed Org", "roleId": "role-viewer", "roleName": "Viewer"}
+      ]
+    }
+  ],
+  "rbac_roles": [
+    {
+      "id": "role-admin",
+      "name": "Admin",
+      "description": "Full site and account administrative access",
+      "scope": "account",
+      "scopeId": "acc-100",
+      "predefinedRole": true
+    },
+    {
+      "id": "role-soc",
+      "name": "SOC Analyst",
+      "description": "Alert triage and threat analysis",
+      "scope": "account",
+      "scopeId": "acc-100",
+      "predefinedRole": true
+    },
+    {
+      "id": "role-ir",
+      "name": "IR Team",
+      "description": "Incident response and endpoint containment",
+      "scope": "account",
+      "scopeId": "acc-100",
+      "predefinedRole": true
+    },
+    {
+      "id": "role-viewer",
+      "name": "Viewer",
+      "description": "Read-only console visibility",
+      "scope": "account",
+      "scopeId": "acc-100",
+      "predefinedRole": true
+    }
+  ],
+  "exclusions": [
+    {
+      "id": "excl-acct-1",
+      "scope": "account",
+      "scopeId": "acc-100",
+      "scopeName": "SOCLens Managed Org",
+      "type": "white_hash",
+      "osType": "windows",
+      "value": "1111111111111111111111111111111111111111",
+      "mode": "suppress",
+      "description": "Account-wide approved agent updater binary",
+      "actions": ["detect", "upload"]
+    },
+    {
+      "id": "excl-src-acct-overlap",
+      "scope": "site",
+      "scopeId": "100101",
+      "scopeName": "MDR-1001",
+      "type": "white_hash",
+      "osType": "windows",
+      "value": "1111111111111111111111111111111111111111",
+      "mode": "suppress",
+      "description": "Site copy of account-inherited updater binary",
+      "actions": ["detect", "upload"]
+    },
+    {
+      "id": "excl-src-dup",
+      "scope": "site",
+      "scopeId": "100101",
+      "scopeName": "MDR-1001",
+      "type": "path",
+      "osType": "windows",
+      "value": "C:\\Tools\\Allowed\\",
+      "mode": "suppress",
+      "pathExclusionType": "folder",
+      "description": "Approved admin tooling folder",
+      "actions": ["detect"]
+    },
+    {
+      "id": "excl-dst-dup",
+      "scope": "site",
+      "scopeId": "100102",
+      "scopeName": "MDR-1002",
+      "type": "path",
+      "osType": "windows",
+      "value": "C:\\Tools\\Allowed",
+      "mode": "suppress",
+      "pathExclusionType": "folder",
+      "description": "Existing tooling exclusion on MDR-1002",
+      "actions": ["detect"]
+    },
+    {
+      "id": "excl-src-create-1",
+      "scope": "site",
+      "scopeId": "100101",
+      "scopeName": "MDR-1001",
+      "type": "path",
+      "osType": "linux",
+      "value": "/opt/monitoring/agent",
+      "mode": "suppress_dynamic_only",
+      "pathExclusionType": "subfolders",
+      "description": "Approved telemetry daemon",
+      "actions": ["detect"]
+    },
+    {
+      "id": "excl-src-create-long",
+      "scope": "site",
+      "scopeId": "100101",
+      "scopeName": "MDR-1001",
+      "type": "certificate",
+      "osType": "macos",
+      "value": "CERT-EXAMPLE-9988",
+      "mode": "suppress",
+      "description": "Synthetic long exclusion description exceeding 480 characters to verify that SentinelOne cloning truncates notes cleanly at 500 characters after prepending the [Cloned from MDR-1001] provenance tag. Padding segment alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 END-OF-LONG-SYNTHETIC-NOTE.",
+      "actions": ["detect"]
+    }
+  ],
+  "threats": [
+    {
+      "id": "thr-1001-1",
+      "threatInfo": {
+        "threatId": "thr-1001-1",
+        "threatName": "beacon_loader.exe",
+        "classification": "Trojan",
+        "confidenceLevel": "malicious",
+        "analystVerdict": "undefined",
+        "incidentStatus": "unresolved",
+        "mitigationStatus": "active",
+        "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "filePath": "C:\\Users\\jdoe\\AppData\\Local\\Temp\\beacon_loader.exe",
+        "createdAt": "2026-11-25T02:10:00Z"
+      },
+      "agentRealtimeInfo": {
+        "agentId": "ag-1001-2",
+        "agentComputerName": "srv-1001-db.example.test",
+        "siteId": "100101",
+        "siteName": "MDR-1001",
+        "accountId": "acc-100",
+        "accountName": "SOCLens Managed Org",
+        "groupId": "grp-100101-ws",
+        "agentOsType": "windows",
+        "agentLastLoggedInUserName": "svc_backup"
+      },
+      "agentDetectionInfo": {
+        "siteId": "100101",
+        "siteName": "MDR-1001",
+        "accountId": "acc-100",
+        "externalIp": "192.0.2.21"
+      }
+    },
+    {
+      "id": "thr-1002-1",
+      "threatInfo": {
+        "threatId": "thr-1002-1",
+        "threatName": "beacon_loader.exe",
+        "classification": "Trojan",
+        "confidenceLevel": "malicious",
+        "analystVerdict": "undefined",
+        "incidentStatus": "unresolved",
+        "mitigationStatus": "mitigated",
+        "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "filePath": "C:\\Users\\asmith\\Downloads\\beacon_loader.exe",
+        "createdAt": "2026-11-25T02:11:00Z"
+      },
+      "agentRealtimeInfo": {
+        "agentId": "ag-1002-1",
+        "agentComputerName": "laptop-1002-07.example.test",
+        "siteId": "100102",
+        "siteName": "MDR-1002",
+        "accountId": "acc-100",
+        "accountName": "SOCLens Managed Org",
+        "groupId": "grp-100102-ws",
+        "agentOsType": "windows",
+        "agentLastLoggedInUserName": "asmith"
+      },
+      "agentDetectionInfo": {
+        "siteId": "100102",
+        "siteName": "MDR-1002",
+        "accountId": "acc-100",
+        "externalIp": "198.51.100.22"
+      }
+    },
+    {
+      "id": "thr-2001-1",
+      "threatInfo": {
+        "threatId": "thr-2001-1",
+        "threatName": "beacon_loader.exe",
+        "classification": "Trojan",
+        "confidenceLevel": "malicious",
+        "analystVerdict": "undefined",
+        "incidentStatus": "unresolved",
+        "mitigationStatus": "active",
+        "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "filePath": "/tmp/beacon_loader",
+        "createdAt": "2026-11-25T02:12:00Z"
+      },
+      "agentRealtimeInfo": {
+        "agentId": "ag-2001-1",
+        "agentComputerName": "app-2001-web.example.test",
+        "siteId": "200101",
+        "siteName": "MSSP-2001",
+        "accountId": "acc-100",
+        "accountName": "SOCLens Managed Org",
+        "groupId": "grp-200101-srv",
+        "agentOsType": "linux",
+        "agentLastLoggedInUserName": "bwayne"
+      },
+      "agentDetectionInfo": {
+        "siteId": "200101",
+        "siteName": "MSSP-2001",
+        "accountId": "acc-100",
+        "externalIp": "203.0.113.99"
+      }
+    },
+    {
+      "id": "thr-1001-2",
+      "threatInfo": {
+        "threatId": "thr-1001-2",
+        "threatName": "procdump64.exe",
+        "classification": "Hacktool",
+        "confidenceLevel": "suspicious",
+        "analystVerdict": "true_positive",
+        "incidentStatus": "in_progress",
+        "mitigationStatus": "active",
+        "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "filePath": "C:\\Temp\\procdump64.exe",
+        "createdAt": "2026-11-25T02:14:50Z"
+      },
+      "agentRealtimeInfo": {
+        "agentId": "ag-1001-1",
+        "agentComputerName": "wkstn-1001-01.example.test",
+        "siteId": "100101",
+        "siteName": "MDR-1001",
+        "accountId": "acc-100",
+        "accountName": "SOCLens Managed Org",
+        "groupId": "grp-100101-ws",
+        "agentOsType": "windows",
+        "agentLastLoggedInUserName": "jdoe"
+      },
+      "agentDetectionInfo": {
+        "siteId": "100101",
+        "siteName": "MDR-1001",
+        "accountId": "acc-100",
+        "externalIp": "198.51.100.10"
+      }
+    },
+    {
+      "id": "thr-2001-2",
+      "threatInfo": {
+        "threatId": "thr-2001-2",
+        "threatName": "web_shell.jsp",
+        "classification": "WebShell",
+        "confidenceLevel": "malicious",
+        "analystVerdict": "undefined",
+        "incidentStatus": "unresolved",
+        "mitigationStatus": "active",
+        "sha1": "cccccccccccccccccccccccccccccccccccccccc",
+        "filePath": "/var/www/html/web_shell.jsp",
+        "createdAt": "2026-11-25T01:55:00Z"
+      },
+      "agentRealtimeInfo": {
+        "agentId": "ag-2001-1",
+        "agentComputerName": "app-2001-web.example.test",
+        "siteId": "200101",
+        "siteName": "MSSP-2001",
+        "accountId": "acc-100",
+        "accountName": "SOCLens Managed Org",
+        "groupId": "grp-200101-srv",
+        "agentOsType": "linux",
+        "agentLastLoggedInUserName": "www-data"
+      },
+      "agentDetectionInfo": {
+        "siteId": "200101",
+        "siteName": "MSSP-2001",
+        "accountId": "acc-100",
+        "externalIp": "203.0.113.99"
+      }
+    },
+    {
+      "id": "thr-3001-1",
+      "threatInfo": {
+        "threatId": "thr-3001-1",
+        "threatName": "test_eicar.com",
+        "classification": "PUA",
+        "confidenceLevel": "suspicious",
+        "analystVerdict": "false_positive",
+        "incidentStatus": "resolved",
+        "mitigationStatus": "mitigated",
+        "sha1": "dddddddddddddddddddddddddddddddddddddddd",
+        "filePath": "C:\\Users\\Public\\test_eicar.com",
+        "createdAt": "2026-11-25T01:20:00Z"
+      },
+      "agentRealtimeInfo": {
+        "agentId": "ag-3001-1",
+        "agentComputerName": "sandbox-3001-01.example.test",
+        "siteId": "300101",
+        "siteName": "Corp-Sandbox-3001",
+        "accountId": "acc-200",
+        "accountName": "Corp Direct Org",
+        "groupId": "grp-300101-ws",
+        "agentOsType": "windows",
+        "agentLastLoggedInUserName": "qa_user"
+      },
+      "agentDetectionInfo": {
+        "siteId": "300101",
+        "siteName": "Corp-Sandbox-3001",
+        "accountId": "acc-200",
+        "externalIp": "192.0.2.199"
+      }
+    }
+  ],
+  "timelines": {
+    "thr-1001-1": [
+      {
+        "id": "tl-1001-1",
+        "activityType": 4003,
+        "primaryDescription": "Threat beacon_loader.exe detected on srv-1001-db.example.test",
+        "createdAt": "2026-11-25T02:10:00Z"
+      },
+      {
+        "id": "tl-1001-2",
+        "activityType": 4010,
+        "primaryDescription": "Outbound connection attempt to 203.0.113.45 blocked",
+        "createdAt": "2026-11-25T02:10:15Z"
+      }
+    ],
+    "thr-1001-2": [
+      {
+        "id": "tl-1001-3",
+        "activityType": 4003,
+        "primaryDescription": "LSASS memory access attempt by procdump64.exe",
+        "createdAt": "2026-11-25T02:14:50Z"
+      }
+    ]
+  },
+  "cloud_alerts": [
+    {
+      "id": "cld-1001-1",
+      "createdAt": "2026-11-25T02:08:00Z",
+      "alertInfo": {
+        "alertId": "cld-1001-1",
+        "analystVerdict": "undefined",
+        "incidentStatus": "unresolved",
+        "createdAt": "2026-11-25T02:08:00Z"
+      },
+      "ruleInfo": {
+        "name": "STAR_Suspicious_Container_Escape",
+        "severity": "High"
+      },
+      "sourceProcessInfo": {
+        "name": "runc",
+        "fileHashSha1": "cccccccccccccccccccccccccccccccccccccccc"
+      },
+      "agentDetectionInfo": {
+        "name": "srv-1001-k8s.example.test",
+        "siteId": "100101",
+        "siteName": "MDR-1001",
+        "accountId": "acc-100",
+        "osType": "linux"
+      }
+    },
+    {
+      "id": "cld-2001-1",
+      "createdAt": "2026-11-25T01:58:00Z",
+      "alertInfo": {
+        "alertId": "cld-2001-1",
+        "analystVerdict": "undefined",
+        "incidentStatus": "unresolved",
+        "createdAt": "2026-11-25T01:58:00Z"
+      },
+      "ruleInfo": {
+        "name": "STAR_Reverse_Shell_Spawn",
+        "severity": "Critical"
+      },
+      "sourceProcessInfo": {
+        "name": "bash",
+        "fileHashSha1": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "agentDetectionInfo": {
+        "name": "api-2001-gw.example.test",
+        "siteId": "200101",
+        "siteName": "MSSP-2001",
+        "accountId": "acc-100",
+        "osType": "linux"
+      }
+    }
+  ],
+  "agents": [
+    {
+      "id": "ag-1001-1",
+      "computerName": "wkstn-1001-01.example.test",
+      "siteId": "100101",
+      "siteName": "MDR-1001",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "groupId": "grp-100101-ws",
+      "osType": "windows",
+      "isActive": true,
+      "infected": true,
+      "isDecommissioned": false,
+      "networkStatus": "connected",
+      "externalIp": "198.51.100.10",
+      "lastLoggedInUserName": "jdoe",
+      "tags": {"sentinelone": [{"key": "tier", "value": "mdr"}]}
+    },
+    {
+      "id": "ag-1001-2",
+      "computerName": "srv-1001-db.example.test",
+      "siteId": "100101",
+      "siteName": "MDR-1001",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "groupId": "grp-100101-ws",
+      "osType": "windows",
+      "isActive": true,
+      "infected": true,
+      "isDecommissioned": false,
+      "networkStatus": "connected",
+      "externalIp": "192.0.2.21",
+      "lastLoggedInUserName": "svc_backup",
+      "tags": {"sentinelone": []}
+    },
+    {
+      "id": "ag-1002-1",
+      "computerName": "laptop-1002-07.example.test",
+      "siteId": "100102",
+      "siteName": "MDR-1002",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "groupId": "grp-100102-ws",
+      "osType": "windows",
+      "isActive": true,
+      "infected": false,
+      "isDecommissioned": false,
+      "networkStatus": "connected",
+      "externalIp": "198.51.100.22",
+      "lastLoggedInUserName": "asmith",
+      "tags": {"sentinelone": []}
+    },
+    {
+      "id": "ag-2001-1",
+      "computerName": "app-2001-web.example.test",
+      "siteId": "200101",
+      "siteName": "MSSP-2001",
+      "accountId": "acc-100",
+      "accountName": "SOCLens Managed Org",
+      "groupId": "grp-200101-srv",
+      "osType": "linux",
+      "isActive": true,
+      "infected": true,
+      "isDecommissioned": false,
+      "networkStatus": "connected",
+      "externalIp": "203.0.113.99",
+      "lastLoggedInUserName": "bwayne",
+      "tags": {"sentinelone": []}
+    },
+    {
+      "id": "ag-3001-1",
+      "computerName": "sandbox-3001-01.example.test",
+      "siteId": "300101",
+      "siteName": "Corp-Sandbox-3001",
+      "accountId": "acc-200",
+      "accountName": "Corp Direct Org",
+      "groupId": "grp-300101-ws",
+      "osType": "windows",
+      "isActive": false,
+      "infected": false,
+      "isDecommissioned": false,
+      "networkStatus": "disconnected",
+      "externalIp": "192.0.2.199",
+      "lastLoggedInUserName": "qa_user",
+      "tags": {"sentinelone": []}
+    }
+  ],
+  "restrictions": [
+    {
+      "id": "rst-1001-1",
+      "scope": "site",
+      "scopeId": "100101",
+      "siteId": "100101",
+      "type": "black_hash",
+      "osType": "windows",
+      "value": "dddddddddddddddddddddddddddddddddddddddd",
+      "description": "Blocked synthetic malware hash for MDR-1001",
+      "source": "soclens"
+    },
+    {
+      "id": "rst-2001-1",
+      "scope": "site",
+      "scopeId": "200101",
+      "siteId": "200101",
+      "type": "black_hash",
+      "osType": "linux",
+      "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "description": "Blocked synthetic webshell hash for MSSP-2001",
+      "source": "soclens"
+    }
+  ],
+  "activities": [
+    {
+      "id": "act-1001",
+      "activityType": 5001,
+      "primaryDescription": "Agent wkstn-1001-01.example.test disconnected from network by soc_analyst",
+      "siteId": "100101",
+      "accountId": "acc-100",
+      "agentId": "ag-1001-1",
+      "threatId": "thr-1001-2",
+      "createdAt": "2026-11-25T02:16:00Z"
+    },
+    {
+      "id": "act-1002",
+      "activityType": 4008,
+      "primaryDescription": "Threat thr-1002-1 mitigated on laptop-1002-07.example.test",
+      "siteId": "100102",
+      "accountId": "acc-100",
+      "agentId": "ag-1002-1",
+      "threatId": "thr-1002-1",
+      "createdAt": "2026-11-25T02:12:00Z"
+    },
+    {
+      "id": "act-1003",
+      "activityType": 3002,
+      "primaryDescription": "Exclusion created on MDR-1001 for /opt/monitoring/agent",
+      "siteId": "100101",
+      "accountId": "acc-100",
+      "createdAt": "2026-11-25T01:50:00Z"
+    }
+  ]
+}

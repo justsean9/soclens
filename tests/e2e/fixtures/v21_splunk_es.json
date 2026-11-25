@@ -1,0 +1,750 @@
+{
+  "findings": [
+    {
+      "event_id": "fnd-1001-a",
+      "finding_id": "fnd-1001-a@@notable@@1001",
+      "_time": "2026-11-25T02:15:00Z",
+      "create_time": "2026-11-25T02:15:00Z",
+      "update_time": "2026-11-25T02:20:00Z",
+      "tenant_id": "1001",
+      "urgency": "critical",
+      "severity": "critical",
+      "status": "1",
+      "status_label": "New",
+      "status_name": "New",
+      "owner": "unassigned",
+      "owner_realname": "unassigned",
+      "disposition": "disposition:6",
+      "disposition_label": "Undetermined",
+      "disposition_name": "Undetermined",
+      "rule_name": "ES_Suspicious_LSASS_Dump",
+      "rule_title": "LSASS Memory Access on wkstn-1001-01.example.test",
+      "rule_description": "Detects credential dumping against LSASS process memory.",
+      "security_domain": "endpoint",
+      "risk_object": "wkstn-1001-01.example.test",
+      "risk_object_type": "system",
+      "risk_score": "85",
+      "src": "198.51.100.10",
+      "dest": "203.0.113.45",
+      "user": "jdoe@example.test",
+      "orig_sid": "1700000100.11",
+      "orig_rid": "0",
+      "notable_type": "notable",
+      "snow_ticket": "INC0010011",
+      "case_id": "CASE-1001-A",
+      "business_unit": "Finance"
+    },
+    {
+      "event_id": "fnd-1001-b",
+      "finding_id": "fnd-1001-b@@notable@@1002",
+      "_time": "2026-11-25T02:10:00Z",
+      "create_time": "2026-11-25T02:10:00Z",
+      "update_time": "2026-11-25T02:18:00Z",
+      "tenant_id": "1001",
+      "urgency": "high",
+      "severity": "high",
+      "status": "2",
+      "status_label": "In Progress",
+      "status_name": "In Progress",
+      "owner": "soc_analyst",
+      "owner_realname": "SOC Analyst",
+      "disposition": "disposition:1",
+      "disposition_label": "True Positive - Suspicious Activity",
+      "disposition_name": "True Positive - Suspicious Activity",
+      "rule_name": "ES_Outbound_C2_Beacon",
+      "rule_title": "Outbound C2 Beacon from srv-1001-db.example.test",
+      "rule_description": "Periodic outbound HTTPS beaconing to suspicious external IP.",
+      "security_domain": "network",
+      "risk_object": "203.0.113.45",
+      "risk_object_type": "system",
+      "risk_score": "70",
+      "src": "192.0.2.21",
+      "dest": "203.0.113.45",
+      "user": "svc_backup@example.test",
+      "orig_sid": "1700000100.12",
+      "orig_rid": "0",
+      "notable_type": "notable",
+      "snow_ticket": "INC0010012",
+      "file_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "event_id": "fnd-1002-org",
+      "finding_id": "fnd-1002-org@@notable@@1003",
+      "_time": "2026-11-25T02:05:00Z",
+      "create_time": "2026-11-25T02:05:00Z",
+      "update_time": "2026-11-25T02:05:00Z",
+      "org_id": "1002",
+      "urgency": "high",
+      "severity": "high",
+      "status": "1",
+      "status_label": "New",
+      "status_name": "New",
+      "owner": "unassigned",
+      "owner_realname": "unassigned",
+      "disposition": "disposition:6",
+      "disposition_label": "Undetermined",
+      "disposition_name": "Undetermined",
+      "rule_name": "ES_Encoded_PowerShell",
+      "rule_title": "Encoded PowerShell Execution on laptop-1002-07.example.test",
+      "rule_description": "Suspicious base64 encoded PowerShell command line.",
+      "security_domain": "endpoint",
+      "risk_object": "laptop-1002-07.example.test",
+      "risk_object_type": "system",
+      "risk_score": "65",
+      "src": "198.51.100.22",
+      "dest": "192.0.2.88",
+      "user": "asmith@example.test",
+      "orig_sid": "1700000200.21",
+      "orig_rid": "1",
+      "notable_type": "notable",
+      "case_id": "CASE-1002-B"
+    },
+    {
+      "event_id": "fnd-2001-cc",
+      "finding_id": "fnd-2001-cc@@notable@@1004",
+      "_time": "2026-11-25T01:55:00Z",
+      "create_time": "2026-11-25T01:55:00Z",
+      "update_time": "2026-11-25T01:55:00Z",
+      "Client_Code": "2001",
+      "urgency": "medium",
+      "severity": "medium",
+      "status": "3",
+      "status_label": "Pending",
+      "status_name": "Pending",
+      "owner": "tier2_analyst",
+      "owner_realname": "Tier2 Analyst",
+      "disposition": "disposition:6",
+      "disposition_label": "Undetermined",
+      "disposition_name": "Undetermined",
+      "rule_name": "ES_DMZ_Web_Probe",
+      "rule_title": "Web Vulnerability Probe on app-2001-web.example.test",
+      "rule_description": "Repeated path traversal attempts against DMZ web node.",
+      "security_domain": "network",
+      "risk_object": "app-2001-web.example.test",
+      "risk_object_type": "system",
+      "risk_score": "55",
+      "src": "203.0.113.99",
+      "dest": "192.0.2.150",
+      "user": "bwayne@example.test",
+      "orig_sid": "1700000300.31",
+      "orig_rid": "0",
+      "notable_type": "risk_event",
+      "custom_tag": "dmz-ingress"
+    },
+    {
+      "event_id": "fnd-2001-cust",
+      "finding_id": "fnd-2001-cust@@notable@@1005",
+      "_time": "2026-11-25T01:40:00Z",
+      "create_time": "2026-11-25T01:40:00Z",
+      "update_time": "2026-11-25T01:40:00Z",
+      "customer_id": "2001",
+      "urgency": "low",
+      "severity": "low",
+      "status": "4",
+      "status_label": "Resolved",
+      "status_name": "Resolved",
+      "owner": "tier2_analyst",
+      "owner_realname": "Tier2 Analyst",
+      "suppressed": true,
+      "disposition": "disposition:2",
+      "disposition_label": "Benign Positive - Suspicious But Expected",
+      "disposition_name": "Benign Positive - Suspicious But Expected",
+      "rule_name": "ES_Scheduled_Scanner",
+      "rule_title": "Suppressed Scheduled Scanner Activity",
+      "rule_description": "Authorized vulnerability scanner sweep.",
+      "security_domain": "network",
+      "risk_object": "scanner-2001.example.test",
+      "risk_object_type": "system",
+      "risk_score": "20",
+      "src": "198.51.100.50",
+      "dest": "192.0.2.150",
+      "user": "scanner_svc@example.test",
+      "orig_sid": "1700000300.32",
+      "orig_rid": "0",
+      "notable_type": "notable"
+    },
+    {
+      "event_id": "fnd-grp-1001",
+      "finding_id": "fnd-grp-1001@@group@@1006",
+      "_time": "2026-11-25T01:30:00Z",
+      "create_time": "2026-11-25T01:30:00Z",
+      "update_time": "2026-11-25T01:30:00Z",
+      "tenant_id": "1001",
+      "urgency": "high",
+      "severity": "high",
+      "status": "1",
+      "status_label": "New",
+      "status_name": "New",
+      "owner": "unassigned",
+      "owner_realname": "unassigned",
+      "disposition": "disposition:6",
+      "disposition_label": "Undetermined",
+      "disposition_name": "Undetermined",
+      "rule_name": "ES_Brute_Force_Group",
+      "rule_title": "Grouped Brute Force Attempts (Tenant 1001)",
+      "rule_description": "Finding group aggregating multiple failed SSH/RDP logins.",
+      "security_domain": "access",
+      "risk_object": "auth-1001.example.test",
+      "risk_object_type": "system",
+      "risk_score": "75",
+      "count_findings": 3,
+      "notable_type": "finding_group"
+    },
+    {
+      "event_id": "fnd-raw-only",
+      "finding_id": "fnd-raw-only@@notable@@1007",
+      "_time": "2026-11-25T02:00:00Z",
+      "create_time": "2026-11-25T02:00:00Z",
+      "update_time": "2026-11-25T02:00:00Z",
+      "TENANT_ID": "1001",
+      "urgency": "high",
+      "severity": "high",
+      "status": "1",
+      "status_label": "New",
+      "status_name": "New",
+      "owner": "unassigned",
+      "owner_realname": "unassigned",
+      "disposition": "disposition:6",
+      "disposition_label": "Undetermined",
+      "disposition_name": "Undetermined",
+      "rule_name": "ES_Raw_Marker_Detection",
+      "rule_title": "Suspicious Tool Marker in Raw Log (Tenant 1001)",
+      "rule_description": "Raw event log contained mimikatz marker.",
+      "security_domain": "endpoint",
+      "risk_object": "wkstn-1001-02.example.test",
+      "risk_object_type": "system",
+      "risk_score": "80",
+      "src": "198.51.100.77",
+      "user": "mross@example.test",
+      "orig_sid": "1700000100.77",
+      "orig_rid": "0",
+      "notable_type": "notable",
+      "_raw": "2026-11-25T02:00:00Z tenant_id=1001 src=198.51.100.77 msg=\"mimikatz_marker_raw\""
+    },
+    {
+      "event_id": "fnd-unassigned",
+      "finding_id": "fnd-unassigned@@notable@@1008",
+      "_time": "2026-11-25T01:15:00Z",
+      "create_time": "2026-11-25T01:15:00Z",
+      "update_time": "2026-11-25T01:15:00Z",
+      "urgency": "low",
+      "severity": "low",
+      "status": "1",
+      "status_label": "New",
+      "status_name": "New",
+      "owner": "unassigned",
+      "owner_realname": "unassigned",
+      "disposition": "disposition:6",
+      "disposition_label": "Undetermined",
+      "disposition_name": "Undetermined",
+      "rule_name": "ES_Unassigned_Host_Alert",
+      "rule_title": "Unattributed DNS Anomaly on lab-gw.example.test",
+      "rule_description": "Finding without explicit tenant attribution.",
+      "security_domain": "network",
+      "risk_object": "lab-gw.example.test",
+      "risk_object_type": "system",
+      "risk_score": "30",
+      "src": "192.0.2.250",
+      "dest": "203.0.113.250",
+      "orig_sid": "1700000900.99",
+      "orig_rid": "0",
+      "notable_type": "notable"
+    }
+  ],
+  "investigations": [
+    {
+      "investigation_guid": "inv-guid-1001",
+      "investigation_id": "ES-1001",
+      "name": "Tenant 1001 Credential Dumping & C2",
+      "description": "Correlated LSASS memory dump and outbound C2 beacon for tenant 1001.",
+      "investigation_type": "default",
+      "status": "2",
+      "status_name": "In Progress",
+      "urgency": "critical",
+      "owner": "soc_analyst",
+      "owner_realname": "SOC Analyst",
+      "disposition": "disposition:1",
+      "disposition_name": "True Positive - Suspicious Activity",
+      "sensitivity": "Amber",
+      "tenant_id": "1001",
+      "queue_id": "__system_default_queue__",
+      "findings": {
+        "incident_ids": ["fnd-1001-a", "fnd-1001-b"]
+      },
+      "count_findings": 2,
+      "create_time": "2026-11-25T02:16:00Z",
+      "update_time": "2026-11-25T02:22:00Z",
+      "custom_fields": {
+        "tenant_id": "1001",
+        "snow_ticket": "INC0010011"
+      }
+    },
+    {
+      "investigation_guid": "inv-guid-2001",
+      "investigation_id": "ES-2001",
+      "name": "Tenant 2001 Web Scan Investigation",
+      "description": "DMZ web probe triage for tenant 2001.",
+      "investigation_type": "default",
+      "status": "1",
+      "status_name": "New",
+      "urgency": "medium",
+      "owner": "unassigned",
+      "owner_realname": "unassigned",
+      "disposition": "disposition:6",
+      "disposition_name": "Undetermined",
+      "sensitivity": "Green",
+      "org_id": "2001",
+      "queue_id": "tier1-mdr-queue",
+      "findings": {
+        "incident_ids": ["fnd-2001-cc"]
+      },
+      "count_findings": 1,
+      "create_time": "2026-11-25T01:56:00Z",
+      "update_time": "2026-11-25T01:56:00Z"
+    }
+  ],
+  "notes": {
+    "inv-guid-1001": [
+      {
+        "id": "note-1001-1",
+        "title": "Initial Escalation",
+        "content": "**Summary:** Observed `procdump64.exe` targeting LSASS on `wkstn-1001-01.example.test`.",
+        "author": {"username": "soc_analyst"},
+        "record_type": "Investigation",
+        "record_title": "Tenant 1001 Credential Dumping & C2",
+        "source_type": "Incident",
+        "incident_id": "inv-guid-1001",
+        "files": [],
+        "create_time": "2026-11-25T02:17:00Z",
+        "update_time": "2026-11-25T02:17:00Z"
+      },
+      {
+        "id": "note-1001-2",
+        "title": "Network Pivot",
+        "content": "Confirmed outbound beacon to `203.0.113.45` matching RF risk rule.",
+        "author": {"username": "soc_analyst"},
+        "record_type": "Investigation",
+        "record_title": "Tenant 1001 Credential Dumping & C2",
+        "source_type": "Incident",
+        "incident_id": "inv-guid-1001",
+        "files": [],
+        "create_time": "2026-11-25T02:19:00Z",
+        "update_time": "2026-11-25T02:19:00Z"
+      }
+    ],
+    "fnd-1001-a": [
+      {
+        "id": "note-fnd-1001-1",
+        "title": "Triage Started",
+        "content": "Checking SentinelOne process tree for `wkstn-1001-01.example.test`.",
+        "author": {"username": "soc_analyst"},
+        "record_type": "Finding",
+        "record_title": "LSASS Memory Access on wkstn-1001-01.example.test",
+        "source_type": "Incident",
+        "incident_id": "fnd-1001-a",
+        "files": [],
+        "create_time": "2026-11-25T02:16:30Z",
+        "update_time": "2026-11-25T02:16:30Z"
+      }
+    ]
+  },
+  "history": {
+    "inv-guid-1001": [
+      {
+        "_time": "2026-11-25T02:16:00Z",
+        "finding_id": "fnd-1001-a",
+        "object_id": "inv-guid-1001",
+        "user": "soc_analyst",
+        "request_id": "req-hist-001",
+        "message": "Investigation created with 2 findings.",
+        "short_description": "Investigation created",
+        "change": "status: New -> In Progress",
+        "category": "investigation"
+      }
+    ],
+    "fnd-1001-a": [
+      {
+        "_time": "2026-11-25T02:15:30Z",
+        "finding_id": "fnd-1001-a",
+        "object_id": "fnd-1001-a",
+        "user": "system",
+        "request_id": "req-hist-002",
+        "message": "Finding generated by ES_Suspicious_LSASS_Dump.",
+        "short_description": "Finding created",
+        "change": "created",
+        "category": "finding"
+      }
+    ]
+  },
+  "queues": [
+    {
+      "id": "__system_default_queue__",
+      "title": "Analyst Queue",
+      "description": "Default Mission Control triage queue.",
+      "allow_override": true,
+      "wildcard_role_access": true
+    },
+    {
+      "id": "tier1-mdr-queue",
+      "title": "MDR Triage Queue",
+      "description": "Dedicated MDR tenant escalation queue.",
+      "allow_override": true,
+      "wildcard_role_access": true
+    }
+  ],
+  "event_attributes": [
+    {"field": "_time", "label": "Time"},
+    {"field": "rule_title", "label": "Title"},
+    {"field": "urgency", "label": "Urgency"},
+    {"field": "status", "label": "Status"},
+    {"field": "owner_realname", "label": "Owner"},
+    {"field": "disposition_label", "label": "Disposition"},
+    {"field": "src", "label": "Source"},
+    {"field": "dest", "label": "Destination"},
+    {"field": "user", "label": "User"},
+    {"field": "tenant_id", "label": "Tenant ID"},
+    {"field": "snow_ticket", "label": "ServiceNow Ticket"},
+    {"field": "case_id", "label": "Case ID"},
+    {"field": "business_unit", "label": "Business Unit"}
+  ],
+  "table_attributes": [
+    {"field": "_time", "label": "Time"},
+    {"field": "urgency", "label": "Urgency"},
+    {"field": "rule_title", "label": "Title"},
+    {"field": "tenant_id", "label": "Tenant ID"},
+    {"field": "status_label", "label": "Status"},
+    {"field": "owner_realname", "label": "Owner"}
+  ],
+  "jobs_by_sid": {
+    "1700000100.11": [
+      {
+        "_time": "2026-11-25T02:14:50Z",
+        "host": "wkstn-1001-01.example.test",
+        "src": "198.51.100.10",
+        "dest": "203.0.113.45",
+        "user": "jdoe@example.test",
+        "process_name": "procdump64.exe",
+        "command_line": "procdump64.exe -accepteula -ma lsass.exe lsass.dmp",
+        "tenant_id": "1001"
+      },
+      {
+        "_time": "2026-11-25T02:14:55Z",
+        "host": "wkstn-1001-01.example.test",
+        "src": "198.51.100.10",
+        "dest": "203.0.113.45",
+        "user": "jdoe@example.test",
+        "process_name": "powershell.exe",
+        "command_line": "powershell.exe -NoP -W Hidden -Enc SQBFAFgA",
+        "tenant_id": "1001"
+      }
+    ],
+    "1700000100.12": [
+      {
+        "_time": "2026-11-25T02:09:30Z",
+        "host": "srv-1001-db.example.test",
+        "src": "192.0.2.21",
+        "dest": "203.0.113.45",
+        "dest_port": "443",
+        "user": "svc_backup@example.test",
+        "tenant_id": "1001"
+      }
+    ],
+    "1700000200.21": [
+      {
+        "_time": "2026-11-25T02:04:10Z",
+        "host": "laptop-1002-07.example.test",
+        "src": "198.51.100.22",
+        "dest": "192.0.2.88",
+        "user": "asmith@example.test",
+        "process_name": "powershell.exe",
+        "org_id": "1002"
+      }
+    ]
+  },
+  "modaction_invocations": [
+    {
+      "sid": "1700000100.11",
+      "rid": "0",
+      "orig_sid": "1700000100.11",
+      "orig_rid": "0",
+      "action_name": "risk",
+      "action_status": "success",
+      "action_mode": "adhoc",
+      "status_description": "Risk score +85 applied to wkstn-1001-01.example.test",
+      "action_time": "2026-11-25T02:15:05Z"
+    },
+    {
+      "sid": "1700000100.11",
+      "rid": "0",
+      "orig_sid": "1700000100.11",
+      "orig_rid": "0",
+      "action_name": "notable",
+      "action_status": "success",
+      "action_mode": "saved",
+      "status_description": "Notable event created",
+      "action_time": "2026-11-25T02:15:01Z"
+    }
+  ],
+  "alert_actions": [
+    {
+      "name": "notable",
+      "content": {
+        "label": "Create Notable Event",
+        "description": "Creates an ES notable event.",
+        "param._cam": "{\"supports_adhoc\": false, \"category\": [\"Information Gathering\"], \"task\": [\"create\"]}"
+      }
+    },
+    {
+      "name": "risk",
+      "content": {
+        "label": "Risk Analysis",
+        "description": "Assigns a risk score to an asset or user.",
+        "param._cam": "{\"supports_adhoc\": true, \"category\": [\"Risk\"], \"task\": [\"create\"], \"required_params\": [\"risk_object\", \"risk_score\"]}",
+        "param.risk_object": "",
+        "param.risk_score": "25"
+      }
+    },
+    {
+      "name": "ping",
+      "content": {
+        "label": "Ping Host",
+        "description": "Runs ICMP connectivity check against target host.",
+        "param._cam": "{\"supports_adhoc\": true, \"category\": [\"Information Gathering\"], \"task\": [\"verify\"], \"field_name_params\": [\"dest\"]}",
+        "param.dest": ""
+      }
+    },
+    {
+      "name": "nslookup",
+      "content": {
+        "label": "NSLookup",
+        "description": "Performs DNS lookup for indicator.",
+        "param._cam": "{\"supports_adhoc\": true, \"category\": [\"Information Gathering\"], \"task\": [\"verify\"]}",
+        "param.host": ""
+      }
+    },
+    {
+      "name": "ea_servicenow_sync",
+      "content": {
+        "label": "ServiceNow Ticket Sync",
+        "description": "Synchronizes finding details with ServiceNow.",
+        "param._cam": "{\"supports_adhoc\": true, \"category\": [\"Ticketing\"], \"task\": [\"create\"], \"required_params\": [\"snow_ticket\"]}",
+        "param.snow_ticket": ""
+      }
+    },
+    {
+      "name": "s1_isolate",
+      "content": {
+        "label": "SentinelOne Host Isolate",
+        "description": "Requests SentinelOne network containment.",
+        "param._cam": "{\"supports_adhoc\": true, \"category\": [\"Containment\"], \"task\": [\"block\"], \"required_params\": [\"dest\"]}",
+        "param.dest": ""
+      }
+    }
+  ],
+  "correlations": [
+    {
+      "name": "ES_Suspicious_LSASS_Dump",
+      "acl": {"app": "SplunkEnterpriseSecuritySuite"},
+      "content": {
+        "search": "| tstats summariesonly=true count from datamodel=Endpoint.Processes where Processes.process_name=procdump64.exe by Processes.dest",
+        "disabled": false,
+        "action.notable": "1",
+        "action.risk": "1",
+        "action.correlationsearch.enabled": "1",
+        "action.correlationsearch.label": "Suspicious LSASS Dump"
+      }
+    },
+    {
+      "name": "ES_Outbound_C2_Beacon",
+      "acl": {"app": "SplunkEnterpriseSecuritySuite"},
+      "content": {
+        "search": "| tstats summariesonly=true count from datamodel=Network_Traffic where All_Traffic.dest_port=443 by All_Traffic.src, All_Traffic.dest",
+        "disabled": false,
+        "action.notable": "1",
+        "action.risk": "1",
+        "action.correlationsearch.enabled": "1",
+        "action.correlationsearch.label": "Outbound C2 Beacon"
+      }
+    },
+    {
+      "name": "ES_Disabled_Test_Rule",
+      "acl": {"app": "SplunkEnterpriseSecuritySuite"},
+      "content": {
+        "search": "| makeresults | eval test=1",
+        "disabled": true,
+        "action.notable": "1",
+        "action.risk": "0",
+        "action.correlationsearch.enabled": "0",
+        "action.correlationsearch.label": "Disabled Test Rule"
+      }
+    }
+  ],
+  "threat_intel": {
+    "ip_intel": [
+      {
+        "_key": "ti-ip-001",
+        "ip": "203.0.113.45",
+        "description": "Synthetic C2 infrastructure node",
+        "threat_key": "e2e_c2_feed"
+      }
+    ],
+    "domain_intel": [
+      {
+        "_key": "ti-dom-001",
+        "domain": "c2-node.example.test",
+        "description": "Synthetic C2 domain",
+        "threat_key": "e2e_c2_feed"
+      }
+    ],
+    "file_intel": [
+      {
+        "_key": "ti-file-001",
+        "file_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "file_name": "beacon_loader.exe",
+        "description": "Synthetic beacon payload hash",
+        "threat_key": "e2e_malware_feed"
+      }
+    ]
+  },
+  "assets": [
+    {
+      "id": "wkstn-1001-01.example.test",
+      "_last_updated": ["2026-11-25T00:00:00Z"],
+      "_sources": ["s1_inventory"],
+      "asset": ["wkstn-1001-01.example.test"],
+      "dns": ["wkstn-1001-01.example.test"],
+      "ip": ["198.51.100.10"],
+      "mac": ["00:53:00:00:10:01"],
+      "nt_host": ["wkstn-1001-01"],
+      "bunit": ["Finance"],
+      "category": ["workstation"],
+      "owner": ["jdoe@example.test"],
+      "priority": ["high"]
+    },
+    {
+      "id": "laptop-1002-07.example.test",
+      "_last_updated": ["2026-11-25T00:00:00Z"],
+      "_sources": ["s1_inventory"],
+      "asset": ["laptop-1002-07.example.test"],
+      "dns": ["laptop-1002-07.example.test"],
+      "ip": ["198.51.100.22"],
+      "mac": ["00:53:00:00:10:02"],
+      "nt_host": ["laptop-1002-07"],
+      "bunit": ["Engineering"],
+      "category": ["laptop"],
+      "owner": ["asmith@example.test"],
+      "priority": ["medium"]
+    }
+  ],
+  "identities": [
+    {
+      "id": "jdoe@example.test",
+      "identity": ["jdoe@example.test", "jdoe"],
+      "email": ["jdoe@example.test"],
+      "bunit": ["Finance"],
+      "category": ["employee"],
+      "priority": ["high"],
+      "watchlist": ["false"]
+    },
+    {
+      "id": "asmith@example.test",
+      "identity": ["asmith@example.test", "asmith"],
+      "email": ["asmith@example.test"],
+      "bunit": ["Engineering"],
+      "category": ["employee"],
+      "priority": ["medium"],
+      "watchlist": ["false"]
+    }
+  ],
+  "asset_lookup_rows": [
+    {
+      "asset": "wkstn-1001-01.example.test",
+      "ip": "198.51.100.10",
+      "nt_host": "wkstn-1001-01",
+      "bunit": "Finance",
+      "owner": "jdoe@example.test",
+      "priority": "high"
+    },
+    {
+      "asset": "laptop-1002-07.example.test",
+      "ip": "198.51.100.22",
+      "nt_host": "laptop-1002-07",
+      "bunit": "Engineering",
+      "owner": "asmith@example.test",
+      "priority": "medium"
+    }
+  ],
+  "identity_lookup_rows": [
+    {
+      "identity": "jdoe@example.test",
+      "email": "jdoe@example.test",
+      "bunit": "Finance",
+      "priority": "high"
+    },
+    {
+      "identity": "asmith@example.test",
+      "email": "asmith@example.test",
+      "bunit": "Engineering",
+      "priority": "medium"
+    }
+  ],
+  "risk_scores": [
+    {
+      "entity": "wkstn-1001-01.example.test",
+      "risk_score": "85",
+      "entity_type": "system",
+      "ers": "85"
+    },
+    {
+      "entity": "203.0.113.45",
+      "risk_score": "70",
+      "entity_type": "system",
+      "ers": "70"
+    },
+    {
+      "entity": "jdoe@example.test",
+      "risk_score": "60",
+      "entity_type": "user",
+      "ers": "60"
+    }
+  ],
+  "risk_events": [
+    {
+      "_time": "2026-11-25T02:15:05Z",
+      "risk_object": "wkstn-1001-01.example.test",
+      "risk_object_type": "system",
+      "risk_score": "85",
+      "source": "ES_Suspicious_LSASS_Dump",
+      "risk_message": "LSASS memory access detected on wkstn-1001-01.example.test"
+    },
+    {
+      "_time": "2026-11-25T02:10:05Z",
+      "risk_object": "203.0.113.45",
+      "risk_object_type": "system",
+      "risk_score": "70",
+      "source": "ES_Outbound_C2_Beacon",
+      "risk_message": "Outbound C2 beacon target"
+    }
+  ],
+  "users": [
+    {
+      "username": "soc_analyst",
+      "realname": "SOC Analyst",
+      "email": "soc_analyst@example.test",
+      "roles": ["ess_analyst", "admin"]
+    },
+    {
+      "username": "tier2_analyst",
+      "realname": "Tier2 Analyst",
+      "email": "tier2_analyst@example.test",
+      "roles": ["ess_analyst"]
+    }
+  ],
+  "default_job_results": [
+    {
+      "_time": "2026-11-25T02:00:00Z",
+      "host": "es-mock.example.test",
+      "count": "1"
+    }
+  ]
+}
