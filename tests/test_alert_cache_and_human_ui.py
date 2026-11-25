@@ -647,8 +647,26 @@ def test_ascii_art_toggle_defaults_off_and_auto_hides_after_10s(
     asyncio.run(_run())
 
 
-def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Path) -> None:
+def _strip_bgcolors_for_text(strip: object, needle: str) -> list[str]:
+    """Return hex bgcolor names for every segment overlapping ``needle`` in ``strip``."""
     from textual.strip import Strip
+
+    assert isinstance(strip, Strip)
+    text = strip.text
+    start = text.find(needle)
+    assert start != -1, f"{needle!r} not found in strip line {text!r}"
+    end = start + len(needle)
+    pos = 0
+    bgs: list[str] = []
+    for seg in strip._segments:
+        seg_end = pos + len(seg.text)
+        if seg_end > start and pos < end and seg.style and seg.style.bgcolor:
+            bgs.append(str(seg.style.bgcolor.name))
+        pos = seg_end
+    return bgs
+
+
+def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Path) -> None:
     from textual.widgets import Input, OptionList, TextArea
 
     from soclens.tui.modals import ContextMenuModal
@@ -664,22 +682,6 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             if col != -1:
                 return idx, col
         raise AssertionError(f"Could not find {needle!r} in SelectableRichLog")
-
-    def _strip_bgcolors_for_text(strip: Strip, needle: str) -> list[str]:
-        """Return hex bgcolor names for every segment overlapping ``needle`` in ``strip``."""
-        text = strip.text
-        start = text.find(needle)
-        if start == -1:
-            return []
-        end = start + len(needle)
-        pos = 0
-        bgs: list[str] = []
-        for seg in strip._segments:
-            seg_end = pos + len(seg.text)
-            if seg_end > start and pos < end and seg.style and seg.style.bgcolor:
-                bgs.append(str(seg.style.bgcolor.name))
-            pos = seg_end
-        return bgs
 
     # 1. SentinelOne bottom detail panel: visible drag highlight + button-like known field clicks
     s1_app = create_app(
@@ -731,9 +733,10 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             await pilot.pause()
             assert s1_app.get_selected_text() == "Suspicious binary"
             vis_y = cls_line - s1_log.scroll_offset.y
-            assert "#f2cc60" in _strip_bgcolors_for_text(
-                s1_log.render_line(vis_y), "Suspicious binary"
-            )
+            sel_strip = s1_log.render_line(vis_y)
+            assert "#f2cc60" in _strip_bgcolors_for_text(sel_strip, "Suspicious binary")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(sel_strip, "execution")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(sel_strip, "from")
 
             await pilot.click(offset=(drag_start_x + 3, sy), button=3)
             await pilot.pause()
@@ -772,9 +775,10 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             await pilot.pause()
             assert not isinstance(s1_app.screen, ContextMenuModal)
             assert s1_app.get_selected_text() == "services"
-            assert "#f2cc60" in _strip_bgcolors_for_text(
-                s1_log.render_line(proc_vis_y), "services"
-            )
+            proc_strip = s1_log.render_line(proc_vis_y)
+            assert "#f2cc60" in _strip_bgcolors_for_text(proc_strip, "services")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(proc_strip, "Process")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(proc_strip, ".exe")
             s1_app.screen.clear_selection()
             await pilot.pause()
 
@@ -851,21 +855,56 @@ def test_bottom_panel_highlight_and_right_click_s1_and_rf_playbooks(tmp_path: Pa
             await pilot.pause()
             assert not isinstance(rf_app.screen, ContextMenuModal)
 
-            # B. Drag highlight "observed" in free-text Explanation -> visible #f2cc60 + right-click opens search
+            # B. Drag highlight "observed" in free-text Explanation -> ONLY "observed" is highlighted (#f2cc60)
             obs_line, obs_col = await _find_line_and_col(rf_log, "observed")
             rf_log.scroll_to(y=max(0, obs_line - 1), animate=False)
             await pilot.pause()
             osy = rf_log.content_region.y + (obs_line - int(round(rf_log.scroll_y)))
             osx = rf_log.content_region.x + obs_col
             await pilot.mouse_down(offset=(osx, osy))
+            await pilot.hover(offset=(osx + 3, osy))
             await pilot.hover(offset=(osx + len("observed") - 1, osy))
             await pilot.mouse_up(offset=(osx + len("observed") - 1, osy))
             await pilot.pause()
             assert rf_app.get_selected_text() == "observed"
             obs_vis_y = obs_line - rf_log.scroll_offset.y
-            assert "#f2cc60" in _strip_bgcolors_for_text(
-                rf_log.render_line(obs_vis_y), "observed"
-            )
+            obs_strip = rf_log.render_line(obs_vis_y)
+            assert "#f2cc60" in _strip_bgcolors_for_text(obs_strip, "observed")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(obs_strip, "Typosquatted")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(obs_strip, "portal")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(obs_strip, "hosting")
+
+            # Also verify start-of-line (vis_start == 0) and end-of-line (vis_end == line_len) slices
+            line_text = rf_log.lines[obs_line].text
+            rf_app.screen.clear_selection()
+            await pilot.pause()
+            await pilot.mouse_down(offset=(rf_log.content_region.x, osy))
+            await pilot.hover(offset=(rf_log.content_region.x + 5, osy))
+            await pilot.mouse_up(offset=(rf_log.content_region.x + 5, osy))
+            await pilot.pause()
+            start_strip = rf_log.render_line(obs_vis_y)
+            assert "#f2cc60" in _strip_bgcolors_for_text(start_strip, start_strip.text[:6])
+            assert "#f2cc60" not in _strip_bgcolors_for_text(start_strip, "observed")
+
+            rf_app.screen.clear_selection()
+            await pilot.pause()
+            end_x1 = rf_log.content_region.x + line_text.index("hosting")
+            end_x2 = rf_log.content_region.x + obs_strip.cell_length - 1
+            await pilot.mouse_down(offset=(end_x1, osy))
+            await pilot.hover(offset=(end_x2, osy))
+            await pilot.mouse_up(offset=(end_x2, osy))
+            await pilot.pause()
+            end_strip = rf_log.render_line(obs_vis_y)
+            assert "#f2cc60" in _strip_bgcolors_for_text(end_strip, "hosting")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(end_strip, "observed")
+
+            # Re-select "observed" and open right-click search menu
+            rf_app.screen.clear_selection()
+            await pilot.pause()
+            await pilot.mouse_down(offset=(osx, osy))
+            await pilot.hover(offset=(osx + len("observed") - 1, osy))
+            await pilot.mouse_up(offset=(osx + len("observed") - 1, osy))
+            await pilot.pause()
             await pilot.click(offset=(osx + 2, osy), button=3)
             await pilot.pause()
             assert isinstance(rf_app.screen, ContextMenuModal)
@@ -963,6 +1002,9 @@ def test_datatable_highlight_and_known_cell_right_click(tmp_path: Path) -> None:
                     bgs.append(str(seg.style.bgcolor.name))
                 pos = seg_end
             assert "#f2cc60" in bgs
+            assert "#f2cc60" not in _strip_bgcolors_for_text(sel_strip, "FIN-WKSTN-07")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(sel_strip, "Resolved")
+            assert "#f2cc60" not in _strip_bgcolors_for_text(sel_strip, sha1[12:])
 
     asyncio.run(_run())
 

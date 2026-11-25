@@ -125,11 +125,16 @@ def _apply_selection_highlight(
         sel_style = _DEFAULT_SELECTION_STYLE
     else:
         sel_style = sel_style + Style(bold=True)
-    parts = strip.divide([vis_start, vis_end])
-    if len(parts) == 3:
-        before, middle, after = parts
-        return Strip.join([before, _apply_post_style(middle, sel_style), after])
-    return _apply_post_style(strip, sel_style)
+    if vis_start == 0 and vis_end >= line_len:
+        return _apply_post_style(strip, sel_style)
+    if vis_start == 0:
+        middle, after = strip.divide([vis_end, line_len])
+        return Strip.join([_apply_post_style(middle, sel_style), after])
+    if vis_end >= line_len:
+        before, middle = strip.divide([vis_start, line_len])
+        return Strip.join([before, _apply_post_style(middle, sel_style)])
+    before, middle, after = strip.divide([vis_start, vis_end, line_len])
+    return Strip.join([before, _apply_post_style(middle, sel_style), after])
 
 
 class SelectableRichLog(RichLog):
@@ -267,9 +272,9 @@ class SelectableRichLog(RichLog):
                     break
                 cells += get_character_cell_size(ch)
                 char_x += 1
-        strip = strip.apply_offsets(char_x, line_index)
         strip = self._apply_pivot_button_style(strip)
-        return _apply_selection_highlight(self, strip, line_index, line_text, scroll_x)
+        strip = _apply_selection_highlight(self, strip, line_index, line_text, scroll_x)
+        return strip.apply_offsets(char_x, line_index)
 
 
 class DoubleClickDataTable(DataTable[Any]):
@@ -332,15 +337,14 @@ class DoubleClickDataTable(DataTable[Any]):
         if scroll_x > 0:
             left_strip = self._render_line(line_index, 0, scroll_x, self.rich_style)
             char_x = len(left_strip.text)
-        strip = strip.apply_offsets(char_x, line_index)
-        if self.text_selection is None:
-            return strip
-        if scroll_x > 0:
-            full_w = max(self.virtual_size.width, self.size.width)
-            full_text = self._render_line(line_index, 0, full_w, self.rich_style).text
-        else:
-            full_text = strip.text
-        return _apply_selection_highlight(self, strip, line_index, full_text, scroll_x)
+        if self.text_selection is not None:
+            if scroll_x > 0:
+                full_w = max(self.virtual_size.width, self.size.width)
+                full_text = self._render_line(line_index, 0, full_w, self.rich_style).text
+            else:
+                full_text = strip.text
+            strip = _apply_selection_highlight(self, strip, line_index, full_text, scroll_x)
+        return strip.apply_offsets(char_x, line_index)
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
         """Extract highlighted cell text from rendered ``DataTable`` rows."""
