@@ -766,6 +766,23 @@ class SocLensApp(App[None]):
     #res-links-timeframe {
         width: 12;
     }
+    #res-mood-strip {
+        height: 4;
+        width: 1fr;
+        padding: 0 1;
+        background: #101726;
+    }
+    #res-mood-art {
+        width: 24;
+        height: 4;
+        content-align: left middle;
+    }
+    #res-mood-caption {
+        width: 1fr;
+        height: 4;
+        padding-left: 1;
+        content-align: left middle;
+    }
     .-compact-narrow #res-toolbar {
         layout: grid;
         grid-size: 3;

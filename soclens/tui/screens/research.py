@@ -37,6 +37,7 @@ from soclens.research import (
 from soclens.tui.filters import SPLUNK_TIME_PRESETS
 from soclens.tui.modals import OSINTSourcesModal
 from soclens.tui.pivot import PivotPayload
+from soclens.tui.research_art import ResearchMoodBanner, determine_research_mood
 from soclens.tui.research_formatters import (
     build_research_findings,
     build_search_summary_bar,
@@ -292,6 +293,7 @@ class ResearchPane(BaseSocPane):
                 yield Checkbox("Deep Lookup", value=False, id="res-deep-check", compact=True)
                 yield Button("Export JSON", id="res-export-json-btn", compact=True)
 
+        yield ResearchMoodBanner(id="res-mood-strip")
         yield Static("", id="res-summary-bar", classes="rf-summary-bar", markup=False)
 
         with Container(id="res-workspace", classes="split-workspace"):
@@ -1064,6 +1066,9 @@ class ResearchPane(BaseSocPane):
             "rf": "Recorded Future",
         }.get(source_mode, source_mode)
         self.set_status(f"Searching ({mode_desc}) for '{query}'...")
+        self.query_one("#res-mood-strip", ResearchMoodBanner).set_mood(
+            determine_research_mood(None, searching=True, query=query)
+        )
         self._investigate_worker(
             seq,
             query,
@@ -1125,6 +1130,9 @@ class ResearchPane(BaseSocPane):
         self._current_dossier = dossier
         self._all_findings = build_research_findings(dossier)
         self._selected_index = 0
+        self.query_one("#res-mood-strip", ResearchMoodBanner).set_mood(
+            determine_research_mood(dossier)
+        )
         self._render_master_table()
         self._render_detail_panel()
         findings_cnt = max(0, len(self._all_findings) - 1)
@@ -1321,6 +1329,9 @@ class ResearchPane(BaseSocPane):
             log_widget.scroll_home(animate=False)
             self.query_one("#res-detail-header", Static).update(
                 Text(f"Error: {context}", style="bold red")
+            )
+            self.query_one("#res-mood-strip", ResearchMoodBanner).set_mood(
+                determine_research_mood(None, error=detail)
             )
 
         self.run_on_ui(_render_err)
