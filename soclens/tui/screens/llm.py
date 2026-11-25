@@ -21,7 +21,7 @@ from soclens.config import (
 )
 from soclens.llm import SOC_PROMPT_TEMPLATES, LocalLLMClient, LocalLLMError
 from soclens.tui.pivot import format_copilot_context
-from soclens.tui.screens.base import BaseSocPane, extract_richlog_text
+from soclens.tui.screens.base import BaseSocPane, SelectableRichLog, extract_richlog_text
 
 _MANUAL_MODEL_VALUE = "__manual__"
 
@@ -143,7 +143,7 @@ class LocalLLMPane(BaseSocPane):
             yield Button("Detach Ctx", id="llm-clear-context-btn", compact=True)
 
         yield Static("", id="llm-context-badge", classes="rf-summary-bar", markup=False)
-        yield RichLog(
+        yield SelectableRichLog(
             id="llm-transcript",
             classes="primary-log",
             highlight=False,

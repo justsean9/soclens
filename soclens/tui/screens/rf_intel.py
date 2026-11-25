@@ -28,7 +28,7 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from soclens.alert_cache import CACHE_SOURCE_RF
+from soclens.alert_cache import CACHE_SOURCE_RF, CACHE_SOURCE_RF_PLAYBOOK
 from soclens.client import RecordedFutureError
 from soclens.tui.filters import (
     ASSIGNEE_FILTER_BASE_OPTIONS,
@@ -115,6 +115,7 @@ from soclens.tui.rf_formatters import (
 from soclens.tui.screens.base import (
     BaseSocPane,
     DoubleClickDataTable,
+    SelectableRichLog,
     extract_richlog_text,
     extract_table_row_text,
 )
@@ -634,7 +635,7 @@ class RFIntelPane(BaseSocPane):
                     yield Button("Blur: ON", id="rf-blur-images-btn", variant="warning", compact=True)
                     yield Button("Triage...", id="rf-triage-status-btn", compact=True)
                     yield Button("Copy Detail", id="rf-copy-detail-btn", compact=True)
-                yield RichLog(
+                yield SelectableRichLog(
                     id="rf-log",
                     classes="detail-log",
                     highlight=False,
@@ -649,21 +650,79 @@ class RFIntelPane(BaseSocPane):
         self._tables_ready = True
         self._hydrated_from_cache: bool = False
         self._cache_fetched_at: float = 0.0
+        self._pb_cache_fetched_at: float = 0.0
         self._refresh_preset_options(select_id=self._active_preset_id)
         self._render_view()
         self._update_responsive_layout()
         self.call_after_refresh(self.hydrate_from_alert_cache)
 
+    def _hydrate_playbook_cache(self, cache: Any, *, force: bool = False) -> bool:
+        pb_entry = cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+        if pb_entry is None:
+            return False
+        if not force and self._datasets.get("playbook") and (
+            pb_entry.fetched_at <= getattr(self, "_pb_cache_fetched_at", 0.0)
+        ):
+            return False
+        self._datasets["playbook"] = list(pb_entry.items)
+        raw_total = pb_entry.meta.get("total")
+        self._dataset_totals["playbook"] = (
+            raw_total if isinstance(raw_total, int) else len(pb_entry.items)
+        )
+        pb_details = pb_entry.meta.get("details")
+        if isinstance(pb_details, dict):
+            for aid, detail in pb_details.items():
+                if aid and isinstance(detail, dict):
+                    key = ("playbook", str(aid))
+                    self._detail_cache[key] = detail
+                    self._auto_enriched_keys.add(key)
+        pb_img_keys = pb_entry.meta.get("image_keys")
+        if isinstance(pb_img_keys, dict):
+            for aid, entries in pb_img_keys.items():
+                if not isinstance(entries, list):
+                    continue
+                for rec in entries:
+                    if not isinstance(rec, (list, tuple)) or len(rec) != 3:
+                        continue
+                    eff_cat, sid, img_key = str(rec[0]), str(rec[1]), str(rec[2])
+                    cache_tuple = (eff_cat, str(aid), sid)
+                    if cache_tuple in self._image_cache and not self._image_cache[cache_tuple].get("error"):
+                        continue
+                    raw_bytes = cache.get_image_bytes(img_key)
+                    if raw_bytes:
+                        try:
+                            decoded = decode_image(raw_bytes)
+                            cropped_img, crop_box = auto_crop_margins(decoded)
+                            cropped_png = (
+                                encode_png(cropped_img) if crop_box is not None else raw_bytes
+                            )
+                            self._image_cache[cache_tuple] = {
+                                "bytes": raw_bytes,
+                                "decoded": decoded,
+                                "crop_checked": True,
+                                "crop_box": crop_box,
+                                "cropped_decoded": cropped_img,
+                                "cropped_png": cropped_png,
+                            }
+                        except Exception:
+                            pass
+        self._pb_cache_fetched_at = pb_entry.fetched_at
+        if self._active_mode == "playbook":
+            self._refresh_assignee_options()
+            self._render_view(schedule_auto_enrich=False)
+        return True
+
     def hydrate_from_alert_cache(self, *, force: bool = False) -> bool:
-        """Populate RF Alerts v3 from the local 24h alert cache when available."""
+        """Populate RF Alerts v3 and Playbook Alerts (with images) from the local 24h cache."""
         if not self._tables_ready:
             return False
         cache = getattr(self.app, "alert_cache", None)
         if cache is None:
             return False
+        pb_hydrated = self._hydrate_playbook_cache(cache, force=force)
         entry = cache.get(CACHE_SOURCE_RF)
         if entry is None:
-            return False
+            return pb_hydrated
         already_same_cache = (
             bool(self._datasets.get("alerts_v3"))
             and self._active_mode == "alerts_v3"
@@ -3290,7 +3349,9 @@ class RFIntelPane(BaseSocPane):
                     except Exception as exc:
                         _logger.debug("Auto-enrich cases batch failed: %s", exc)
             elif mode == "playbook":
-                def _fetch_pb(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+                def _fetch_pb(
+                    item: dict[str, Any],
+                ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
                     if self.is_app_shutting_down() or seq != self._enrich_seq:
                         return None
                     aid = str(item.get("id") or "").strip()
@@ -3298,9 +3359,7 @@ class RFIntelPane(BaseSocPane):
                     try:
                         if cat and cat != "-":
                             try:
-                                resp = self.client.get_playbook_alert(
-                                    cat, aid, panels=["status"]
-                                )
+                                resp = self.client.get_playbook_alert(cat, aid)
                             except ValueError:
                                 resp = self.client.get_playbook_alert_preview(aid)
                             except RecordedFutureError as exc:
@@ -3319,7 +3378,53 @@ class RFIntelPane(BaseSocPane):
                         if not detail.get("category") and cat and cat != "-":
                             detail = {**detail, "category": cat}
                         norm = normalize_playbook_alert(detail)
-                        return aid, norm
+                        eff_cat = str(
+                            norm.get("category")
+                            if norm.get("category") and norm.get("category") != "-"
+                            else (cat if cat and cat != "-" else "domain_abuse")
+                        )
+                        sc_ids = [str(s) for s in (norm.get("screenshot_ids") or []) if s][:4]
+                        cache = getattr(self.app, "alert_cache", None)
+                        for sid in sc_ids:
+                            if self.is_app_shutting_down() or seq != self._enrich_seq:
+                                break
+                            img_tuple = (eff_cat, aid, sid)
+                            if img_tuple in self._image_cache and not self._image_cache[img_tuple].get("error"):
+                                continue
+                            try:
+                                img_key = f"{eff_cat}__{aid}__{sid}"
+                                raw_bytes = (
+                                    cache.get_image_bytes(img_key) if cache is not None else None
+                                )
+                                if raw_bytes is None:
+                                    fetched = self.client.get_playbook_alert_image(
+                                        eff_cat, aid, sid
+                                    )
+                                    if isinstance(fetched, (bytes, bytearray)) and len(fetched) > 8:
+                                        raw_bytes = bytes(fetched)
+                                        if cache is not None:
+                                            cache.put_image_bytes(img_key, raw_bytes)
+                                if raw_bytes:
+                                    decoded = decode_image(raw_bytes)
+                                    cropped_img, crop_box = auto_crop_margins(decoded)
+                                    cropped_png = (
+                                        encode_png(cropped_img)
+                                        if crop_box is not None
+                                        else raw_bytes
+                                    )
+                                    self._image_cache[img_tuple] = {
+                                        "bytes": raw_bytes,
+                                        "decoded": decoded,
+                                        "crop_checked": True,
+                                        "crop_box": crop_box,
+                                        "cropped_decoded": cropped_img,
+                                        "cropped_png": cropped_png,
+                                    }
+                            except Exception as img_exc:
+                                self._image_cache[img_tuple] = {
+                                    "error": self.format_exception(img_exc)
+                                }
+                        return aid, norm, detail
                     except Exception as exc:
                         _logger.debug("Auto-enrich playbook %s failed: %s", aid, exc)
                         return None
@@ -3332,6 +3437,7 @@ class RFIntelPane(BaseSocPane):
                         res = fut.result()
                         if res is not None:
                             updates[res[0]] = res[1]
+                            full_details[res[0]] = res[2]
             elif mode == "alerts_v3":
                 def _fetch_v3(
                     item: dict[str, Any],

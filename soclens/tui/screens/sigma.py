@@ -34,7 +34,12 @@ from soclens.sigma import (
     parse_key_value_mapping,
     search_rules,
 )
-from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable, extract_richlog_text
+from soclens.tui.screens.base import (
+    BaseSocPane,
+    DoubleClickDataTable,
+    SelectableRichLog,
+    extract_richlog_text,
+)
 
 _SIGMA_COLUMN_SPECS: tuple[tuple[str, float, int], ...] = (
     ("rule_id", 0.18, 12),
@@ -274,7 +279,7 @@ class SigmaPane(BaseSocPane):
             yield Button("Copy Stanza", id="sigma-copy-stanza-btn", compact=True)
             yield Button("Copy YAML", id="sigma-copy-yaml-btn", compact=True)
             yield Button("Copyable View", id="sigma-copy-modal-btn", compact=True)
-        yield RichLog(id="sigma-log", highlight=False, markup=False, wrap=True)
+        yield SelectableRichLog(id="sigma-log", highlight=False, markup=False, wrap=True)
 
     def on_mount(self) -> None:
         table = self.query_one("#sigma-table", DataTable)

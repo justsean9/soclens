@@ -24,7 +24,7 @@ from soclens.tui.filters import SPLUNK_TIME_PRESETS
 from soclens.tui.pivot import PivotPayload, build_spl_from_pivot, make_pivot_text
 from soclens.tui.s1_formatters import format_s1_value as _format_human_value
 from soclens.tui.s1_formatters import pretty_s1_label as _pretty_field_label
-from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
+from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable, SelectableRichLog
 
 _TIME_PRESETS: list[tuple[str, str]] = list(SPLUNK_TIME_PRESETS)
 
@@ -209,7 +209,7 @@ class SplunkSearchPane(BaseSocPane):
                     classes="section-label",
                     markup=False,
                 )
-                yield RichLog(
+                yield SelectableRichLog(
                     id="splunk-search-detail",
                     classes="detail-log",
                     highlight=False,

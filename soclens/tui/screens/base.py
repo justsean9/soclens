@@ -10,11 +10,14 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.containers import VerticalScroll
 from textual.coordinate import Coordinate
 from textual.message import Message
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.widgets import DataTable, RichLog, Static
 from textual.widgets._data_table import RowKey
 
@@ -68,6 +71,55 @@ def extract_richlog_text(log_widget: RichLog) -> str:
         return ""
     extracted = [str(getattr(line, "text", line)).rstrip() for line in lines]
     return "\n".join(extracted).strip()
+
+
+class SelectableRichLog(RichLog):
+    """``RichLog`` subclass with native mouse-drag text highlighting and selection extraction."""
+
+    ALLOW_SELECT = True
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Extract the exact highlighted text across rendered ``RichLog`` lines."""
+        if not self.lines:
+            return None
+        full_text = "\n".join(line.text for line in self.lines)
+        extracted = selection.extract(full_text)
+        if not extracted:
+            return None
+        return extracted, "\n"
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        """Refresh visible lines immediately as the user drags a text highlight."""
+        self._line_cache.clear()
+        self.refresh()
+
+    def render_line(self, y: int) -> Strip:
+        """Render a viewport line and apply selection highlight styling when selected."""
+        strip = super().render_line(y)
+        selection = self.text_selection
+        if selection is None:
+            return strip
+        scroll_x, scroll_y = self.scroll_offset
+        span = selection.get_span(scroll_y + y)
+        if span is None:
+            return strip
+        start_x, end_x = span
+        line_len = strip.cell_length
+        vis_start = max(0, start_x - scroll_x)
+        vis_end = line_len if end_x == -1 else max(0, min(line_len, end_x - scroll_x))
+        if vis_start >= vis_end:
+            return strip
+        try:
+            sel_style = self.screen.get_component_rich_style("screen--selection")
+        except Exception:
+            sel_style = Style(bgcolor="#264f78", color="#ffffff")
+        if not sel_style:
+            sel_style = Style(bgcolor="#264f78", color="#ffffff")
+        parts = strip.divide([vis_start, vis_end])
+        if len(parts) == 3:
+            before, middle, after = parts
+            return Strip.join([before, middle.apply_style(sel_style), after])
+        return strip.apply_style(sel_style)
 
 
 class DoubleClickDataTable(DataTable[Any]):

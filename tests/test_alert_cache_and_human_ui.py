@@ -467,3 +467,110 @@ def test_global_highlight_selection_pivots_to_research_and_splunk(tmp_path: Path
             await pilot.pause()
 
     asyncio.run(_run())
+
+
+def test_selectable_richlog_highlights_and_extracts_selected_text(tmp_path: Path) -> None:
+    from textual.geometry import Offset
+    from textual.selection import Selection
+
+    from soclens.tui.screens.base import SelectableRichLog
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-rf-intel",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            log = app.query_one("#rf-log", SelectableRichLog)
+            log.clear()
+            log.write("Process: services.exe")
+            log.write("SHA-1: da39a3ee5e6b4b0d3255bfef95601890afd80709")
+            await pilot.pause()
+
+            sel = Selection(Offset(9, 0), Offset(21, 0))
+            extracted = log.get_selection(sel)
+            assert extracted is not None
+            assert extracted[0] == "services.exe"
+
+            # Apply selection to screen and verify SocLensApp.get_selected_text() returns it
+            app.screen.selections = {log: sel}
+            await pilot.pause()
+            assert app.get_selected_text() == "services.exe"
+            # Rendering line 0 with active selection must succeed without error
+            strip = log.render_line(0)
+            assert strip.cell_length > 0
+
+    asyncio.run(_run())
+
+
+def test_playbook_alerts_precache_details_and_images_without_enter(tmp_path: Path) -> None:
+    from soclens.tui.image_render import DecodedImage, encode_png
+
+    recent = _recent_iso(1)
+    rgb_rows = [bytes([40, 90, 180] * 8) for _ in range(8)]
+    png_bytes = encode_png(
+        DecodedImage(width=8, height=8, color_type=2, bit_depth=8, raw_size=0, rgb_rows=rgb_rows)
+    )
+
+    rf_client = MagicMock()
+    rf_client.search_alerts_v3.return_value = {"data": [], "counts": {"total": 0}}
+    rf_client.search_playbook_alerts.return_value = {
+        "data": [
+            {
+                "playbook_alert_id": "pb-img-1",
+                "category": "domain_abuse",
+                "status": "New",
+                "priority": "High",
+                "title": "spoof-bank.example",
+                "updated": recent,
+            }
+        ],
+        "counts": {"total": 1},
+    }
+    rf_client.get_playbook_alert.return_value = {
+        "data": {
+            "playbook_alert_id": "pb-img-1",
+            "category": "domain_abuse",
+            "panel_status": {"status": "New", "priority": "High", "entity_name": "spoof-bank.example"},
+            "panel_evidence_summary": {
+                "screenshots": [{"image_id": "img-abc", "description": "Landing page"}]
+            },
+        }
+    }
+    rf_client.get_playbook_alert_image.return_value = png_bytes
+
+    app = create_app(
+        client=rf_client,
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        preload_alerts=True,
+        alert_cache_refresh_seconds=0,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            # Preloader fetched Playbook Alert detail AND screenshot bytes into local cache
+            assert rf_client.get_playbook_alert.call_count == 1
+            assert rf_client.get_playbook_alert_image.call_count == 1
+            assert app.alert_cache.get_image_bytes("domain_abuse__pb-img-1__img-abc") == png_bytes
+
+            # Switching to RF Intel hydrates playbook details & decoded images immediately
+            app.activate_tab("tab-rf-intel")
+            await pilot.pause()
+            await pilot.pause()
+            rf_pane = app.query_one(RFIntelPane)
+            assert ("playbook", "pb-img-1") in rf_pane._detail_cache
+            img_entry = rf_pane._image_cache.get(("domain_abuse", "pb-img-1", "img-abc"))
+            assert img_entry is not None
+            assert img_entry.get("bytes") == png_bytes
+            assert img_entry.get("decoded") is not None
+
+    asyncio.run(_run())

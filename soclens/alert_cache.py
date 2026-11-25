@@ -19,11 +19,13 @@ from soclens.settings import get_setting_with_source
 logger = logging.getLogger("soclens.alert_cache")
 
 CACHE_SOURCE_RF = "rf_alerts_24h"
+CACHE_SOURCE_RF_PLAYBOOK = "rf_playbook_24h"
 CACHE_SOURCE_ES = "es_notables_24h"
 CACHE_SOURCE_S1 = "s1_threats_24h"
 
 ALL_CACHE_SOURCES: tuple[str, ...] = (
     CACHE_SOURCE_RF,
+    CACHE_SOURCE_RF_PLAYBOOK,
     CACHE_SOURCE_ES,
     CACHE_SOURCE_S1,
 )
@@ -121,6 +123,7 @@ class AlertCacheStore:
     def __init__(self, cache_dir: Path | str | None = None) -> None:
         self._lock = threading.RLock()
         self._entries: dict[str, AlertCacheEntry] = {}
+        self._images: dict[str, bytes] = {}
         self._cache_dir: Path | None = Path(cache_dir) if cache_dir is not None else None
         if self._cache_dir is not None:
             self.load_from_disk()
@@ -233,6 +236,58 @@ class AlertCacheStore:
             if entry is None:
                 return True
             return entry.age_seconds() >= max_age_seconds
+
+    def _image_path(self, image_key: str) -> Path | None:
+        if self._cache_dir is None:
+            return None
+        safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in image_key)
+        return self._cache_dir / "images" / f"{safe_name[:120]}.bin"
+
+    def put_image_bytes(self, image_key: str, data: bytes) -> None:
+        """Cache raw screenshot bytes in memory and on disk."""
+        if not image_key or not data:
+            return
+        payload = bytes(data)
+        with self._lock:
+            self._images[image_key] = payload
+            path = self._image_path(image_key)
+            if path is not None:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=".img.", suffix=".tmp", dir=str(path.parent)
+                    )
+                    try:
+                        with os.fdopen(fd, "wb") as fh:
+                            fh.write(payload)
+                        os.replace(tmp_name, path)
+                    except Exception:
+                        try:
+                            os.unlink(tmp_name)
+                        except OSError:
+                            pass
+                        raise
+                except Exception as exc:
+                    logger.debug("Failed to persist cached image %s: %s", image_key, exc)
+
+    def get_image_bytes(self, image_key: str) -> bytes | None:
+        """Return cached screenshot bytes from memory or disk if available."""
+        if not image_key:
+            return None
+        with self._lock:
+            mem = self._images.get(image_key)
+            if mem is not None:
+                return mem
+            path = self._image_path(image_key)
+            if path is not None and path.is_file():
+                try:
+                    data = path.read_bytes()
+                    if data:
+                        self._images[image_key] = data
+                        return data
+                except OSError:
+                    pass
+        return None
 
     def clear(self, source: str | None = None) -> None:
         """Clear one source or all sources from memory and disk."""

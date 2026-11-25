@@ -27,7 +27,7 @@ from soclens.tui.logging_bridge import (
     LogEntry,
     source_matches_filter,
 )
-from soclens.tui.screens.base import BaseSocPane
+from soclens.tui.screens.base import BaseSocPane, SelectableRichLog
 
 _LEVEL_STYLE: dict[str, tuple[str, str]] = {
     "DEBUG": ("[DEBUG]", "dim"),
@@ -143,7 +143,7 @@ class LogsPane(BaseSocPane):
             yield Button("Brand", id="logs-brand-btn", compact=True)
             yield Button(f"TZ: {format_timezone_label()}", id="logs-tz-btn", compact=True)
 
-        yield RichLog(
+        yield SelectableRichLog(
             id="app-log",
             classes="primary-log",
             highlight=False,

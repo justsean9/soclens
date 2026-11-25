@@ -58,7 +58,12 @@ from soclens.tui.s1_formatters import (
     render_s1_record_detail,
     summarize_mitigation_status,
 )
-from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable, extract_richlog_text
+from soclens.tui.screens.base import (
+    BaseSocPane,
+    DoubleClickDataTable,
+    SelectableRichLog,
+    extract_richlog_text,
+)
 from soclens.tui.screens.s1_modals import (
     CloneExclusionsModal,
     ConfirmDeleteSiteModal,
@@ -500,7 +505,7 @@ class SentinelOnePane(BaseSocPane):
                     yield Button("Overview", id="s1-view-overview-btn", variant="primary", compact=True)
                     yield Button("Raw JSON", id="s1-view-json-btn", compact=True)
                     yield Button("Copy Detail", id="s1-copy-detail-btn", compact=True)
-                yield RichLog(
+                yield SelectableRichLog(
                     id="s1-detail-log",
                     classes="detail-log",
                     highlight=False,

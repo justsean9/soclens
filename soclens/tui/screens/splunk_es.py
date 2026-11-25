@@ -61,7 +61,7 @@ from soclens.tui.pivot import emit_pivot, make_pivot_text
 from soclens.tui.rf_formatters import render_raw_json
 from soclens.tui.s1_formatters import format_s1_value as _format_human_value
 from soclens.tui.s1_formatters import pretty_s1_label as _pretty_field_label
-from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable
+from soclens.tui.screens.base import BaseSocPane, DoubleClickDataTable, SelectableRichLog
 from soclens.tui.screens.es_modals import (
     ESAdaptiveResponseModal,
     ESBulkTriageModal,
@@ -818,7 +818,7 @@ class SplunkESPane(BaseSocPane):
                     yield Button("Pivot F8", id="es-insp-pivot-search-btn", compact=True)
                     yield Button("Pivot S1", id="es-insp-pivot-s1-btn", compact=True)
                     yield Button("Copilot F7", id="es-insp-pivot-llm-btn", compact=True)
-                yield RichLog(
+                yield SelectableRichLog(
                     id="es-detail",
                     classes="detail-log",
                     highlight=False,

@@ -26,6 +26,7 @@ from textual.widgets import Button, Footer, Header, Select, Static, TabbedConten
 from soclens.alert_cache import (
     CACHE_SOURCE_ES,
     CACHE_SOURCE_RF,
+    CACHE_SOURCE_RF_PLAYBOOK,
     CACHE_SOURCE_S1,
     AlertCacheStore,
     get_alert_cache_refresh_seconds,
@@ -1759,6 +1760,17 @@ class SocLensApp(App[None]):
             return
         self.open_selection_pivot_menu(selected, origin=(6, 4))
 
+    def action_copy_selection(self) -> None:
+        """Copy currently highlighted text to the OS clipboard (Ctrl+Y / Copy Selection)."""
+        selected = self.get_selected_text()
+        if not selected:
+            return
+        from soclens.tui.clipboard import copy_text_to_clipboard
+
+        res = copy_text_to_clipboard(selected, app=self)
+        if res.success:
+            self.notify(f"Copied selection ({res.char_count:,} chars).", title="Clipboard")
+
     def on_mouse_down(self, event: events.MouseDown) -> None:
         """Right-clicking anywhere while text is highlighted opens the global Pivot menu."""
         if event.button != 3 or isinstance(self.screen, ModalScreen):
@@ -1956,10 +1968,11 @@ class SocLensApp(App[None]):
 
             tasks: list[tuple[str, Callable[[], None]]] = [
                 (CACHE_SOURCE_RF, self._preload_rf_alerts_24h),
+                (CACHE_SOURCE_RF_PLAYBOOK, self._preload_rf_playbook_24h),
                 (CACHE_SOURCE_ES, self._preload_es_notables_24h),
                 (CACHE_SOURCE_S1, self._preload_s1_threats_24h),
             ]
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="soclens-preload") as pool:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="soclens-preload") as pool:
                 futures = [pool.submit(fn) for _, fn in tasks]
                 for fut in futures:
                     with contextlib.suppress(Exception):
@@ -2087,6 +2100,151 @@ class SocLensApp(App[None]):
         except Exception as exc:
             self._log_preload_debug("RF alerts (24h)", exc)
 
+    def _preload_rf_playbook_24h(self) -> None:
+        if self._stop_event.is_set() or self._shutting_down:
+            return
+        if not self._custom_client_injected and not get_rf_token(required=False):
+            return
+        search_pb = getattr(self.client, "search_playbook_alerts", None)
+        if not callable(search_pb):
+            return
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            from soclens.tui.filters import build_playbook_date_range
+            from soclens.tui.rf_formatters import extract_playbook_alerts, normalize_playbook_alert
+
+            pb_range = build_playbook_date_range("last_24h")
+            call_kw: dict[str, Any] = {"limit": 100}
+            if pb_range:
+                call_kw["updated_range"] = pb_range
+            data = search_pb(**call_kw)
+            raw_items, total = extract_playbook_alerts(data)
+            normalized = [normalize_playbook_alert(item) for item in raw_items]
+            if self._stop_event.is_set() or self._shutting_down:
+                return
+
+            existing_entry = self.alert_cache.get(CACHE_SOURCE_RF_PLAYBOOK)
+            existing_details: dict[str, dict[str, Any]] = {}
+            if existing_entry is not None and isinstance(existing_entry.meta.get("details"), dict):
+                existing_details = {
+                    str(k): v
+                    for k, v in existing_entry.meta["details"].items()
+                    if isinstance(v, dict)
+                }
+
+            self.alert_cache.put(
+                CACHE_SOURCE_RF_PLAYBOOK,
+                normalized,
+                timeframe="last_24h",
+                meta={"total": total, "details": existing_details},
+            )
+            self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
+
+            if not normalized:
+                return
+
+            get_pb = getattr(self.client, "get_playbook_alert", None)
+            get_pb_preview = getattr(self.client, "get_playbook_alert_preview", None)
+            get_pb_img = getattr(self.client, "get_playbook_alert_image", None)
+            if not callable(get_pb) and not callable(get_pb_preview):
+                return
+
+            details_by_id: dict[str, dict[str, Any]] = {}
+            image_keys_by_alert: dict[str, list[tuple[str, str, str]]] = {}
+
+            def _fetch_pb_full(item: dict[str, Any]) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
+                if self._stop_event.is_set() or self._shutting_down:
+                    return "", None, None
+                aid = str(item.get("id") or "").strip()
+                cat = str(item.get("category") or "").strip()
+                if not aid:
+                    return "", None, None
+                detail = existing_details.get(aid)
+                if detail is None:
+                    try:
+                        resp: Any = None
+                        if cat and cat != "-" and callable(get_pb):
+                            try:
+                                resp = get_pb(cat, aid)
+                            except Exception:
+                                if callable(get_pb_preview):
+                                    resp = get_pb_preview(aid)
+                        elif callable(get_pb_preview):
+                            resp = get_pb_preview(aid)
+                        if isinstance(resp, dict):
+                            raw_d = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+                            if isinstance(raw_d, dict):
+                                detail = raw_d
+                    except Exception:
+                        detail = None
+                if not isinstance(detail, dict):
+                    return aid, None, None
+                if not detail.get("category") and cat and cat != "-":
+                    detail = {**detail, "category": cat}
+                norm = normalize_playbook_alert(detail)
+                eff_cat = str(
+                    norm.get("category")
+                    if norm.get("category") and norm.get("category") != "-"
+                    else (cat if cat and cat != "-" else "domain_abuse")
+                )
+                # Pre-fetch all screenshots for this Playbook Alert into local image cache
+                if callable(get_pb_img):
+                    sc_ids = [str(s) for s in (norm.get("screenshot_ids") or []) if s][:4]
+                    for sid in sc_ids:
+                        if self._stop_event.is_set() or self._shutting_down:
+                            break
+                        img_key = f"{eff_cat}__{aid}__{sid}"
+                        if self.alert_cache.get_image_bytes(img_key) is not None:
+                            continue
+                        try:
+                            raw_bytes = get_pb_img(eff_cat, aid, sid)
+                            if isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) > 8:
+                                self.alert_cache.put_image_bytes(img_key, bytes(raw_bytes))
+                        except Exception:
+                            pass
+                return aid, detail, norm
+
+            with ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="soclens-rf-pb"
+            ) as pool:
+                for aid, detail, norm in pool.map(_fetch_pb_full, normalized):
+                    if self._stop_event.is_set() or self._shutting_down:
+                        return
+                    if aid and detail is not None and norm is not None:
+                        details_by_id[aid] = detail
+                        for entry in normalized:
+                            if str(entry.get("id") or "") == aid:
+                                updated_norm = dict(norm)
+                                if updated_norm.get("category") == "-" and entry.get("category"):
+                                    updated_norm["category"] = entry["category"]
+                                if not detail.get("title") and entry.get("title"):
+                                    updated_norm["title"] = entry["title"]
+                                entry.update(updated_norm)
+                                eff_cat = str(entry.get("category") or "domain_abuse")
+                                sc_ids = [str(s) for s in (entry.get("screenshot_ids") or []) if s][:4]
+                                if sc_ids:
+                                    image_keys_by_alert[aid] = [
+                                        (eff_cat, sid, f"{eff_cat}__{aid}__{sid}") for sid in sc_ids
+                                    ]
+                                break
+
+            if self._stop_event.is_set() or self._shutting_down:
+                return
+            self.alert_cache.put(
+                CACHE_SOURCE_RF_PLAYBOOK,
+                normalized,
+                timeframe="last_24h",
+                meta={
+                    "total": total,
+                    "details": details_by_id,
+                    "image_keys": image_keys_by_alert,
+                },
+            )
+            self._notify_cache_updated(CACHE_SOURCE_RF_PLAYBOOK, len(normalized))
+        except Exception as exc:
+            self._log_preload_debug("RF Playbook alerts (24h)", exc)
+
     def _preload_es_notables_24h(self) -> None:
         if self._stop_event.is_set() or self._shutting_down:
             return
@@ -2211,6 +2369,7 @@ class SocLensApp(App[None]):
                 return
             tab_map = {
                 CACHE_SOURCE_RF: "tab-rf-intel",
+                CACHE_SOURCE_RF_PLAYBOOK: "tab-rf-intel",
                 CACHE_SOURCE_ES: "tab-splunk-es",
                 CACHE_SOURCE_S1: "tab-sentinelone",
             }

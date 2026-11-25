@@ -52,6 +52,7 @@ from soclens.tui.rf_formatters import (
 from soclens.tui.screens.base import (
     BaseSocPane,
     DoubleClickDataTable,
+    SelectableRichLog,
     extract_richlog_text,
     extract_table_row_text,
 )
@@ -312,7 +313,7 @@ class ResearchPane(BaseSocPane):
                     yield Button("Search Selected", id="res-pivot-btn", compact=True)
                     yield Button("Raw JSON", id="res-detail-mode-btn", compact=True)
                     yield Button("Copy Detail", id="res-copy-detail-btn", compact=True)
-                yield RichLog(
+                yield SelectableRichLog(
                     id="res-detail-log",
                     classes="detail-log",
                     highlight=False,
