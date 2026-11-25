@@ -345,3 +345,61 @@ def test_copilot_studio_d2e_post_sse_and_auto_routing() -> None:
         assert call1_kwargs["url"] == d2e_url
         assert call2_kwargs["method"] == "POST"
         assert "/conversations/d2e-conv-777?api-version=2022-03-01-preview" in call2_kwargs["url"]
+
+
+def test_copilot_directline_multi_turn_reuses_token_and_watermark() -> None:
+    session = MagicMock()
+    session.request.side_effect = [
+        # Turn 1: generate token -> start conv -> drain -> post turn 1 -> poll turn 1
+        _fake_response(200, {"token": "conv-tok-1"}),
+        _fake_response(201, {"conversationId": "dl-multi-1", "token": "conv-tok-1"}),
+        _fake_response(200, {"watermark": "0", "activities": []}),
+        _fake_response(200, {"id": "act-1"}),
+        _fake_response(
+            200,
+            {
+                "watermark": "2",
+                "activities": [{"type": "message", "from": {"id": "bot"}, "text": "Reply 1"}],
+            },
+        ),
+        # Turn 2 (new LocalLLMClient instance, passing saved conv_id + token + watermark):
+        # NO /tokens/generate call! Directly POST turn 2 -> GET activities?watermark=2
+        _fake_response(200, {"id": "act-2"}),
+        _fake_response(
+            200,
+            {
+                "watermark": "4",
+                "activities": [{"type": "message", "from": {"id": "bot"}, "text": "Reply 2"}],
+            },
+        ),
+    ]
+    cfg = get_local_llm_config(
+        provider="copilot_directline",
+        ms_directline_secret="web-channel-secret-1",
+    )
+    with LocalLLMClient(config=cfg, session=session) as c1:
+        r1 = c1.chat([{"role": "user", "content": "First question"}])
+        assert r1["content"] == "Reply 1"
+        assert r1["conversation_id"] == "dl-multi-1"
+        assert r1["conversation_token"] == "conv-tok-1"
+        assert r1["watermark"] == "2"
+
+    # Simulate LocalLLMPane creating a new LocalLLMClient for Turn 2
+    with LocalLLMClient(
+        config=cfg,
+        session=session,
+        conversation_id=r1["conversation_id"],
+        conversation_token=r1["conversation_token"],
+        watermark=r1["watermark"],
+    ) as c2:
+        r2 = c2.chat([{"role": "user", "content": "Follow-up question"}])
+        assert r2["content"] == "Reply 2"
+        assert r2["conversation_id"] == "dl-multi-1"
+        assert r2["watermark"] == "4"
+
+    # Confirm Turn 2 used conv-tok-1 and watermark=2 without calling /tokens/generate again
+    assert session.request.call_count == 7
+    turn2_post = session.request.call_args_list[5].kwargs
+    turn2_poll = session.request.call_args_list[6].kwargs
+    assert turn2_post["headers"]["Authorization"] == "Bearer conv-tok-1"
+    assert turn2_poll["params"] == {"watermark": "2"}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soclens"
-version = "2.3.1"
+version = "2.3.2"
 description = "SOCLens — Cross-platform SOC investigation workbench (TUI & CLI) for Recorded Future, Splunk, SentinelOne, Sigma, and Local LLM"
 readme = "README.md"
 license = { file = "LICENSE" }

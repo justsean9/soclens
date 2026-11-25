@@ -326,6 +326,8 @@ class LocalLLMClient:
         ms_security_poll_interval: float | str | None = None,
         agent_name: str | None = None,
         conversation_id: str | None = None,
+        conversation_token: str | None = None,
+        watermark: str | None = None,
         max_retries: int = 2,
         backoff_base: float = 0.5,
         stop_event: threading.Event | None = None,
@@ -444,6 +446,8 @@ class LocalLLMClient:
         self._stop_event = stop_event if stop_event is not None else threading.Event()
         self._owns_session = session is None
         self._initial_conversation_id = (conversation_id or "").strip() or None
+        self._initial_conversation_token = (conversation_token or "").strip() or None
+        self._initial_watermark = (watermark or "").strip() or None
         self._copilot_transport: (
             M365CopilotTransport
             | CopilotStudioD2ETransport
@@ -548,7 +552,13 @@ class LocalLLMClient:
         elif is_d2e:
             transport = CopilotStudioD2ETransport(self.config, self.session, **common_kwargs)
         elif self.config.provider == "copilot_directline":
-            transport = CopilotDirectLineTransport(self.config, self.session, **common_kwargs)
+            transport = CopilotDirectLineTransport(
+                self.config,
+                self.session,
+                conversation_token=self._initial_conversation_token,
+                watermark=self._initial_watermark,
+                **common_kwargs,
+            )
         elif self.config.provider == "security_copilot":
             transport = SecurityCopilotTransport(self.config, self.session, **common_kwargs)
         else:

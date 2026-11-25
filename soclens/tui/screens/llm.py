@@ -77,6 +77,8 @@ class _ChatSession:
     attached_payload: PivotPayload | None = None
     last_reply: str = ""
     remote_conversation_id: str | None = None
+    remote_conversation_token: str | None = None
+    remote_watermark: str | None = None
     stop_event: threading.Event | None = None
     busy: bool = False
 
@@ -526,6 +528,8 @@ class LocalLLMPane(BaseSocPane):
         base_url: str | None = None,
         model: str | None = None,
         conversation_id: str | None = None,
+        conversation_token: str | None = None,
+        watermark: str | None = None,
         stop_event: threading.Event | None = None,
     ) -> LocalLLMClient:
         eff_provider = provider if provider is not None else self._current_provider()
@@ -555,6 +559,10 @@ class LocalLLMPane(BaseSocPane):
         }
         if conversation_id:
             kwargs["conversation_id"] = conversation_id
+        if conversation_token:
+            kwargs["conversation_token"] = conversation_token
+        if watermark:
+            kwargs["watermark"] = watermark
         return LocalLLMClient(**kwargs)
 
     def _write_transcript(
@@ -618,6 +626,8 @@ class LocalLLMPane(BaseSocPane):
         self._active_session.provider = new_provider
         self._active_session.base_url = url_input.value.strip()
         self._active_session.remote_conversation_id = None
+        self._active_session.remote_conversation_token = None
+        self._active_session.remote_watermark = None
 
         options, selected = self._model_options_for_provider(new_provider)
         model_sel = self.query_one("#llm-model-select", Select)
@@ -639,6 +649,8 @@ class LocalLLMPane(BaseSocPane):
                 manual_input.value = event.value
             self._active_session.model = event.value
             self._active_session.remote_conversation_id = None
+            self._active_session.remote_conversation_token = None
+            self._active_session.remote_watermark = None
             self._refresh_session_select()
 
     def accept_pivot(self, payload: PivotPayload) -> None:
@@ -840,6 +852,8 @@ class LocalLLMPane(BaseSocPane):
             model = _default_agent_label_for_provider(provider)
         history_snapshot = list(sess.history)
         remote_conv_id = sess.remote_conversation_id
+        remote_conv_token = sess.remote_conversation_token
+        remote_watermark = sess.remote_watermark
 
         if not user_prompt and not attached_ctx:
             self.set_status("Enter a prompt or attach context before sending.")
@@ -890,6 +904,8 @@ class LocalLLMPane(BaseSocPane):
             model=model,
             history_snapshot=history_snapshot,
             remote_conversation_id=remote_conv_id,
+            remote_conversation_token=remote_conv_token,
+            remote_watermark=remote_watermark,
             stop_event=stop_event,
         )
 
@@ -906,6 +922,8 @@ class LocalLLMPane(BaseSocPane):
         model: str,
         history_snapshot: list[dict[str, str]] | None = None,
         remote_conversation_id: str | None = None,
+        remote_conversation_token: str | None = None,
+        remote_watermark: str | None = None,
         stop_event: threading.Event,
     ) -> None:
         eff_provider = provider or "ollama"
@@ -919,6 +937,8 @@ class LocalLLMPane(BaseSocPane):
                     base_url=base_url,
                     model=model,
                     conversation_id=remote_conversation_id,
+                    conversation_token=remote_conversation_token,
+                    watermark=remote_watermark,
                     stop_event=stop_event,
                 ) as client:
                     if attached_ctx is not None:
@@ -953,6 +973,8 @@ class LocalLLMPane(BaseSocPane):
             reply = str(result.get("content") or "").strip()
             resp_model = str(result.get("model") or model)
             new_conv_id = result.get("conversation_id")
+            new_conv_token = result.get("conversation_token")
+            new_watermark = result.get("watermark")
 
             def _record_reply() -> None:
                 target = self._sessions.get(session_id)
@@ -962,6 +984,10 @@ class LocalLLMPane(BaseSocPane):
                 target.busy = False
                 if isinstance(new_conv_id, str) and new_conv_id.strip():
                     target.remote_conversation_id = new_conv_id.strip()
+                if isinstance(new_conv_token, str) and new_conv_token.strip():
+                    target.remote_conversation_token = new_conv_token.strip()
+                if isinstance(new_watermark, str) and new_watermark.strip():
+                    target.remote_watermark = new_watermark.strip()
                 if updated_freeform_pair is not None:
                     target.history.extend(updated_freeform_pair)
                 self._refresh_session_select()
@@ -1020,6 +1046,8 @@ class LocalLLMPane(BaseSocPane):
         sess.transcript.clear()
         sess.last_reply = ""
         sess.remote_conversation_id = None
+        sess.remote_conversation_token = None
+        sess.remote_watermark = None
         self._clear_attached_context()
         try:
             self.query_one("#llm-transcript", RichLog).clear()

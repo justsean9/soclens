@@ -751,6 +751,8 @@ class CopilotDirectLineTransport(_BaseCopilotTransport):
         error_factory: Callable[..., Exception],
         connection_error_factory: Callable[..., Exception],
         poll_interval: float = 1.2,
+        conversation_token: str | None = None,
+        watermark: str | None = None,
     ) -> None:
         super().__init__(
             config,
@@ -776,12 +778,13 @@ class CopilotDirectLineTransport(_BaseCopilotTransport):
             self.token_endpoint = base_override
         self.directline_secret = (config.ms_directline_secret or config.api_key or "").strip()
         self.poll_interval = max(0.1, float(poll_interval))
-        self._dl_token: str | None = None
-        self._watermark: str | None = None
+        self._dl_token: str | None = (conversation_token or "").strip() or None
+        self._watermark: str | None = (watermark or "").strip() or None
         self._user_id = "soclens-analyst"
 
     def reset_conversation(self) -> None:
         super().reset_conversation()
+        self._dl_token = None
         self._watermark = None
 
     def _acquire_directline_token(self) -> str:
@@ -940,9 +943,41 @@ class CopilotDirectLineTransport(_BaseCopilotTransport):
         conv_id = (conversation_id or self.conversation_id or "").strip()
         if not conv_id:
             conv_id = self.start_conversation()
+            token = self._acquire_directline_token()
         else:
             self.conversation_id = conv_id
-        token = self._acquire_directline_token()
+            if self._dl_token:
+                token = self._dl_token
+            elif self.directline_secret:
+                # Direct Line secret is valid for any existing conversation owned by this bot,
+                # whereas /tokens/generate creates a token bound to a *new* conversation.
+                token = self.directline_secret
+                self._dl_token = token
+            else:
+                # Token Endpoint cannot re-attach to an old conversation without its token;
+                # start a fresh conversation cleanly.
+                conv_id = self.start_conversation()
+                token = self._acquire_directline_token()
+
+            # Sync watermark before sending when resuming an existing conversation without watermark
+            if self._watermark is None:
+                try:
+                    sync_resp = self._request(
+                        "GET",
+                        f"{self.directline_base_url}/conversations/{conv_id}/activities",
+                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                        timeout=min(10.0, self.config.timeout),
+                    )
+                    try:
+                        sync_data = sync_resp.json()
+                        if isinstance(sync_data, dict) and sync_data.get("watermark"):
+                            self._watermark = str(sync_data["watermark"])
+                    except ValueError:
+                        pass
+                    finally:
+                        sync_resp.close()
+                except Exception:
+                    pass
 
         send_url = f"{self.directline_base_url}/conversations/{conv_id}/activities"
         send_resp = self._request(
@@ -1023,6 +1058,8 @@ class CopilotDirectLineTransport(_BaseCopilotTransport):
             "model": model_label,
             "provider": self.provider_name,
             "conversation_id": conv_id,
+            "conversation_token": self._dl_token,
+            "watermark": self._watermark,
             "done": True,
             "raw": raw_activities,
         }

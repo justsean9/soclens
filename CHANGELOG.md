@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-11-25
+
+### Fixed
+- **Multi-Turn Copilot Studio Direct Line Conversations (`soclens.copilot`, `soclens.llm`, `soclens.tui.screens.llm`)**:
+  - Persisted Direct Line `conversation_token` and `watermark` per chat window in `LocalLLMPane` and reused them across turns (falling back to the Direct Line Secret directly when resuming an existing conversation without a cached token instead of generating an unrelated new-conversation token), fixing failures after the first chat turn.
+
 ## [2.3.1] - 2026-11-25
 
 ### Added
