@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "created_at": "2026-11-25T14:22:09Z",
+  "created_at": "2026-11-26T22:43:31Z",
   "package_name": "soclens",
   "python_versions": [
     "3.12",
@@ -13,6 +13,14 @@
     "macosx_arm64"
   ],
   "runtime_packages": [
+    {
+      "name": "anyio",
+      "version": "4.16.0"
+    },
+    {
+      "name": "asn1crypto",
+      "version": "1.5.1"
+    },
     {
       "name": "beautifulsoup4",
       "version": "4.15.0"
@@ -30,6 +38,10 @@
       "version": "3.5.3"
     },
     {
+      "name": "click",
+      "version": "8.5.1"
+    },
+    {
       "name": "cryptography",
       "version": "50.0.2"
     },
@@ -44,6 +56,10 @@
     {
       "name": "google-re2",
       "version": "1.1.20251105"
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0"
     },
     {
       "name": "idna",
@@ -82,6 +98,10 @@
       "version": "26.4"
     },
     {
+      "name": "pg8000",
+      "version": "1.31.6"
+    },
+    {
       "name": "platformdirs",
       "version": "4.14.8"
     },
@@ -92,6 +112,10 @@
     {
       "name": "pygments",
       "version": "2.21.0"
+    },
+    {
+      "name": "pymysql",
+      "version": "1.2.4"
     },
     {
       "name": "pyparsing",
@@ -106,6 +130,10 @@
       "version": "3.0.1"
     },
     {
+      "name": "python-dateutil",
+      "version": "4.0.0"
+    },
+    {
       "name": "pyyaml",
       "version": "6.0.4"
     },
@@ -118,8 +146,20 @@
       "version": "15.0.0"
     },
     {
+      "name": "scramp",
+      "version": "1.5.0"
+    },
+    {
       "name": "soupsieve",
       "version": "4.1.3"
+    },
+    {
+      "name": "sqlalchemy",
+      "version": "2.1.9"
+    },
+    {
+      "name": "starlette",
+      "version": "1.10.0"
     },
     {
       "name": "textual",
@@ -134,8 +174,16 @@
       "version": "4.16.0"
     },
     {
+      "name": "tzdata",
+      "version": "2026.6"
+    },
+    {
       "name": "urllib3",
       "version": "2.8.0"
+    },
+    {
+      "name": "uvicorn",
+      "version": "0.54.0"
     }
   ],
   "build_packages": [
@@ -148,9 +196,25 @@
       "version": "0.48.0"
     }
   ],
-  "wheel_count": 75,
-  "total_bytes": 32478380,
+  "wheel_count": 87,
+  "total_bytes": 35687548,
   "wheels": [
+    {
+      "filename": "anyio-4.16.0-py3-none-any.whl",
+      "package": "anyio",
+      "version": "4.16.0",
+      "role": "runtime",
+      "sha256": "c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026",
+      "size": 134521
+    },
+    {
+      "filename": "asn1crypto-1.5.1-py2.py3-none-any.whl",
+      "package": "asn1crypto",
+      "version": "1.5.1",
+      "role": "runtime",
+      "sha256": "db4e40728b728508912cbb3d44f19ce188f218e9eba635821bb4b68564f8fd67",
+      "size": 105045
+    },
     {
       "filename": "beautifulsoup4-4.15.0-py3-none-any.whl",
       "package": "beautifulsoup4",
@@ -246,6 +310,14 @@
       "role": "runtime",
       "sha256": "96e268b0cbda016ac519513294fcd17032264085b600abaac58b93049477e132",
       "size": 68878
+    },
+    {
+      "filename": "click-8.5.1-py3-none-any.whl",
+      "package": "click",
+      "version": "8.5.1",
+      "role": "runtime",
+      "sha256": "8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37",
+      "size": 126163
     },
     {
       "filename": "cryptography-50.0.2-cp311-abi3-macosx_11_0_arm64.whl",
@@ -358,6 +430,14 @@
       "role": "runtime",
       "sha256": "6d4d5fdadd329a2ed193463899d00ef2fd126172f36a4c01c9def271f19801b6",
       "size": 491893
+    },
+    {
+      "filename": "h11-0.16.0-py3-none-any.whl",
+      "package": "h11",
+      "version": "0.16.0",
+      "role": "runtime",
+      "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+      "size": 37515
     },
     {
       "filename": "idna-3.20-py3-none-any.whl",
@@ -560,6 +640,14 @@
       "size": 140049
     },
     {
+      "filename": "pg8000-1.31.6-py3-none-any.whl",
+      "package": "pg8000",
+      "version": "1.31.6",
+      "role": "runtime",
+      "sha256": "1ffe27af94fa5b37ce6885b98d591dc75562ff076859bf50ca7729af59345a80",
+      "size": 57878
+    },
+    {
       "filename": "platformdirs-4.14.8-py3-none-any.whl",
       "package": "platformdirs",
       "version": "4.14.8",
@@ -584,6 +672,14 @@
       "size": 1250147
     },
     {
+      "filename": "pymysql-1.2.4-py3-none-any.whl",
+      "package": "pymysql",
+      "version": "1.2.4",
+      "role": "runtime",
+      "sha256": "e169bed906168fffd0088925f45b3df024c2775c6fd128da0df773d47c458840",
+      "size": 46892
+    },
+    {
       "filename": "pyparsing-3.3.3-py3-none-any.whl",
       "package": "pyparsing",
       "version": "3.3.3",
@@ -606,6 +702,14 @@
       "role": "runtime",
       "sha256": "cb983c86c409227d25b3c39f4420b0508f630db012071fff0920a999cce92a05",
       "size": 25944
+    },
+    {
+      "filename": "python_dateutil-4.0.0-py3-none-any.whl",
+      "package": "python-dateutil",
+      "version": "4.0.0",
+      "role": "runtime",
+      "sha256": "a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c",
+      "size": 92853
     },
     {
       "filename": "pyyaml-6.0.4-cp312-cp312-macosx_11_0_arm64.whl",
@@ -696,6 +800,14 @@
       "size": 310654
     },
     {
+      "filename": "scramp-1.5.0-py3-none-any.whl",
+      "package": "scramp",
+      "version": "1.5.0",
+      "role": "runtime",
+      "sha256": "8280608f568e81da9e9c9d69cac1331b836622d9b48bf5c5e400e16129c6d1fa",
+      "size": 20233
+    },
+    {
       "filename": "setuptools-84.2.1-py3-none-any.whl",
       "package": "setuptools",
       "version": "84.2.1",
@@ -710,6 +822,22 @@
       "role": "runtime",
       "sha256": "7a390d1a57d1ab7bb228531e9b8a750a5ebf87db774e0ef6faeeac057d22a5bf",
       "size": 59792
+    },
+    {
+      "filename": "sqlalchemy-2.1.9-py3-none-any.whl",
+      "package": "sqlalchemy",
+      "version": "2.1.9",
+      "role": "runtime",
+      "sha256": "449fed5c2caa3b278cc57499d09db001fb3f28dc7f18affc48142aee4dcc0cdf",
+      "size": 2071860
+    },
+    {
+      "filename": "starlette-1.10.0-py3-none-any.whl",
+      "package": "starlette",
+      "version": "1.10.0",
+      "role": "runtime",
+      "sha256": "478c0ab3b4ced6e82719849c118fa406f0278a3499c1a898cd15cd31bdc38ce4",
+      "size": 80571
     },
     {
       "filename": "textual-8.2.8-py3-none-any.whl",
@@ -736,12 +864,28 @@
       "size": 45571
     },
     {
+      "filename": "tzdata-2026.6-py2.py3-none-any.whl",
+      "package": "tzdata",
+      "version": "2026.6",
+      "role": "runtime",
+      "sha256": "0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec",
+      "size": 348210
+    },
+    {
       "filename": "urllib3-2.8.0-py3-none-any.whl",
       "package": "urllib3",
       "version": "2.8.0",
       "role": "runtime",
       "sha256": "0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3",
       "size": 135717
+    },
+    {
+      "filename": "uvicorn-0.54.0-py3-none-any.whl",
+      "package": "uvicorn",
+      "version": "0.54.0",
+      "role": "runtime",
+      "sha256": "505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf",
+      "size": 87427
     },
     {
       "filename": "wheel-0.48.0-py3-none-any.whl",

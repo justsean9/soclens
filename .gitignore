@@ -39,6 +39,8 @@ validate_savedsearches.log
 soclens-bundle.zip
 
 # Runtime & Local Caches
+.soclens_cache/
+cache/
 validation_results.json
 sigma_rules_cache.json
 savedsearches*.conf

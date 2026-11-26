@@ -39,6 +39,11 @@ dependencies = [
     "textual>=0.80.0",
     "rich>=13.7.0",
     "cryptography>=44.0.0",
+    "SQLAlchemy>=2.0",
+    "pg8000",
+    "PyMySQL",
+    "starlette",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]
@@ -61,6 +66,9 @@ Changelog = "https://github.com/justsean9/soclens/blob/main/CHANGELOG.md"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["soclens*"]
+
+[tool.setuptools.package-data]
+soclens = ["web/static/*", "web/static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
