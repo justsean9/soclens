@@ -37,11 +37,13 @@ from soclens.agent_policy import (
 )
 from soclens.client import RecordedFutureClient
 from soclens.config import (
+    DEFAULT_GEMINI_MODEL,
     ConfigurationError,
     OSINTConfig,
     SecretStoreConfig,
     _normalize_llm_provider,
     format_ssl_verify_status,
+    get_local_llm_config,
     get_osint_config,
     get_proxy_summary,
     get_rf_asi_key,
@@ -55,7 +57,9 @@ from soclens.config import (
     get_sentinelone_config,
     get_splunk_config,
     hydrate_secrets_from_store,
+    parse_visible_llm_providers,
 )
+from soclens.llm import ProviderModelsResult, discover_available_ai_models
 from soclens.osint import OSINTClient
 from soclens.secret_stores import build_secret_store_provider
 from soclens.secret_stores.base import SECRET_PROVIDER_LABELS, SecretCatalogEntry
@@ -79,6 +83,7 @@ from soclens.settings import (
     delete_profile,
     encrypt_settings_store,
     get_active_profile_name,
+    get_effective_setting,
     get_env_override_for_setting,
     get_profile_settings,
     get_session_override,
@@ -114,6 +119,7 @@ _CATEGORIES: tuple[tuple[str, str], ...] = (
     ("cat-profiles", "Profiles & Storage"),
     ("cat-secrets", "Secret Manager (PAM / Vault)"),
     ("cat-osint", "OSINT Free API Keys"),
+    ("cat-ai", "AI & LLM Settings"),
 )
 
 _SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
@@ -149,7 +155,7 @@ _VAULT_BANNER_IDS: tuple[str, ...] = (
     "cat-rf-vault-banner",
     "cat-splunk-vault-banner",
     "cat-s1-vault-banner",
-    "cat-workspace-vault-banner",
+    "cat-ai-vault-banner",
 )
 
 _VAULT_MODE_BANNER_TEXT = (
@@ -206,22 +212,22 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "rf_ignored_hashes": ("cat-workspace", "set-ignored-hashes"),
     "soclens_auto_approve": ("cat-workspace", "set-auto-approve"),
     "soclens_ascii_art_enabled": ("cat-workspace", "set-ascii-art-enabled"),
-    "rf_llm_provider": ("cat-workspace", "set-rf-llm-provider"),
-    "rf_llm_model": ("cat-workspace", "set-rf-llm-model"),
-    "rf_llm_base_url": ("cat-workspace", "set-rf-llm-base-url"),
-    "rf_llm_api_key": ("cat-workspace", "set-rf-llm-api-key"),
-    "gemini_api_key": ("cat-workspace", "set-gemini-api-key"),
-    "llm_visible_providers": ("cat-workspace", "set-llm-visible-providers"),
-    "ms_copilot_auth_mode": ("cat-workspace", "set-ms-copilot-auth-mode"),
-    "ms_copilot_bearer_token": ("cat-workspace", "set-ms-copilot-bearer-token"),
-    "ms_copilot_graph_base_url": ("cat-workspace", "set-ms-copilot-graph-url"),
-    "ms_copilot_web_grounding": ("cat-workspace", "set-ms-copilot-web-grounding"),
-    "ms_copilot_directline_url": ("cat-workspace", "set-ms-copilot-directline-url"),
-    "ms_copilot_token_endpoint": ("cat-workspace", "set-ms-copilot-token-endpoint"),
-    "ms_copilot_directline_secret": ("cat-workspace", "set-ms-copilot-directline-secret"),
-    "ms_security_copilot_workspace": ("cat-workspace", "set-ms-security-copilot-workspace"),
-    "ms_security_copilot_poll_interval": ("cat-workspace", "set-ms-security-copilot-poll-interval"),
-    "ms_copilot_agents_json": ("cat-workspace", "set-ms-copilot-agents-json"),
+    "rf_llm_provider": ("cat-ai", "set-rf-llm-provider"),
+    "rf_llm_model": ("cat-ai", "set-rf-llm-model"),
+    "rf_llm_base_url": ("cat-ai", "set-rf-llm-base-url"),
+    "rf_llm_api_key": ("cat-ai", "set-rf-llm-api-key"),
+    "gemini_api_key": ("cat-ai", "set-gemini-api-key"),
+    "llm_visible_providers": ("cat-ai", "set-llm-visible-providers"),
+    "ms_copilot_auth_mode": ("cat-ai", "set-ms-copilot-auth-mode"),
+    "ms_copilot_bearer_token": ("cat-ai", "set-ms-copilot-bearer-token"),
+    "ms_copilot_graph_base_url": ("cat-ai", "set-ms-copilot-graph-url"),
+    "ms_copilot_web_grounding": ("cat-ai", "set-ms-copilot-web-grounding"),
+    "ms_copilot_directline_url": ("cat-ai", "set-ms-copilot-directline-url"),
+    "ms_copilot_token_endpoint": ("cat-ai", "set-ms-copilot-token-endpoint"),
+    "ms_copilot_directline_secret": ("cat-ai", "set-ms-copilot-directline-secret"),
+    "ms_security_copilot_workspace": ("cat-ai", "set-ms-security-copilot-workspace"),
+    "ms_security_copilot_poll_interval": ("cat-ai", "set-ms-security-copilot-poll-interval"),
+    "ms_copilot_agents_json": ("cat-ai", "set-ms-copilot-agents-json"),
     "secret_provider": ("cat-secrets", "set-secret-provider"),
     "secret_store_verify_ssl": ("cat-secrets", "set-secret-store-verify-ssl"),
     "secret_store_timeout": ("cat-secrets", "set-pam-timeout"),
@@ -432,7 +438,27 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
 _SSL_VERIFY_TRUE = frozenset({"1", "true", "yes", "on"})
 _SSL_VERIFY_FALSE = frozenset({"0", "false", "no", "off"})
 _NON_SETTING_CONTROL_IDS: frozenset[str] = frozenset(
-    {"settings-show-secrets", "set-profile-select", "set-new-profile-input"}
+    {
+        "settings-show-secrets",
+        "set-profile-select",
+        "set-new-profile-input",
+        "set-rf-llm-model-select",
+    }
+)
+_MANUAL_AI_MODEL_VALUE = "__manual__"
+_AI_PROVIDER_BADGES: dict[str, str] = {
+    "gemini": "Gemini",
+    "ollama": "Ollama",
+    "openai": "OpenAI",
+    "copilot_directline": "Copilot Direct Line",
+    "copilot_studio": "Copilot Studio",
+    "m365_copilot": "M365 Copilot",
+    "security_copilot": "Security Copilot",
+}
+_DEFAULT_GEMINI_MODELS_SETTINGS: tuple[str, ...] = (
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
 )
 
 
@@ -499,6 +525,8 @@ class SettingsPane(BaseSocPane):
         self._baseline_values: dict[str, Any] = {}
         self._catalog_entries: list[SecretCatalogEntry] = []
         self._catalog_provider: str = ""
+        self._ai_discovered_models: dict[str, list[str]] = {}
+        self._ai_models_auto_queried: bool = False
 
     def _make_vault_select(self, select_id: str) -> Select[str]:
         return Select(
@@ -892,12 +920,6 @@ class SettingsPane(BaseSocPane):
                             classes="section-label",
                             markup=False,
                         )
-                        yield Static(
-                            _VAULT_MODE_BANNER_TEXT,
-                            id="cat-workspace-vault-banner",
-                            classes="info-box vault-mode-banner",
-                            markup=False,
-                        )
                         yield self._make_label("soclens_home")
                         yield Input(
                             value="",
@@ -981,281 +1003,6 @@ class SettingsPane(BaseSocPane):
                             "Unlock ASCII Art Banner (auto-hides after 10s)",
                             value=False,
                             id="set-ascii-art-enabled",
-                            compact=True,
-                        )
-                        yield Static(
-                            "AI Analyst & Investigation LLM Defaults",
-                            classes="section-label",
-                        )
-                        yield self._make_label("rf_llm_provider")
-                        yield Select(
-                            [
-                                ("Auto (First Visible Provider / Ollama)", ""),
-                                ("Google Gemini API", "gemini"),
-                                ("Ollama (Local)", "ollama"),
-                                ("OpenAI-Compatible (Local/Remote)", "openai"),
-                                ("Copilot Studio (Direct Line)", "copilot_directline"),
-                                ("Copilot Studio (Direct-to-Engine)", "copilot_studio"),
-                                ("M365 Copilot Chat", "m365_copilot"),
-                                ("Microsoft Security Copilot", "security_copilot"),
-                            ],
-                            allow_blank=False,
-                            value="",
-                            id="set-rf-llm-provider",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("rf_llm_model")
-                        yield Input(
-                            value="",
-                            placeholder="e.g. gemini-2.5-flash, llama3.2, gpt-4o-mini (Gemini defaults to gemini-2.5-flash)",
-                            id="set-rf-llm-model",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("rf_llm_base_url")
-                        yield Input(
-                            value="",
-                            placeholder="Optional custom Ollama / OpenAI / Gemini base URL",
-                            id="set-rf-llm-base-url",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("rf_llm_api_key")
-                        yield Input(
-                            value="",
-                            password=True,
-                            placeholder="Optional API key for OpenAI-compatible local LLM",
-                            id="set-rf-llm-api-key",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_vault_select("set-rf-llm-api-key-vault")
-                        yield self._make_label("gemini_api_key")
-                        yield Input(
-                            value="",
-                            password=True,
-                            placeholder="Google AI Studio / Gemini API key (GEMINI_API_KEY)",
-                            id="set-gemini-api-key",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_vault_select("set-gemini-api-key-vault")
-                        yield Static(
-                            "Microsoft Enterprise Copilot & Security Copilot (Token-First)",
-                            classes="section-label",
-                        )
-                        yield self._make_label("llm_visible_providers")
-                        yield Select(
-                            [
-                                ("Show All AI Providers (Default)", ""),
-                                ("Google Gemini API Only", "gemini"),
-                                ("Copilot Studio (Direct Line) Only", "copilot_directline"),
-                                (
-                                    "Copilot Studio Only (Direct Line & Direct-to-Engine)",
-                                    "copilot_directline,copilot_studio",
-                                ),
-                                (
-                                    "Copilot Direct Line + Security Copilot",
-                                    "copilot_directline,security_copilot",
-                                ),
-                                (
-                                    "Microsoft Copilot Suite Only (All MS Copilot)",
-                                    "copilot_directline,copilot_studio,m365_copilot,security_copilot",
-                                ),
-                                ("Local LLMs Only (Ollama & OpenAI-Compatible)", "ollama,openai"),
-                                (
-                                    "Local LLMs + Gemini API (Ollama, OpenAI, Gemini)",
-                                    "ollama,openai,gemini",
-                                ),
-                            ],
-                            allow_blank=False,
-                            value="",
-                            id="set-llm-visible-providers",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_copilot_auth_mode")
-                        yield Select(
-                            [
-                                ("Direct Bearer Token (Graph Explorer / PAM / PowerShell)", "token"),
-                                ("Azure CLI Auto-Refresh (az account get-access-token)", "az_cli"),
-                            ],
-                            allow_blank=False,
-                            value="token",
-                            id="set-ms-copilot-auth-mode",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_copilot_bearer_token")
-                        yield Input(
-                            value="",
-                            password=True,
-                            placeholder="MS Graph Bearer token (Graph Explorer / az CLI / PowerShell)",
-                            id="set-ms-copilot-bearer-token",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_vault_select("set-ms-copilot-bearer-token-vault")
-                        yield self._make_label("ms_copilot_graph_base_url")
-                        yield Input(
-                            value="",
-                            placeholder="Default: https://graph.microsoft.com/beta",
-                            id="set-ms-copilot-graph-url",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_copilot_web_grounding")
-                        yield Checkbox(
-                            "Enable M365 Copilot Web Search Grounding",
-                            value=True,
-                            id="set-ms-copilot-web-grounding",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_copilot_token_endpoint")
-                        yield Input(
-                            value="",
-                            password=True,
-                            placeholder="Copilot Studio Mobile/Web Channel Token Endpoint URL",
-                            id="set-ms-copilot-token-endpoint",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_vault_select("set-ms-copilot-token-endpoint-vault")
-                        yield self._make_label("ms_copilot_directline_secret")
-                        yield Input(
-                            value="",
-                            password=True,
-                            placeholder="Optional Copilot Studio Direct Line channel secret",
-                            id="set-ms-copilot-directline-secret",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_vault_select("set-ms-copilot-directline-secret-vault")
-                        yield self._make_label("ms_copilot_directline_url")
-                        yield Input(
-                            value="",
-                            placeholder="Default: https://directline.botframework.com/v3/directline",
-                            id="set-ms-copilot-directline-url",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_security_copilot_workspace")
-                        yield Input(
-                            value="",
-                            placeholder="Default: default",
-                            id="set-ms-security-copilot-workspace",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_security_copilot_poll_interval")
-                        yield Input(
-                            value="",
-                            placeholder="Default: 2.0",
-                            id="set-ms-security-copilot-poll-interval",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield self._make_label("ms_copilot_agents_json")
-                        yield Input(
-                            value="",
-                            placeholder='Optional JSON array: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}]',
-                            id="set-ms-copilot-agents-json",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield Static(
-                            "AI Agent Tool Limits & Global Kill Switch",
-                            classes="section-label",
-                        )
-                        yield Static(
-                            f"Max Tool Steps per Run ({MIN_TOOL_STEPS}-{MAX_TOOL_STEPS}, default 50)",
-                            classes="setting-label",
-                            markup=False,
-                        )
-                        yield Input(
-                            value="50",
-                            placeholder="50",
-                            id="set-ai-max-tool-steps",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield Static(
-                            f"Max Identical Tool Calls ({MIN_IDENTICAL_TOOL_CALLS}-{MAX_IDENTICAL_TOOL_CALLS}, default 2)",
-                            classes="setting-label",
-                            markup=False,
-                        )
-                        yield Input(
-                            value="2",
-                            placeholder="2",
-                            id="set-ai-max-identical-calls",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield Static(
-                            f"Max Same-Tool Failures ({MIN_SAME_TOOL_FAILURES}-{MAX_SAME_TOOL_FAILURES}, default 10)",
-                            classes="setting-label",
-                            markup=False,
-                        )
-                        yield Input(
-                            value="10",
-                            placeholder="10",
-                            id="set-ai-max-tool-failures",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield Static(
-                            "Global Kill Switch Button Label (max 20 chars)",
-                            classes="setting-label",
-                            markup=False,
-                        )
-                        yield Input(
-                            value=DEFAULT_KILL_SWITCH_LABEL,
-                            placeholder=DEFAULT_KILL_SWITCH_LABEL,
-                            id="set-ai-kill-label",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield Static(
-                            "Global Kill Switch Hotkey",
-                            classes="setting-label",
-                            markup=False,
-                        )
-                        yield Select(
-                            [
-                                ("F12 (Default)", "f12"),
-                                ("F11", "f11"),
-                                ("Ctrl+\\", "ctrl+backslash"),
-                                ("Disabled (Button Only)", "none"),
-                            ],
-                            allow_blank=False,
-                            value="f12",
-                            id="set-ai-kill-hotkey",
-                            classes="setting-field",
-                            compact=True,
-                        )
-                        yield Checkbox(
-                            "Show Global AI Kill Button in Every Dashboard",
-                            value=True,
-                            id="set-ai-kill-visible",
-                            compact=True,
-                        )
-                        yield Checkbox(
-                            "Require Confirmation Before Halting AI",
-                            value=False,
-                            id="set-ai-kill-confirm-engage",
-                            compact=True,
-                        )
-                        yield Checkbox(
-                            "Require Confirmation Before Resuming AI",
-                            value=False,
-                            id="set-ai-kill-confirm-resume",
-                            compact=True,
-                        )
-                        yield Checkbox(
-                            "Keep AI Halted Across App Restarts",
-                            value=True,
-                            id="set-ai-kill-persist",
                             compact=True,
                         )
 
@@ -1824,6 +1571,319 @@ class SettingsPane(BaseSocPane):
                                 id="settings-test-osint-btn",
                                 compact=True,
                             )
+
+                    with VerticalScroll(id="cat-ai", classes="settings-cat-scroll"):
+                        yield Static(
+                            "AI & LLM Settings (Providers, Default Model, Copilot & Governance)",
+                            classes="section-label",
+                            markup=False,
+                        )
+                        yield Static(
+                            _VAULT_MODE_BANNER_TEXT,
+                            id="cat-ai-vault-banner",
+                            classes="info-box vault-mode-banner",
+                            markup=False,
+                        )
+                        yield self._make_label("rf_llm_provider")
+                        yield Select(
+                            [
+                                ("Auto (First Visible Provider / Ollama)", ""),
+                                ("Google Gemini API", "gemini"),
+                                ("Ollama (Local)", "ollama"),
+                                ("OpenAI-Compatible (Local/Remote)", "openai"),
+                                ("Copilot Studio (Direct Line)", "copilot_directline"),
+                                ("Copilot Studio (Direct-to-Engine)", "copilot_studio"),
+                                ("M365 Copilot Chat", "m365_copilot"),
+                                ("Microsoft Security Copilot", "security_copilot"),
+                            ],
+                            allow_blank=False,
+                            value="",
+                            id="set-rf-llm-provider",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("rf_llm_model")
+                        yield Select(
+                            [
+                                ("Auto / Provider Default", ""),
+                                ("(Custom / Manual Model Name)", _MANUAL_AI_MODEL_VALUE),
+                            ],
+                            allow_blank=False,
+                            value="",
+                            id="set-rf-llm-model-select",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Input(
+                            value="",
+                            placeholder="Auto-filled from dropdown above, or type a custom model name...",
+                            id="set-rf-llm-model",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        with Horizontal(classes="action-row toolbar-row"):
+                            yield Button(
+                                "Query Available AI Models",
+                                id="settings-refresh-ai-models-btn",
+                                variant="primary",
+                                compact=True,
+                            )
+                            yield Button(
+                                "Test AI Connection",
+                                id="settings-test-ai-btn",
+                                compact=True,
+                            )
+                        yield Static(
+                            "Click 'Query Available AI Models' to fetch live models from configured AI providers.",
+                            id="settings-ai-models-status",
+                            classes="info-box",
+                            markup=False,
+                        )
+                        yield self._make_label("rf_llm_base_url")
+                        yield Input(
+                            value="",
+                            placeholder="Optional custom Ollama / OpenAI / Gemini base URL",
+                            id="set-rf-llm-base-url",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("rf_llm_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional API key for OpenAI-compatible local LLM",
+                            id="set-rf-llm-api-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-rf-llm-api-key-vault")
+                        yield self._make_label("gemini_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Google AI Studio / Gemini API key (GEMINI_API_KEY)",
+                            id="set-gemini-api-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-gemini-api-key-vault")
+                        yield Static(
+                            "Microsoft Enterprise Copilot & Security Copilot (Token-First)",
+                            classes="section-label",
+                        )
+                        yield self._make_label("llm_visible_providers")
+                        yield Select(
+                            [
+                                ("Show All AI Providers (Default)", ""),
+                                ("Google Gemini API Only", "gemini"),
+                                ("Copilot Studio (Direct Line) Only", "copilot_directline"),
+                                (
+                                    "Copilot Studio Only (Direct Line & Direct-to-Engine)",
+                                    "copilot_directline,copilot_studio",
+                                ),
+                                (
+                                    "Copilot Direct Line + Security Copilot",
+                                    "copilot_directline,security_copilot",
+                                ),
+                                (
+                                    "Microsoft Copilot Suite Only (All MS Copilot)",
+                                    "copilot_directline,copilot_studio,m365_copilot,security_copilot",
+                                ),
+                                ("Local LLMs Only (Ollama & OpenAI-Compatible)", "ollama,openai"),
+                                (
+                                    "Local LLMs + Gemini API (Ollama, OpenAI, Gemini)",
+                                    "ollama,openai,gemini",
+                                ),
+                            ],
+                            allow_blank=False,
+                            value="",
+                            id="set-llm-visible-providers",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_auth_mode")
+                        yield Select(
+                            [
+                                ("Direct Bearer Token (Graph Explorer / PAM / PowerShell)", "token"),
+                                ("Azure CLI Auto-Refresh (az account get-access-token)", "az_cli"),
+                            ],
+                            allow_blank=False,
+                            value="token",
+                            id="set-ms-copilot-auth-mode",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_bearer_token")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="MS Graph Bearer token (Graph Explorer / az CLI / PowerShell)",
+                            id="set-ms-copilot-bearer-token",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-ms-copilot-bearer-token-vault")
+                        yield self._make_label("ms_copilot_graph_base_url")
+                        yield Input(
+                            value="",
+                            placeholder="Default: https://graph.microsoft.com/beta",
+                            id="set-ms-copilot-graph-url",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_web_grounding")
+                        yield Checkbox(
+                            "Enable M365 Copilot Web Search Grounding",
+                            value=True,
+                            id="set-ms-copilot-web-grounding",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_token_endpoint")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Copilot Studio Mobile/Web Channel Token Endpoint URL",
+                            id="set-ms-copilot-token-endpoint",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-ms-copilot-token-endpoint-vault")
+                        yield self._make_label("ms_copilot_directline_secret")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional Copilot Studio Direct Line channel secret",
+                            id="set-ms-copilot-directline-secret",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-ms-copilot-directline-secret-vault")
+                        yield self._make_label("ms_copilot_directline_url")
+                        yield Input(
+                            value="",
+                            placeholder="Default: https://directline.botframework.com/v3/directline",
+                            id="set-ms-copilot-directline-url",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_security_copilot_workspace")
+                        yield Input(
+                            value="",
+                            placeholder="Default: default",
+                            id="set-ms-security-copilot-workspace",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_security_copilot_poll_interval")
+                        yield Input(
+                            value="",
+                            placeholder="Default: 2.0",
+                            id="set-ms-security-copilot-poll-interval",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("ms_copilot_agents_json")
+                        yield Input(
+                            value="",
+                            placeholder='Optional JSON array: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}]',
+                            id="set-ms-copilot-agents-json",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            "AI Agent Tool Limits & Global Kill Switch",
+                            classes="section-label",
+                        )
+                        yield Static(
+                            f"Max Tool Steps per Run ({MIN_TOOL_STEPS}-{MAX_TOOL_STEPS}, default 50)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value="50",
+                            placeholder="50",
+                            id="set-ai-max-tool-steps",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            f"Max Identical Tool Calls ({MIN_IDENTICAL_TOOL_CALLS}-{MAX_IDENTICAL_TOOL_CALLS}, default 2)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value="2",
+                            placeholder="2",
+                            id="set-ai-max-identical-calls",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            f"Max Same-Tool Failures ({MIN_SAME_TOOL_FAILURES}-{MAX_SAME_TOOL_FAILURES}, default 10)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value="10",
+                            placeholder="10",
+                            id="set-ai-max-tool-failures",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            "Global Kill Switch Button Label (max 20 chars)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value=DEFAULT_KILL_SWITCH_LABEL,
+                            placeholder=DEFAULT_KILL_SWITCH_LABEL,
+                            id="set-ai-kill-label",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            "Global Kill Switch Hotkey",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Select(
+                            [
+                                ("F12 (Default)", "f12"),
+                                ("F11", "f11"),
+                                ("Ctrl+\\", "ctrl+backslash"),
+                                ("Disabled (Button Only)", "none"),
+                            ],
+                            allow_blank=False,
+                            value="f12",
+                            id="set-ai-kill-hotkey",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Show Global AI Kill Button in Every Dashboard",
+                            value=True,
+                            id="set-ai-kill-visible",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Require Confirmation Before Halting AI",
+                            value=False,
+                            id="set-ai-kill-confirm-engage",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Require Confirmation Before Resuming AI",
+                            value=False,
+                            id="set-ai-kill-confirm-resume",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Keep AI Halted Across App Restarts",
+                            value=True,
+                            id="set-ai-kill-persist",
+                            compact=True,
+                        )
 
     def _make_label(self, key: str) -> Static:
         spec = SETTING_SPECS_BY_KEY[key]
@@ -2405,6 +2465,7 @@ class SettingsPane(BaseSocPane):
 
             # AI Agent Tool Limits & Global Kill Switch
             self._populate_ai_policy_controls()
+            self._rebuild_ai_model_dropdown()
 
             # Profiles dropdown & vault controls
             self._refresh_profile_selector(active_profile)
@@ -2540,6 +2601,8 @@ class SettingsPane(BaseSocPane):
             self.query_one("#settings-category-switcher", ContentSwitcher).current = cat_id
         except Exception:
             pass
+        if cat_id == "cat-ai":
+            self._maybe_auto_query_ai_models()
 
     @on(Select.Changed, "#set-rf-verify-ssl")
     @on(Select.Changed, "#set-splunk-verify-ssl")
@@ -2617,6 +2680,8 @@ class SettingsPane(BaseSocPane):
             if cat_id in cat_ids:
                 self.query_one("#settings-category-list", OptionList).highlighted = cat_ids.index(cat_id)
                 self.query_one("#settings-category-switcher", ContentSwitcher).current = cat_id
+                if cat_id == "cat-ai":
+                    self._maybe_auto_query_ai_models()
         except Exception:
             pass
 
@@ -2957,7 +3022,7 @@ class SettingsPane(BaseSocPane):
         ai_updates, ai_err = self._collect_ai_policy_updates()
         if ai_err is not None:
             key, widget_id, message = ai_err
-            self._switch_to_widget("cat-workspace", widget_id, key=key)
+            self._switch_to_widget("cat-ai", widget_id, key=key)
             self.set_status(f"Validation error: {message}")
             self.notify_user(message, title="Invalid AI Setting", severity="error")
             return False
@@ -4027,3 +4092,300 @@ class SettingsPane(BaseSocPane):
             )
         except Exception as exc:
             self.report_error("Test OSINT Sources", exc)
+
+    def _rebuild_ai_model_dropdown(self) -> None:
+        try:
+            model_sel = self.query_one("#set-rf-llm-model-select", Select)
+            model_inp = self.query_one("#set-rf-llm-model", Input)
+            prov_sel = self.query_one("#set-rf-llm-provider", Select)
+            vis_sel = self.query_one("#set-llm-visible-providers", Select)
+            gemini_key_inp = self.query_one("#set-gemini-api-key", Input)
+        except Exception:
+            return
+
+        selected_prov = str(prov_sel.value or "").strip().lower()
+        cur_model = model_inp.value.strip()
+        vis_raw = str(vis_sel.value or "").strip()
+        vis_set = set(parse_visible_llm_providers(vis_raw)) if vis_raw else set()
+        has_gemini_key = bool(gemini_key_inp.value.strip() or get_effective_setting("gemini_api_key"))
+
+        options: list[tuple[str, str]] = [("Auto / Provider Default", "")]
+        seen_vals: set[str] = {""}
+
+        ordered_provs: list[str] = []
+        if selected_prov and selected_prov in self._ai_discovered_models:
+            ordered_provs.append(selected_prov)
+        for prov in self._ai_discovered_models:
+            if prov not in ordered_provs:
+                ordered_provs.append(prov)
+
+        for prov in ordered_provs:
+            badge = _AI_PROVIDER_BADGES.get(prov, prov)
+            for model_id in self._ai_discovered_models.get(prov, []):
+                val = f"{prov}::{model_id}"
+                if val in seen_vals:
+                    continue
+                seen_vals.add(val)
+                options.append((f"{model_id} [{badge}]", val))
+
+        if not self._ai_discovered_models.get("gemini") and (
+            selected_prov == "gemini"
+            or (has_gemini_key and (not vis_set or "gemini" in vis_set))
+        ):
+            for gm in _DEFAULT_GEMINI_MODELS_SETTINGS:
+                val = f"gemini::{gm}"
+                if val not in seen_vals:
+                    seen_vals.add(val)
+                    options.append((f"{gm} [Gemini]", val))
+
+        target_val = ""
+        if cur_model:
+            preferred = f"{selected_prov}::{cur_model}" if selected_prov else ""
+            if preferred and preferred in seen_vals:
+                target_val = preferred
+            else:
+                matched = next(
+                    (opt_val for _lbl, opt_val in options if opt_val.endswith(f"::{cur_model}")),
+                    None,
+                )
+                if matched is not None:
+                    target_val = matched
+                else:
+                    if cur_model not in seen_vals:
+                        seen_vals.add(cur_model)
+                        options.append((f"{cur_model} (Saved / Custom)", cur_model))
+                    target_val = cur_model
+
+        options.append(("(Custom / Manual Model Name)", _MANUAL_AI_MODEL_VALUE))
+        with model_sel.prevent(Select.Changed):
+            model_sel.set_options(options)
+            model_sel.value = target_val
+
+    def _snapshot_ai_query_params(self) -> dict[str, Any]:
+        selected_prov = str(self.query_one("#set-rf-llm-provider", Select).value or "").strip().lower()
+        base_url_override = self.query_one("#set-rf-llm-base-url", Input).value.strip() or None
+        gemini_key = (
+            self.query_one("#set-gemini-api-key", Input).value.strip()
+            or get_effective_setting("gemini_api_key")
+        )
+        llm_key = (
+            self.query_one("#set-rf-llm-api-key", Input).value.strip()
+            or get_effective_setting("rf_llm_api_key")
+        )
+        vis_raw = str(self.query_one("#set-llm-visible-providers", Select).value or "").strip()
+        vis_tuple = parse_visible_llm_providers(vis_raw) if vis_raw else None
+        ms_token = (
+            self.query_one("#set-ms-copilot-bearer-token", Input).value.strip()
+            or get_effective_setting("ms_copilot_bearer_token")
+        )
+        ms_ep = (
+            self.query_one("#set-ms-copilot-token-endpoint", Input).value.strip()
+            or get_effective_setting("ms_copilot_token_endpoint")
+        )
+        ms_dl_secret = (
+            self.query_one("#set-ms-copilot-directline-secret", Input).value.strip()
+            or get_effective_setting("ms_copilot_directline_secret")
+        )
+        ms_agents_json = (
+            self.query_one("#set-ms-copilot-agents-json", Input).value.strip()
+            or get_effective_setting("ms_copilot_agents_json")
+        )
+        cur_model = self.query_one("#set-rf-llm-model", Input).value.strip()
+        verify_ssl: bool | str | None = None
+        if not (os.environ.get("RF_LLM_VERIFY_SSL") or "").strip():
+            get_ssl_fn = getattr(self.app, "get_effective_verify_ssl", None)
+            if callable(get_ssl_fn):
+                eff_ssl = get_ssl_fn()
+                if isinstance(eff_ssl, (bool, str)):
+                    verify_ssl = eff_ssl
+        return {
+            "selected_provider": selected_prov or None,
+            "base_url_override": base_url_override,
+            "gemini_api_key": gemini_key,
+            "llm_api_key": llm_key,
+            "visible_providers": vis_tuple,
+            "ms_copilot_bearer_token": ms_token,
+            "ms_copilot_token_endpoint": ms_ep,
+            "ms_copilot_directline_secret": ms_dl_secret,
+            "ms_copilot_agents_json": ms_agents_json,
+            "current_model": cur_model,
+            "verify_ssl": verify_ssl,
+            "stop_event": getattr(self.app, "_stop_event", None),
+        }
+
+    def _maybe_auto_query_ai_models(self) -> None:
+        if self._ai_models_auto_queried:
+            return
+        should_preload_fn = getattr(self.app, "_should_preload_alerts", None)
+        if not callable(should_preload_fn) or not should_preload_fn():
+            return
+        self._ai_models_auto_queried = True
+        with contextlib.suppress(Exception):
+            params = self._snapshot_ai_query_params()
+            self._refresh_ai_models_worker(params, auto=True)
+
+    @on(Select.Changed, "#set-rf-llm-provider")
+    def handle_ai_provider_changed(self, _event: Select.Changed) -> None:
+        if self._populating_form:
+            return
+        self._rebuild_ai_model_dropdown()
+
+    @on(Select.Changed, "#set-rf-llm-model-select")
+    def handle_ai_model_select_changed(self, event: Select.Changed) -> None:
+        if self._populating_form or event.value != event.select.value:
+            return
+        raw = str(event.value or "")
+        try:
+            model_inp = self.query_one("#set-rf-llm-model", Input)
+            prov_sel = self.query_one("#set-rf-llm-provider", Select)
+        except Exception:
+            return
+        if raw == _MANUAL_AI_MODEL_VALUE:
+            with contextlib.suppress(Exception):
+                model_inp.focus()
+            return
+        if raw == "":
+            if model_inp.value != "":
+                model_inp.value = ""
+            return
+        if "::" in raw:
+            prov, model_id = raw.split("::", 1)
+            if model_inp.value != model_id:
+                model_inp.value = model_id
+            if prov in _AI_PROVIDER_BADGES and str(prov_sel.value or "") != prov:
+                prov_sel.value = prov
+        elif model_inp.value != raw:
+            model_inp.value = raw
+
+    @on(Input.Changed, "#set-rf-llm-model")
+    def handle_ai_model_input_changed(self, _event: Input.Changed) -> None:
+        if self._populating_form:
+            return
+        self._rebuild_ai_model_dropdown()
+
+    @on(Button.Pressed, "#settings-refresh-ai-models-btn")
+    def handle_refresh_ai_models(self) -> None:
+        params = self._snapshot_ai_query_params()
+        msg = "Querying available AI providers for models..."
+        self.set_status(msg)
+        with contextlib.suppress(Exception):
+            self.query_one("#settings-ai-models-status", Static).update(msg)
+        self._refresh_ai_models_worker(params, auto=False)
+
+    @work(thread=True, exit_on_error=False)
+    def _refresh_ai_models_worker(
+        self,
+        params: dict[str, Any],
+        *,
+        auto: bool = False,
+    ) -> None:
+        try:
+            with self.log_scope("settings"):
+                results = discover_available_ai_models(
+                    selected_provider=params.get("selected_provider"),
+                    base_url_override=params.get("base_url_override"),
+                    gemini_api_key=params.get("gemini_api_key"),
+                    llm_api_key=params.get("llm_api_key"),
+                    visible_providers=params.get("visible_providers"),
+                    ms_copilot_bearer_token=params.get("ms_copilot_bearer_token"),
+                    ms_copilot_token_endpoint=params.get("ms_copilot_token_endpoint"),
+                    ms_copilot_directline_secret=params.get("ms_copilot_directline_secret"),
+                    ms_copilot_agents_json=params.get("ms_copilot_agents_json"),
+                    verify_ssl=params.get("verify_ssl"),
+                    stop_event=params.get("stop_event"),
+                )
+            self.run_on_ui(self._apply_ai_models_discovery, results, auto)
+        except Exception as exc:
+            if not auto:
+                self.report_error("Query Available AI Models", exc)
+
+    def _apply_ai_models_discovery(
+        self,
+        results: list[ProviderModelsResult],
+        auto: bool,
+    ) -> None:
+        discovered: dict[str, list[str]] = {}
+        summary_parts: list[str] = []
+        total_models = 0
+        for res in results:
+            badge = _AI_PROVIDER_BADGES.get(res.provider, res.provider)
+            if res.ok:
+                discovered[res.provider] = list(res.models)
+                total_models += len(res.models)
+                summary_parts.append(f"{badge}: {len(res.models)} model(s)")
+            else:
+                summary_parts.append(f"{badge}: offline ({res.error or 'unreachable'})")
+
+        if discovered:
+            self._ai_discovered_models = discovered
+        self._rebuild_ai_model_dropdown()
+
+        summary = (
+            " | ".join(summary_parts)
+            if summary_parts
+            else "No configured AI providers found to query."
+        )
+        with contextlib.suppress(Exception):
+            self.query_one("#settings-ai-models-status", Static).update(summary)
+        if not auto:
+            status_msg = f"Queried AI providers: {summary}"
+            self.set_status(status_msg)
+            self.append_log(status_msg, level="INFO" if total_models else "WARNING")
+            self.notify_user(
+                summary,
+                title="AI Models Discovered" if total_models else "AI Model Discovery",
+                severity="information" if total_models else "warning",
+            )
+
+    @on(Button.Pressed, "#settings-test-ai-btn")
+    def handle_test_ai_connection(self) -> None:
+        params = self._snapshot_ai_query_params()
+        target_prov = params.get("selected_provider") or get_local_llm_config().provider
+        self.set_status(f"Testing AI connection ({target_prov})...")
+        self._test_ai_connection_worker(params, target_prov)
+
+    @work(thread=True, exit_on_error=False)
+    def _test_ai_connection_worker(
+        self,
+        params: dict[str, Any],
+        target_prov: str,
+    ) -> None:
+        try:
+            with self.log_scope("settings"):
+                results = discover_available_ai_models(
+                    providers=[target_prov],
+                    selected_provider=target_prov,
+                    base_url_override=params.get("base_url_override"),
+                    gemini_api_key=params.get("gemini_api_key"),
+                    llm_api_key=params.get("llm_api_key"),
+                    visible_providers=params.get("visible_providers"),
+                    ms_copilot_bearer_token=params.get("ms_copilot_bearer_token"),
+                    ms_copilot_token_endpoint=params.get("ms_copilot_token_endpoint"),
+                    ms_copilot_directline_secret=params.get("ms_copilot_directline_secret"),
+                    ms_copilot_agents_json=params.get("ms_copilot_agents_json"),
+                    verify_ssl=params.get("verify_ssl"),
+                    stop_event=params.get("stop_event"),
+                )
+            res = results[0] if results else None
+            badge = _AI_PROVIDER_BADGES.get(target_prov, target_prov)
+            if res is not None and res.ok:
+                def _apply_ok() -> None:
+                    self._ai_discovered_models[res.provider] = list(res.models)
+                    self._rebuild_ai_model_dropdown()
+                    msg = f"{badge} OK ({res.base_url}): {len(res.models)} model(s) available"
+                    with contextlib.suppress(Exception):
+                        self.query_one("#settings-ai-models-status", Static).update(msg)
+                    self.set_status(msg)
+                    self.append_log(msg)
+                    self.notify_user(msg, title="AI Connection OK")
+
+                self.run_on_ui(_apply_ok)
+            else:
+                err = res.error if res is not None else "No response"
+                hint = DEFAULT_GEMINI_MODEL if target_prov == "gemini" else ""
+                msg = f"{badge} connection failed: {err}" + (f" (default model: {hint})" if hint else "")
+                self.set_status(msg)
+                self.append_log(msg, level="WARNING")
+                self.notify_user(msg, title="AI Connection Failed", severity="warning")
+        except Exception as exc:
+            self.report_error("Test AI Connection", exc)

@@ -1320,4 +1320,70 @@ def test_saved_llm_provider_model_base_url_and_gemini_default_model(
     assert get_local_llm_config(provider="gemini").model == "gemini-2.0-flash"
 
 
+def test_discover_available_ai_models_queries_multiple_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.llm import discover_available_ai_models
+    from tests.e2e.agentic_mocks import MockAgenticLLMAndCopilotServer
+
+    for var in (
+        "RF_LLM_PROVIDER",
+        "RF_LLM_BASE_URL",
+        "RF_LLM_MODEL",
+        "RF_LLM_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "SOCLENS_GEMINI_API_KEY",
+        "GEMINI_BASE_URL",
+        "SOCLENS_LLM_VISIBLE_PROVIDERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        # Gemini missing key returns ok=False without crashing, while OpenAI succeeds
+        monkeypatch.setenv("RF_LLM_BASE_URL", server.openai_base_url)
+        res_partial = discover_available_ai_models(
+            providers=["gemini", "openai"],
+            selected_provider="openai",
+            base_url_override=server.openai_base_url,
+            llm_api_key="sk-local",
+        )
+        by_prov = {r.provider: r for r in res_partial}
+        assert by_prov["gemini"].ok is False
+        assert "key" in (by_prov["gemini"].error or "").lower()
+        assert by_prov["openai"].ok is True
+        assert list(by_prov["openai"].models) == ["qwen2.5-coder:7b", "gpt-4o-mini"]
+
+        # Both Ollama and Gemini succeed when configured
+        monkeypatch.setenv("RF_LLM_BASE_URL", server.ollama_base_url)
+        monkeypatch.setenv("GEMINI_BASE_URL", server.gemini_base_url)
+        res_both = discover_available_ai_models(
+            providers=["ollama", "gemini"],
+            gemini_api_key="AIzaSyDiscoveryTest123456",
+        )
+        by_both = {r.provider: r for r in res_both}
+        assert by_both["ollama"].ok is True
+        assert list(by_both["ollama"].models) == ["llama3.2:latest", "qwen2.5:14b"]
+        assert by_both["gemini"].ok is True
+        assert list(by_both["gemini"].models) == ["gemini-2.5-flash", "gemini-2.5-pro"]
+
+        # Unreachable provider is isolated cleanly alongside a healthy provider
+        res_mixed = discover_available_ai_models(
+            providers=["ollama", "gemini"],
+            selected_provider="ollama",
+            base_url_override="http://127.0.0.1:9",
+            gemini_api_key="AIzaSyDiscoveryTest123456",
+            timeout=1.0,
+        )
+        by_mixed = {r.provider: r for r in res_mixed}
+        assert by_mixed["ollama"].ok is False
+        assert by_mixed["gemini"].ok is True
+        assert "gemini-2.5-pro" in by_mixed["gemini"].models
+
+
+
 

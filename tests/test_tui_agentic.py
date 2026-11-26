@@ -1380,13 +1380,13 @@ def test_control_panel_tool_limits_presets_and_settings_sync(tmp_path: Path) -> 
             assert pol.max_identical_tool_calls == 6
             assert pol.max_same_tool_failures == 25
 
-            # Switch to Settings -> Workspace & Defaults reflects 300/6/25
+            # Switch to Settings -> AI & LLM Settings reflects 300/6/25
             app.activate_tab("tab-settings")
             await pilot.pause()
             await app.ensure_tab_mounted("tab-settings")
             await pilot.pause()
             settings_pane = app.query_one(SettingsPane)
-            settings_pane.select_category("cat-workspace")
+            settings_pane.select_category("cat-ai")
             await pilot.pause()
             assert settings_pane.query_one("#set-ai-max-tool-steps", Input).value == "300"
             assert settings_pane.query_one("#set-ai-max-identical-calls", Input).value == "6"
@@ -1457,7 +1457,7 @@ def test_settings_llm_defaults_gemini_autofallback_and_active_session_model(
 
             # Configure Default AI Provider + Model in Settings -> Save -> verifies persistence
             settings_pane = app_gemini.query_one(SettingsPane)
-            settings_pane.select_category("cat-workspace")
+            settings_pane.select_category("cat-ai")
             await pilot.pause()
             settings_pane.query_one("#set-rf-llm-provider", Select).value = "gemini"
             settings_pane.query_one("#set-rf-llm-model", Input).value = "gemini-2.5-pro"
@@ -1507,6 +1507,99 @@ def test_settings_llm_defaults_gemini_autofallback_and_active_session_model(
             assert client.config.model == "qwen2.5-coder:7b"
 
     asyncio.run(_run_session_fallback())
+
+
+def test_ai_settings_page_queries_available_ais_and_picks_default_model_from_dropdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.config import get_local_llm_config
+    from soclens.settings import (
+        clear_session_overrides,
+        invalidate_settings_cache,
+    )
+    from soclens.tui.screens.settings import SettingsPane
+    from tests.e2e.agentic_mocks import MockAgenticLLMAndCopilotServer
+
+    for var in (
+        "RF_LLM_PROVIDER",
+        "RF_LLM_BASE_URL",
+        "RF_LLM_MODEL",
+        "RF_LLM_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "SOCLENS_GEMINI_API_KEY",
+        "GEMINI_MODEL",
+        "GEMINI_BASE_URL",
+        "SOCLENS_LLM_VISIBLE_PROVIDERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(settings_path))
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        monkeypatch.setenv("GEMINI_BASE_URL", server.gemini_base_url)
+
+        app = create_app(
+            client=MagicMock(),
+            dry_run=True,
+            initial_tab="tab-settings",
+            workspace_dir=tmp_path,
+            no_secret_store=True,
+            preload_alerts=False,
+        )
+
+        async def _run() -> None:
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.pause()
+                settings_pane = app.query_one(SettingsPane)
+                settings_pane.select_category("cat-ai")
+                await pilot.pause()
+
+                # Provide an Ollama base URL + a Gemini API key, then query all available AIs
+                settings_pane.query_one("#set-rf-llm-provider", Select).value = "ollama"
+                settings_pane.query_one("#set-rf-llm-base-url", Input).value = server.ollama_base_url
+                settings_pane.query_one("#set-gemini-api-key", Input).value = "AIzaSyLiveQueryKey123456"
+                await pilot.pause()
+
+                await pilot.click("#settings-refresh-ai-models-btn")
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                status_text = str(settings_pane.query_one("#settings-ai-models-status", Static).content)
+                assert "Ollama: 2 model(s)" in status_text
+                assert "Gemini: 2 model(s)" in status_text
+
+                # Dropdown contains queried models from both available AIs
+                model_sel = settings_pane.query_one("#set-rf-llm-model-select", Select)
+                option_vals = [val for _lbl, val in model_sel._options]
+                assert "ollama::llama3.2:latest" in option_vals
+                assert "ollama::qwen2.5:14b" in option_vals
+                assert "gemini::gemini-2.5-flash" in option_vals
+                assert "gemini::gemini-2.5-pro" in option_vals
+
+                # Pick a queried Gemini model from dropdown -> auto-syncs input AND provider!
+                model_sel.value = "gemini::gemini-2.5-pro"
+                await pilot.pause()
+                assert settings_pane.query_one("#set-rf-llm-model", Input).value == "gemini-2.5-pro"
+                assert settings_pane.query_one("#set-rf-llm-provider", Select).value == "gemini"
+
+                # Save Settings -> get_local_llm_config() reflects chosen provider & model
+                await pilot.click("#settings-save-btn")
+                await pilot.pause()
+
+                invalidate_settings_cache()
+                cfg = get_local_llm_config()
+                assert cfg.provider == "gemini"
+                assert cfg.model == "gemini-2.5-pro"
+
+        asyncio.run(_run())
+
 
 
 

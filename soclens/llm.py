@@ -6,6 +6,8 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -15,12 +17,16 @@ from requests.adapters import HTTPAdapter
 
 from soclens.config import (
     COPILOT_LLM_PROVIDERS,
+    SUPPORTED_LLM_PROVIDERS,
     ConfigurationError,
     ConfiguredSession,
     CopilotAgentPreset,
     LocalLLMConfig,
     PivotPayload,
+    _clean_optional_str,
+    _normalize_llm_provider,
     get_local_llm_config,
+    parse_copilot_agent_presets,
     suppress_insecure_ssl_warnings,
 )
 from soclens.copilot import (
@@ -30,6 +36,7 @@ from soclens.copilot import (
     SecurityCopilotTransport,
     is_copilot_d2e_url,
 )
+from soclens.settings import get_effective_setting
 
 __all__ = [
     "SOC_PROMPT_TEMPLATES",
@@ -37,7 +44,9 @@ __all__ = [
     "LocalLLMConfigError",
     "LocalLLMConnectionError",
     "LocalLLMError",
+    "ProviderModelsResult",
     "build_copilot_prompt",
+    "discover_available_ai_models",
     "format_llm_copilot_context",
 ]
 
@@ -1760,3 +1769,172 @@ class LocalLLMClient:
             max_tokens=max_tokens,
             stream_callback=stream_callback,
         )
+
+
+@dataclass(frozen=True)
+class ProviderModelsResult:
+    """Result of querying available models/agents from a single AI provider."""
+
+    provider: str
+    ok: bool
+    models: tuple[str, ...] = ()
+    base_url: str = ""
+    error: str | None = None
+
+
+def discover_available_ai_models(
+    *,
+    providers: Sequence[str] | None = None,
+    selected_provider: str | None = None,
+    base_url_override: str | None = None,
+    gemini_api_key: str | None = None,
+    llm_api_key: str | None = None,
+    visible_providers: tuple[str, ...] | None = None,
+    ms_copilot_bearer_token: str | None = None,
+    ms_copilot_token_endpoint: str | None = None,
+    ms_copilot_directline_secret: str | None = None,
+    ms_copilot_agents_json: str | None = None,
+    verify_ssl: bool | str | None = None,
+    timeout: float = 4.0,
+    stop_event: threading.Event | None = None,
+) -> list[ProviderModelsResult]:
+    """Query available models/agents across configured AI providers concurrently."""
+    base_cfg = get_local_llm_config()
+    eff_visible = visible_providers if visible_providers is not None else base_cfg.visible_providers
+    allowed: set[str] = set(eff_visible) if eff_visible else set(SUPPORTED_LLM_PROVIDERS)
+
+    norm_selected = ""
+    if _clean_optional_str(selected_provider):
+        try:
+            norm_selected = _normalize_llm_provider(selected_provider)
+        except ConfigurationError:
+            norm_selected = ""
+
+    eff_gemini_key = (
+        _clean_optional_str(gemini_api_key)
+        or _clean_optional_str(get_effective_setting("gemini_api_key"))
+        or (_clean_optional_str(llm_api_key) if norm_selected == "gemini" else None)
+    )
+    eff_llm_key = _clean_optional_str(llm_api_key) or _clean_optional_str(
+        get_effective_setting("rf_llm_api_key")
+    )
+    eff_base_override = _clean_optional_str(base_url_override)
+    eff_ms_token = _clean_optional_str(ms_copilot_bearer_token) or _clean_optional_str(
+        get_effective_setting("ms_copilot_bearer_token")
+    )
+    eff_ms_ep = _clean_optional_str(ms_copilot_token_endpoint) or _clean_optional_str(
+        get_effective_setting("ms_copilot_token_endpoint")
+    )
+    eff_ms_dl_secret = _clean_optional_str(ms_copilot_directline_secret) or _clean_optional_str(
+        get_effective_setting("ms_copilot_directline_secret")
+    )
+    eff_ms_auth_mode = (_clean_optional_str(get_effective_setting("ms_copilot_auth_mode")) or "token").lower()
+    if ms_copilot_agents_json is not None:
+        try:
+            eff_presets: tuple[CopilotAgentPreset, ...] = parse_copilot_agent_presets(ms_copilot_agents_json)
+        except ConfigurationError:
+            eff_presets = ()
+    else:
+        eff_presets = base_cfg.agent_presets
+
+    targets: list[str] = []
+    if providers is not None:
+        for raw_p in providers:
+            if not _clean_optional_str(raw_p):
+                continue
+            try:
+                norm_p = _normalize_llm_provider(raw_p)
+            except ConfigurationError:
+                continue
+            if norm_p not in targets:
+                targets.append(norm_p)
+    else:
+        if norm_selected:
+            targets.append(norm_selected)
+        if "gemini" in allowed and eff_gemini_key and "gemini" not in targets:
+            targets.append("gemini")
+        if "ollama" in allowed and "ollama" not in targets:
+            targets.append("ollama")
+        if (
+            "openai" in allowed
+            and "openai" not in targets
+            and (
+                eff_base_override
+                or eff_llm_key
+                or _clean_optional_str(get_effective_setting("rf_llm_base_url"))
+            )
+        ):
+            targets.append("openai")
+        for cp in ("copilot_directline", "copilot_studio", "m365_copilot", "security_copilot"):
+            if cp not in allowed or cp in targets:
+                continue
+            has_preset = any(preset.provider == cp for preset in eff_presets)
+            has_creds = (
+                (cp in ("copilot_directline", "copilot_studio") and bool(eff_ms_ep))
+                or (cp == "copilot_directline" and bool(eff_ms_dl_secret))
+                or (cp in ("m365_copilot", "security_copilot") and (bool(eff_ms_token) or eff_ms_auth_mode == "az_cli"))
+            )
+            if has_preset or has_creds:
+                targets.append(cp)
+
+    if not targets:
+        return []
+
+    def _probe(prov: str) -> ProviderModelsResult:
+        if stop_event is not None and stop_event.is_set():
+            return ProviderModelsResult(provider=prov, ok=False, models=(), error="Cancelled")
+        prov_base_url = (
+            eff_base_override
+            if (eff_base_override and (prov == norm_selected or (not norm_selected and prov in ("ollama", "openai"))))
+            else None
+        )
+        prov_api_key = (
+            eff_gemini_key
+            if prov == "gemini"
+            else (eff_llm_key if prov in ("ollama", "openai") else None)
+        )
+        try:
+            cfg = get_local_llm_config(
+                provider=prov,
+                base_url=prov_base_url,
+                api_key=prov_api_key,
+                timeout=timeout,
+                verify_ssl=verify_ssl,
+                ms_bearer_token=ms_copilot_bearer_token,
+                ms_token_endpoint=ms_copilot_token_endpoint,
+                ms_directline_secret=ms_copilot_directline_secret,
+                agent_presets=eff_presets if eff_presets else None,
+            )
+        except Exception as exc:
+            return ProviderModelsResult(provider=prov, ok=False, models=(), error=str(exc))
+
+        if prov == "gemini" and not cfg.api_key:
+            return ProviderModelsResult(
+                provider=prov,
+                ok=False,
+                models=(),
+                base_url=cfg.base_url,
+                error="No Gemini API key configured",
+            )
+        try:
+            with LocalLLMClient(cfg, stop_event=stop_event) as client:
+                models = client.list_models()
+            return ProviderModelsResult(
+                provider=prov,
+                ok=True,
+                models=tuple(models),
+                base_url=cfg.base_url,
+            )
+        except Exception as exc:
+            return ProviderModelsResult(
+                provider=prov,
+                ok=False,
+                models=(),
+                base_url=cfg.base_url,
+                error=str(exc),
+            )
+
+    if len(targets) == 1:
+        return [_probe(targets[0])]
+    with ThreadPoolExecutor(max_workers=min(4, len(targets)), thread_name_prefix="soclens-ai-models") as pool:
+        return list(pool.map(_probe, targets))

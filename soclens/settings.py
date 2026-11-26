@@ -124,6 +124,7 @@ SETTING_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("workspace", "Workspace & Tool Defaults"),
     ("secret_manager", "Secret Manager (PAM / Vault)"),
     ("osint", "OSINT Enrichment APIs"),
+    ("ai", "AI & LLM Settings"),
 )
 
 SETTING_SPECS: tuple[SettingSpec, ...] = (
@@ -478,7 +479,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="rf_llm_provider",
-        category="workspace",
+        category="ai",
         label="Default AI Provider",
         env_vars=("RF_LLM_PROVIDER",),
         default="",
@@ -487,7 +488,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="rf_llm_model",
-        category="workspace",
+        category="ai",
         label="Default AI / LLM Model",
         env_vars=("RF_LLM_MODEL",),
         default="",
@@ -495,7 +496,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="rf_llm_base_url",
-        category="workspace",
+        category="ai",
         label="Custom LLM Base URL",
         env_vars=("RF_LLM_BASE_URL",),
         value_type="url",
@@ -504,7 +505,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="rf_llm_api_key",
-        category="workspace",
+        category="ai",
         label="Local LLM API Key",
         env_vars=("RF_LLM_API_KEY",),
         secret=True,
@@ -512,7 +513,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="gemini_api_key",
-        category="workspace",
+        category="ai",
         label="Google Gemini API Key",
         env_vars=("GEMINI_API_KEY", "GOOGLE_API_KEY", "SOCLENS_GEMINI_API_KEY"),
         secret=True,
@@ -520,7 +521,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="llm_visible_providers",
-        category="workspace",
+        category="ai",
         label="Visible AI Analyst Providers",
         env_vars=("SOCLENS_LLM_VISIBLE_PROVIDERS",),
         default="",
@@ -528,7 +529,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_auth_mode",
-        category="workspace",
+        category="ai",
         label="MS Copilot Auth Mode",
         env_vars=("SOCLENS_MS_COPILOT_AUTH_MODE",),
         default="token",
@@ -537,7 +538,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_bearer_token",
-        category="workspace",
+        category="ai",
         label="MS Copilot / Graph Bearer Token",
         env_vars=("SOCLENS_MS_COPILOT_TOKEN", "MS_COPILOT_BEARER_TOKEN"),
         secret=True,
@@ -545,7 +546,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_graph_base_url",
-        category="workspace",
+        category="ai",
         label="MS Graph Base URL",
         env_vars=("SOCLENS_MS_COPILOT_GRAPH_URL",),
         value_type="url",
@@ -554,7 +555,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_web_grounding",
-        category="workspace",
+        category="ai",
         label="M365 Copilot Web Grounding",
         env_vars=("SOCLENS_MS_COPILOT_WEB_GROUNDING",),
         value_type="bool",
@@ -563,7 +564,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_directline_url",
-        category="workspace",
+        category="ai",
         label="Copilot Studio Direct Line URL",
         env_vars=("SOCLENS_MS_COPILOT_DIRECTLINE_URL",),
         value_type="url",
@@ -572,7 +573,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_token_endpoint",
-        category="workspace",
+        category="ai",
         label="Copilot Studio Token Endpoint",
         env_vars=("SOCLENS_MS_COPILOT_TOKEN_ENDPOINT",),
         secret=True,
@@ -580,7 +581,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_directline_secret",
-        category="workspace",
+        category="ai",
         label="Copilot Studio Direct Line Secret",
         env_vars=("SOCLENS_MS_COPILOT_DIRECTLINE_SECRET",),
         secret=True,
@@ -588,7 +589,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_security_copilot_workspace",
-        category="workspace",
+        category="ai",
         label="Security Copilot Workspace ID",
         env_vars=("SOCLENS_MS_SECURITY_COPILOT_WORKSPACE",),
         default="default",
@@ -596,7 +597,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_security_copilot_poll_interval",
-        category="workspace",
+        category="ai",
         label="Security Copilot Poll Interval (s)",
         env_vars=("SOCLENS_MS_SECURITY_COPILOT_POLL_INTERVAL",),
         value_type="float",
@@ -605,7 +606,7 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         key="ms_copilot_agents_json",
-        category="workspace",
+        category="ai",
         label="MS Copilot Named Agents (JSON)",
         env_vars=("SOCLENS_MS_COPILOT_AGENTS",),
         description='Optional JSON array of named Copilot/LLM agents: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}].',
