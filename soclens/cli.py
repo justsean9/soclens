@@ -3153,10 +3153,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_s1_act.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
-    # 7. AI Analyst / Local LLM & Microsoft Copilot subcommand
+    # 7. AI Analyst / Local LLM, Gemini API & Microsoft Copilot subcommand
     llm_parser = subparsers.add_parser(
         "llm",
-        help="Interact with Local LLMs (Ollama/OpenAI) or Microsoft Copilot & Security Copilot agents",
+        help="Interact with Local LLMs (Ollama/OpenAI), Google Gemini API, or Microsoft Copilot agents",
     )
     llm_subparsers = llm_parser.add_subparsers(dest="llm_subcommand", metavar="SUBCOMMAND")
 
@@ -3166,6 +3166,7 @@ def build_parser() -> argparse.ArgumentParser:
             choices=[
                 "ollama",
                 "openai",
+                "gemini",
                 "m365_copilot",
                 "copilot_studio",
                 "copilot_directline",
@@ -3182,7 +3183,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--api-key",
             default=None,
-            help="Optional API key, MS Graph Bearer token, or Direct Line secret",
+            help="Optional API key (OpenAI/Gemini), MS Graph Bearer token, or Direct Line secret",
         )
         p.add_argument(
             "--agent",

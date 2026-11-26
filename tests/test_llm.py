@@ -697,3 +697,372 @@ def test_format_llm_copilot_context_renders_spl_query() -> None:
                 spl_query="   ",
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Google Gemini API tests
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_config_defaults_aliases_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from soclens.config import DEFAULT_GEMINI_BASE_URL
+
+    for var in (
+        "RF_LLM_PROVIDER",
+        "RF_LLM_BASE_URL",
+        "RF_LLM_MODEL",
+        "RF_LLM_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "SOCLENS_GEMINI_API_KEY",
+        "GEMINI_MODEL",
+        "GEMINI_BASE_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    invalidate_settings_cache()
+
+    monkeypatch.setenv("RF_LLM_PROVIDER", "google-gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSyTestSecretKey1234567890abcdef")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    invalidate_settings_cache()
+
+    cfg = get_local_llm_config()
+    assert cfg.provider == "gemini"
+    assert cfg.base_url == DEFAULT_GEMINI_BASE_URL
+    assert cfg.model == "gemini-2.5-flash"
+    assert cfg.api_key == "AIzaSyTestSecretKey1234567890abcdef"
+    assert "AIzaSyTestSecretKey1234567890abcdef" not in repr(cfg)
+
+    # Explicit alias normalization
+    for alias in ("gemini", "google", "google_gemini", "gemini-api", "gemini_api"):
+        assert get_local_llm_config(provider=alias).provider == "gemini"
+
+    # Custom GEMINI_BASE_URL takes precedence over default
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://proxy.corp.local/gemini/v1beta")
+    assert get_local_llm_config(provider="gemini").base_url == "https://proxy.corp.local/gemini/v1beta"
+
+
+def test_gemini_list_models_pagination_and_filtering() -> None:
+    session = MagicMock(spec=requests.Session)
+    session.request.side_effect = [
+        _mock_response(
+            200,
+            json_body={
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-flash",
+                        "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    },
+                    {
+                        "name": "models/text-embedding-004",
+                        "supportedGenerationMethods": ["embedContent"],
+                    },
+                ],
+                "nextPageToken": "page-2",
+            },
+        ),
+        _mock_response(
+            200,
+            json_body={
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-pro",
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                ],
+            },
+        ),
+    ]
+
+    with LocalLLMClient(
+        provider="gemini",
+        base_url="https://generativelanguage.googleapis.com",
+        api_key="AIzaSyCanaryModelListKey0123456789",
+        session=session,
+    ) as llm:
+        models = llm.list_models()
+
+    assert models == ["gemini-2.5-flash", "gemini-2.5-pro"]
+    first = session.request.call_args_list[0].kwargs
+    second = session.request.call_args_list[1].kwargs
+    assert first["url"] == "https://generativelanguage.googleapis.com/v1beta/models"
+    assert first["headers"]["x-goog-api-key"] == "AIzaSyCanaryModelListKey0123456789"
+    assert "AIzaSy" not in first["url"]
+    assert second["url"] == "https://generativelanguage.googleapis.com/v1beta/models?pageToken=page-2"
+
+
+def test_gemini_chat_non_streaming_thinking_filter_and_streaming_sse() -> None:
+    # Non-streaming with systemInstruction and thinking part skipped
+    session = MagicMock(spec=requests.Session)
+    session.request.return_value = _mock_response(
+        200,
+        json_body={
+            "modelVersion": "gemini-2.5-flash-001",
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "Internal reasoning...", "thought": True},
+                            {"text": "IOC 198.51.100.5 is high risk."},
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+        },
+    )
+
+    with LocalLLMClient(
+        provider="gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        model="models/gemini-2.5-flash",
+        api_key="AIzaSyCanaryChatKey01234567890abcd",
+        session=session,
+    ) as llm:
+        res = llm.chat(
+            [{"role": "user", "content": "Analyze 198.51.100.5"}],
+            system_prompt="Be concise.",
+            temperature=0.3,
+            max_tokens=512,
+        )
+
+    assert res["content"] == "IOC 198.51.100.5 is high risk."
+    assert res["model"] == "gemini-2.5-flash-001"
+    assert res["provider"] == "gemini"
+    assert res["done"] is True
+    req = session.request.call_args.kwargs
+    assert req["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    assert req["headers"]["x-goog-api-key"] == "AIzaSyCanaryChatKey01234567890abcd"
+    body = req["json"]
+    assert body["systemInstruction"] == {"parts": [{"text": "Be concise."}]}
+    assert body["generationConfig"] == {"temperature": 0.3, "maxOutputTokens": 512}
+    assert body["contents"] == [{"role": "user", "parts": [{"text": "Analyze 198.51.100.5"}]}]
+
+    # Streaming SSE
+    stream_session = MagicMock(spec=requests.Session)
+    stream_session.request.return_value = _mock_response(
+        200,
+        lines=[
+            'data: {"modelVersion":"gemini-2.5-flash","candidates":[{"content":{"role":"model","parts":[{"text":"Step 1. "}]}}]}',
+            'data: {"modelVersion":"gemini-2.5-flash","candidates":[{"content":{"role":"model","parts":[{"text":"Step 2."}]},"finishReason":"STOP"}]}',
+        ],
+    )
+    chunks: list[str] = []
+    with LocalLLMClient(
+        provider="gemini",
+        model="gemini-2.5-flash",
+        api_key="AIzaSyStreamKey01234567890abcdefgh",
+        session=stream_session,
+    ) as llm_s:
+        s_res = llm_s.chat(
+            [{"role": "user", "content": "Stream triage"}],
+            stream_callback=chunks.append,
+        )
+
+    assert stream_session.request.call_args.kwargs["url"] == (
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    )
+    assert chunks == ["Step 1. ", "Step 2."]
+    assert s_res["content"] == "Step 1. Step 2."
+    assert s_res["done"] is True
+
+
+def test_gemini_native_tool_calling_schema_sanitization_and_roundtrip() -> None:
+    session = MagicMock(spec=requests.Session)
+    session.request.side_effect = [
+        _mock_response(
+            200,
+            json_body={
+                "modelVersion": "gemini-2.5-flash",
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "name": "rf_lookup_ioc",
+                                        "args": {"entity_type": "ip", "value": "198.51.100.5"},
+                                    },
+                                    "thoughtSignature": "sig-abc-123",
+                                }
+                            ],
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+            },
+        ),
+        _mock_response(
+            200,
+            json_body={
+                "modelVersion": "gemini-2.5-flash",
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": "Risk score is 89."}],
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+            },
+        ),
+    ]
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "rf_lookup_ioc",
+                "description": "Look up an IOC in Recorded Future.",
+                "parameters": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "entity_type": {"type": "string", "enum": ["ip", "domain"]},
+                        "value": {"type": ["string", "null"], "default": ""},
+                    },
+                    "required": ["entity_type", "value"],
+                },
+            },
+        }
+    ]
+
+    with LocalLLMClient(
+        provider="gemini",
+        model="gemini-2.5-flash",
+        api_key="AIzaSyToolTestKey01234567890abcdef",
+        session=session,
+    ) as llm:
+        turn1 = llm.chat(
+            [{"role": "user", "content": "Check IP 198.51.100.5"}],
+            tools=tools,
+            tool_choice="auto",
+        )
+        assert len(turn1["tool_calls"]) == 1
+        tc = turn1["tool_calls"][0]
+        assert tc["function"]["name"] == "rf_lookup_ioc"
+        assert json.loads(tc["function"]["arguments"]) == {
+            "entity_type": "ip",
+            "value": "198.51.100.5",
+        }
+        assert tc["thoughtSignature"] == "sig-abc-123"
+
+        # Verify schema sanitization on Turn 1 request
+        req1_body = session.request.call_args_list[0].kwargs["json"]
+        decl = req1_body["tools"][0]["functionDeclarations"][0]
+        assert "$schema" not in decl["parameters"]
+        assert "additionalProperties" not in decl["parameters"]
+        assert decl["parameters"]["properties"]["value"] == {"type": "string", "nullable": True}
+        assert req1_body["toolConfig"] == {"functionCallingConfig": {"mode": "AUTO"}}
+
+        # Turn 2: pass assistant tool_calls + tool result back
+        turn2 = llm.chat(
+            [
+                {"role": "user", "content": "Check IP 198.51.100.5"},
+                {"role": "assistant", "content": "", "tool_calls": turn1["tool_calls"]},
+                {
+                    "role": "tool",
+                    "name": "rf_lookup_ioc",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps({"risk_score": 89}),
+                },
+            ],
+            tools=tools,
+        )
+        assert turn2["content"] == "Risk score is 89."
+
+    req2_contents = session.request.call_args_list[1].kwargs["json"]["contents"]
+    assert req2_contents[1]["role"] == "model"
+    assert req2_contents[1]["parts"][0]["functionCall"] == {
+        "name": "rf_lookup_ioc",
+        "args": {"entity_type": "ip", "value": "198.51.100.5"},
+    }
+    assert req2_contents[1]["parts"][0]["thoughtSignature"] == "sig-abc-123"
+    assert req2_contents[2] == {
+        "role": "user",
+        "parts": [{"functionResponse": {"name": "rf_lookup_ioc", "response": {"risk_score": 89}}}],
+    }
+
+
+def test_gemini_prompt_blocked_and_audit_redaction() -> None:
+    from soclens.agent_audit import redact_sensitive_data
+
+    session = MagicMock(spec=requests.Session)
+    session.request.return_value = _mock_response(
+        200,
+        json_body={"promptFeedback": {"blockReason": "SAFETY"}},
+    )
+    with LocalLLMClient(
+        provider="gemini",
+        model="gemini-2.5-flash",
+        api_key="AIzaSyBlockedCanary0123456789abcde",
+        session=session,
+    ) as llm:
+        with pytest.raises(LocalLLMError, match="SAFETY"):
+            llm.chat([{"role": "user", "content": "test"}])
+
+    redacted = redact_sensitive_data(
+        {
+            "gemini_api_key": "AIzaSyAuditLeakTest0123456789abcde",
+            "headers": {"x-goog-api-key": "AIzaSyAuditLeakTest0123456789abcde"},
+            "note": "leaked AIzaSyAuditLeakTest0123456789abcde in text",
+        }
+    )
+    assert "AIzaSyAuditLeakTest" not in json.dumps(redacted)
+
+
+def test_cli_llm_gemini_status_and_chat(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_llm = MagicMock(spec=LocalLLMClient)
+    fake_llm.__enter__.return_value = fake_llm
+    fake_llm.__exit__.return_value = None
+    fake_llm.check_connection.return_value = {
+        "ok": True,
+        "provider": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
+        "error": None,
+    }
+    fake_llm.chat.return_value = {
+        "content": "Gemini triage summary.",
+        "model": "gemini-2.5-flash",
+        "provider": "gemini",
+        "done": True,
+        "raw": {},
+    }
+
+    with patch("soclens.cli.LocalLLMClient", return_value=fake_llm):
+        monkeypatch.setattr(
+            sys, "argv", ["soclens", "llm", "status", "--provider", "gemini", "--json"]
+        )
+        cli.main()
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is True
+        assert out["provider"] == "gemini"
+        assert "gemini-2.5-flash" in out["models"]
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "soclens",
+                "llm",
+                "chat",
+                "--provider",
+                "gemini",
+                "--model",
+                "gemini-2.5-flash",
+                "--prompt",
+                "Summarize IOC",
+                "--json",
+            ],
+        )
+        cli.main()
+        chat_out = json.loads(capsys.readouterr().out)
+        assert chat_out["content"] == "Gemini triage summary."
+        assert chat_out["provider"] == "gemini"

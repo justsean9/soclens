@@ -112,6 +112,7 @@ _SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("splunk_password", "set-splunk-password", "set-splunk-password-vault"),
     ("s1_api_token", "set-s1-api-token", "set-s1-api-token-vault"),
     ("rf_llm_api_key", "set-rf-llm-api-key", "set-rf-llm-api-key-vault"),
+    ("gemini_api_key", "set-gemini-api-key", "set-gemini-api-key-vault"),
     ("ms_copilot_bearer_token", "set-ms-copilot-bearer-token", "set-ms-copilot-bearer-token-vault"),
     ("ms_copilot_token_endpoint", "set-ms-copilot-token-endpoint", "set-ms-copilot-token-endpoint-vault"),
     (
@@ -191,6 +192,7 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "soclens_auto_approve": ("cat-workspace", "set-auto-approve"),
     "soclens_ascii_art_enabled": ("cat-workspace", "set-ascii-art-enabled"),
     "rf_llm_api_key": ("cat-workspace", "set-rf-llm-api-key"),
+    "gemini_api_key": ("cat-workspace", "set-gemini-api-key"),
     "llm_visible_providers": ("cat-workspace", "set-llm-visible-providers"),
     "ms_copilot_auth_mode": ("cat-workspace", "set-ms-copilot-auth-mode"),
     "ms_copilot_bearer_token": ("cat-workspace", "set-ms-copilot-bearer-token"),
@@ -314,6 +316,7 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
     ("rf_ignored_hashes_file", "set-ignored-hashes-file", "Optional ignored_hashes.txt path"),
     ("rf_ignored_hashes", "set-ignored-hashes", "Comma-separated SHA-256 hashes"),
     ("rf_llm_api_key", "set-rf-llm-api-key", "Optional API key for OpenAI-compatible local LLM"),
+    ("gemini_api_key", "set-gemini-api-key", "Google AI Studio / Gemini API key (GEMINI_API_KEY)"),
     (
         "ms_copilot_bearer_token",
         "set-ms-copilot-bearer-token",
@@ -962,6 +965,16 @@ class SettingsPane(BaseSocPane):
                             compact=True,
                         )
                         yield self._make_vault_select("set-rf-llm-api-key-vault")
+                        yield self._make_label("gemini_api_key")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Google AI Studio / Gemini API key (GEMINI_API_KEY)",
+                            id="set-gemini-api-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_vault_select("set-gemini-api-key-vault")
                         yield Static(
                             "Microsoft Enterprise Copilot & Security Copilot (Token-First)",
                             classes="section-label",
@@ -970,6 +983,7 @@ class SettingsPane(BaseSocPane):
                         yield Select(
                             [
                                 ("Show All AI Providers (Default)", ""),
+                                ("Google Gemini API Only", "gemini"),
                                 ("Copilot Studio (Direct Line) Only", "copilot_directline"),
                                 (
                                     "Copilot Studio Only (Direct Line & Direct-to-Engine)",
@@ -984,6 +998,10 @@ class SettingsPane(BaseSocPane):
                                     "copilot_directline,copilot_studio,m365_copilot,security_copilot",
                                 ),
                                 ("Local LLMs Only (Ollama & OpenAI-Compatible)", "ollama,openai"),
+                                (
+                                    "Local LLMs + Gemini API (Ollama, OpenAI, Gemini)",
+                                    "ollama,openai,gemini",
+                                ),
                             ],
                             allow_blank=False,
                             value="",
@@ -2084,6 +2102,7 @@ class SettingsPane(BaseSocPane):
             vis_sel = self.query_one("#set-llm-visible-providers", Select)
             vis_preset_opts = [
                 ("Show All AI Providers (Default)", ""),
+                ("Google Gemini API Only", "gemini"),
                 ("Copilot Studio (Direct Line) Only", "copilot_directline"),
                 (
                     "Copilot Studio Only (Direct Line & Direct-to-Engine)",
@@ -2098,6 +2117,10 @@ class SettingsPane(BaseSocPane):
                     "copilot_directline,copilot_studio,m365_copilot,security_copilot",
                 ),
                 ("Local LLMs Only (Ollama & OpenAI-Compatible)", "ollama,openai"),
+                (
+                    "Local LLMs + Gemini API (Ollama, OpenAI, Gemini)",
+                    "ollama,openai,gemini",
+                ),
             ]
             if vis_prov and not any(v == vis_prov for _, v in vis_preset_opts):
                 vis_preset_opts.append((f"Custom ({vis_prov})", vis_prov))

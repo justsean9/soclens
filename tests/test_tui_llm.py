@@ -264,3 +264,48 @@ def test_tui_llm_visible_providers_directline_only(
             assert pane.query_one("#llm-provider-select", Select).value == "copilot_directline"
 
     asyncio.run(_run())
+
+
+def test_tui_llm_gemini_provider_switch_and_chat(tmp_path: Path) -> None:
+    from soclens.config import DEFAULT_GEMINI_BASE_URL
+
+    mock_llm = MagicMock(spec=LocalLLMClient)
+    mock_llm.__enter__.return_value = mock_llm
+    mock_llm.__exit__.return_value = None
+    mock_llm.chat.return_value = {
+        "content": "Gemini TUI analysis reply.",
+        "model": "gemini-2.5-flash",
+        "provider": "gemini",
+        "done": True,
+        "raw": {},
+    }
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        with patch("soclens.tui.screens.llm.LocalLLMClient", return_value=mock_llm):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                pane = app.query_one(LocalLLMPane)
+
+                pane.query_one("#llm-provider-select", Select).value = "gemini"
+                await pilot.pause()
+                assert pane.query_one("#llm-base-url-input", Input).value == DEFAULT_GEMINI_BASE_URL
+                assert pane.query_one("#llm-model-input", Input).value == "gemini-2.5-flash"
+
+                pane.query_one("#llm-prompt", Input).value = "Triage CVE-2026-1234"
+                pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                transcript = _richlog_text(pane.query_one("#llm-transcript", RichLog))
+                assert "Gemini TUI analysis reply." in transcript
+                assert mock_llm.chat.call_count == 1
+
+    asyncio.run(_run())

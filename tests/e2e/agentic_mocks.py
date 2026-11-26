@@ -88,11 +88,13 @@ def agentic_workspace(
 
 
 class MockAgenticLLMAndCopilotServer(_BaseV21MockServer):
-    """Unified localhost HTTP mock serving all 6 SOCLens LLM and Copilot providers.
+    """Unified localhost HTTP mock serving all 7 SOCLens LLM and Copilot providers.
 
     Supported providers & routes:
     - ``ollama``: ``GET /api/tags``, ``POST /api/chat`` (native ``tool_calls`` + ``<tool_call>`` + NDJSON)
     - ``openai``: ``GET /v1/models``, ``POST /v1/chat/completions`` (native ``tool_calls`` + ``<tool_call>`` + SSE)
+    - ``gemini``: ``GET /v1beta/models``, ``POST /v1beta/models/{m}:generateContent``,
+      ``POST /v1beta/models/{m}:streamGenerateContent?alt=sse`` (native ``functionCall`` + ``<tool_call>`` + SSE)
     - ``m365_copilot``: ``GET /graph/beta/me``, ``POST /graph/beta/copilot/conversations``,
       ``POST .../chat``, ``POST .../chatOverStream`` (SSE)
     - ``copilot_studio`` (D2E): ``POST /copilotstudio/.../bots/{bot}/conversations``,
@@ -109,6 +111,7 @@ class MockAgenticLLMAndCopilotServer(_BaseV21MockServer):
         super().__init__()
         self.ollama_base_url: str = self.base_url
         self.openai_base_url: str = f"{self.base_url}/v1"
+        self.gemini_base_url: str = f"{self.base_url}/v1beta"
         self.graph_base_url: str = f"{self.base_url}/graph/beta"
         self.directline_base_url: str = f"{self.base_url}/v3/directline"
         self.directline_token_endpoint: str = f"{self.base_url}/powerplatform/directline/token"
@@ -131,6 +134,23 @@ class MockAgenticLLMAndCopilotServer(_BaseV21MockServer):
             "openai_models": [
                 {"id": "qwen2.5-coder:7b", "object": "model", "owned_by": "local.example.test"},
                 {"id": "gpt-4o-mini", "object": "model", "owned_by": "local.example.test"},
+            ],
+            "gemini_models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "displayName": "Gemini 2.5 Flash",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                },
+                {
+                    "name": "models/gemini-2.5-pro",
+                    "displayName": "Gemini 2.5 Pro",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "displayName": "Text Embedding 004",
+                    "supportedGenerationMethods": ["embedContent"],
+                },
             ],
             "required_api_key": None,
             "required_bearer_token": None,
@@ -213,6 +233,8 @@ class MockAgenticLLMAndCopilotServer(_BaseV21MockServer):
             monkeypatch.setenv("RF_LLM_MODEL", "llama3.2:latest")
         elif provider == "openai":
             monkeypatch.setenv("RF_LLM_MODEL", "qwen2.5-coder:7b")
+        elif provider == "gemini":
+            monkeypatch.setenv("RF_LLM_MODEL", "gemini-2.5-flash")
         else:
             monkeypatch.delenv("RF_LLM_MODEL", raising=False)
 
@@ -221,6 +243,9 @@ class MockAgenticLLMAndCopilotServer(_BaseV21MockServer):
         elif provider == "openai":
             monkeypatch.setenv("RF_LLM_BASE_URL", self.openai_base_url)
             monkeypatch.setenv("RF_LLM_API_KEY", api_key)
+        elif provider == "gemini":
+            monkeypatch.setenv("GEMINI_BASE_URL", self.gemini_base_url)
+            monkeypatch.setenv("GEMINI_API_KEY", api_key)
         elif provider == "m365_copilot":
             monkeypatch.setenv("SOCLENS_MS_COPILOT_GRAPH_URL", self.graph_base_url)
             monkeypatch.setenv("SOCLENS_MS_COPILOT_TOKEN", token)
@@ -604,6 +629,168 @@ class MockAgenticLLMAndCopilotServer(_BaseV21MockServer):
                     )
                     events.append("data: [DONE]")
                     self._send_sse(handler, 200, "\n\n".join(events) + "\n\n")
+                    return
+
+            # --- 2b. Google Gemini REST API ---
+            if path == "/v1beta/models" or path.startswith("/v1beta/models/"):
+                req_key = self.state.get("required_api_key")
+                if req_key:
+                    got_key = headers.get("x-goog-api-key", "")
+                    if got_key != req_key:
+                        self._send_json(
+                            handler,
+                            401,
+                            {"error": {"code": 401, "message": "API key not valid."}},
+                        )
+                        return
+
+                if path == "/v1beta/models" and method == "GET":
+                    self._send_json(
+                        handler,
+                        200,
+                        {"models": copy.deepcopy(self.state["gemini_models"])},
+                    )
+                    return
+
+                if (
+                    path.startswith("/v1beta/models/")
+                    and method == "POST"
+                    and (path.endswith(":generateContent") or path.endswith(":streamGenerateContent"))
+                ):
+                    body = json_body if isinstance(json_body, dict) else {}
+                    contents = body.get("contents")
+                    if not isinstance(contents, list) or not contents:
+                        self._send_json(
+                            handler, 400, {"error": {"message": "contents required"}}
+                        )
+                        return
+                    is_stream = path.endswith(":streamGenerateContent")
+                    suffix = ":streamGenerateContent" if is_stream else ":generateContent"
+                    model_id = path[len("/v1beta/models/") : -len(suffix)] or "gemini-2.5-flash"
+                    raw_tools = body.get("tools")
+                    tools_list = list(raw_tools) if isinstance(raw_tools, list) else []
+                    last_parts = contents[-1].get("parts") if isinstance(contents[-1], Mapping) else []
+                    turn_text = ""
+                    if isinstance(last_parts, list) and last_parts:
+                        first_part = last_parts[0]
+                        if isinstance(first_part, Mapping):
+                            turn_text = str(first_part.get("text") or first_part.get("functionResponse") or "")
+                    reply = self._resolve_turn_reply_locked(
+                        provider="gemini",
+                        path=path,
+                        messages=contents,
+                        turn_text=turn_text,
+                        tools=tools_list,
+                        headers=headers,
+                    )
+                    status = int(reply.get("status_code") or 200)
+                    if status >= 400:
+                        self._send_json(
+                            handler,
+                            status,
+                            reply.get("error_body") or {"error": {"message": f"HTTP {status}"}},
+                        )
+                        return
+
+                    content_str = self._extract_reply_text(reply)
+                    raw_tcs = reply.get("tool_calls")
+                    parts_out: list[dict[str, Any]] = []
+                    if raw_tcs:
+                        if tools_list:
+                            if content_str:
+                                parts_out.append({"text": content_str})
+                            for tc in raw_tcs:
+                                fn = (
+                                    tc.get("function")
+                                    if isinstance(tc.get("function"), Mapping)
+                                    else tc
+                                )
+                                raw_args = fn.get("arguments")
+                                if isinstance(raw_args, Mapping):
+                                    args_obj = dict(raw_args)
+                                elif isinstance(raw_args, str) and raw_args.strip():
+                                    try:
+                                        args_obj = json.loads(raw_args)
+                                    except ValueError:
+                                        args_obj = {}
+                                else:
+                                    args_obj = {}
+                                parts_out.append(
+                                    {
+                                        "functionCall": {
+                                            "name": str(fn.get("name") or ""),
+                                            "args": args_obj,
+                                        }
+                                    }
+                                )
+                        else:
+                            tag_text = self._format_tool_call_tags(raw_tcs)
+                            merged = f"{content_str}\n{tag_text}".strip() if content_str else tag_text
+                            parts_out.append({"text": merged})
+                    else:
+                        parts_out.append({"text": content_str})
+
+                    if not is_stream:
+                        self._send_json(
+                            handler,
+                            200,
+                            {
+                                "modelVersion": model_id,
+                                "candidates": [
+                                    {
+                                        "content": {"role": "model", "parts": parts_out},
+                                        "finishReason": "STOP",
+                                    }
+                                ],
+                            },
+                        )
+                        return
+
+                    raw_chunks = reply.get("chunks")
+                    sse_events: list[str] = []
+                    if raw_chunks is not None:
+                        for ch in raw_chunks:
+                            sse_events.append(
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "modelVersion": model_id,
+                                        "candidates": [
+                                            {"content": {"role": "model", "parts": [{"text": ch}]}}
+                                        ],
+                                    }
+                                )
+                            )
+                        sse_events.append(
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "modelVersion": model_id,
+                                    "candidates": [
+                                        {
+                                            "content": {"role": "model", "parts": []},
+                                            "finishReason": "STOP",
+                                        }
+                                    ],
+                                }
+                            )
+                        )
+                    else:
+                        sse_events.append(
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "modelVersion": model_id,
+                                    "candidates": [
+                                        {
+                                            "content": {"role": "model", "parts": parts_out},
+                                            "finishReason": "STOP",
+                                        }
+                                    ],
+                                }
+                            )
+                        )
+                    self._send_sse(handler, 200, "\n\n".join(sse_events) + "\n\n")
                     return
 
             # --- 3. Microsoft Graph Beta (M365 Copilot & Security Copilot) ---

@@ -498,8 +498,9 @@ def test_wave0_categories_specs_and_aliases(monkeypatch: pytest.MonkeyPatch) -> 
         "bitwarden",
         "akeyless",
     )
-    assert len(settings_mod.SECRET_MANAGED_SETTING_KEYS) == 13
+    assert len(settings_mod.SECRET_MANAGED_SETTING_KEYS) == 14
     assert "rf_llm_api_key" in settings_mod.SECRET_MANAGED_SETTING_KEYS
+    assert "gemini_api_key" in settings_mod.SECRET_MANAGED_SETTING_KEYS
     assert "splunk_username" in settings_mod.SECRET_MANAGED_SETTING_KEYS
 
     bw_pw = settings_mod.SETTING_SPECS_BY_KEY["bw_master_password"]

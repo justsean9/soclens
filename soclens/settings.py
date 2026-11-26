@@ -100,6 +100,7 @@ SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
     "splunk_password",
     "s1_api_token",
     "rf_llm_api_key",
+    "gemini_api_key",
     "ms_copilot_bearer_token",
     "ms_copilot_token_endpoint",
     "ms_copilot_directline_secret",
@@ -473,6 +474,14 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         env_vars=("RF_LLM_API_KEY",),
         secret=True,
         description="Optional API key for OpenAI-compatible local LLM endpoints.",
+    ),
+    SettingSpec(
+        key="gemini_api_key",
+        category="workspace",
+        label="Google Gemini API Key",
+        env_vars=("GEMINI_API_KEY", "GOOGLE_API_KEY", "SOCLENS_GEMINI_API_KEY"),
+        secret=True,
+        description="Google AI Studio / Gemini Developer API key (sent via x-goog-api-key header).",
     ),
     SettingSpec(
         key="llm_visible_providers",

@@ -19,6 +19,7 @@ from soclens.agent_policy import AIPolicyStore
 from soclens.config import (
     COPILOT_LLM_PROVIDERS,
     DEFAULT_COPILOT_DIRECTLINE_URL,
+    DEFAULT_GEMINI_BASE_URL,
     DEFAULT_M365_COPILOT_GRAPH_URL,
     DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OPENAI_BASE_URL,
@@ -36,6 +37,7 @@ _MANUAL_MODEL_VALUE = "__manual__"
 _PROVIDER_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Ollama", "ollama"),
     ("OpenAI-Compatible", "openai"),
+    ("Google Gemini API", "gemini"),
     ("M365 Copilot Chat", "m365_copilot"),
     ("Copilot Studio (Direct-to-Engine)", "copilot_studio"),
     ("Copilot Studio (Direct Line)", "copilot_directline"),
@@ -45,11 +47,18 @@ _PROVIDER_OPTIONS: tuple[tuple[str, str], ...] = (
 _PROVIDER_SHORT_LABELS: dict[str, str] = {
     "ollama": "Ollama",
     "openai": "OpenAI",
+    "gemini": "Gemini",
     "m365_copilot": "M365 Copilot",
     "copilot_studio": "Copilot Studio D2E",
     "copilot_directline": "Copilot Direct Line",
     "security_copilot": "Security Copilot",
 }
+
+_DEFAULT_GEMINI_MODELS: tuple[str, ...] = (
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+)
 
 _VALID_PROVIDERS: frozenset[str] = frozenset(_PROVIDER_SHORT_LABELS.keys())
 
@@ -98,6 +107,8 @@ def _default_url_for_provider(provider: str) -> str:
     cfg = get_local_llm_config(provider=provider)
     if provider == "openai":
         return DEFAULT_OPENAI_BASE_URL
+    if provider == "gemini":
+        return cfg.base_url or DEFAULT_GEMINI_BASE_URL
     if provider in ("m365_copilot", "security_copilot"):
         return cfg.ms_graph_base_url or DEFAULT_M365_COPILOT_GRAPH_URL
     if provider == "copilot_studio":
@@ -241,6 +252,13 @@ class LocalLLMPane(BaseSocPane):
             default_label = _default_agent_label_for_provider(provider)
             if default_label and default_label not in candidates:
                 candidates.insert(0, default_label)
+        elif provider == "gemini":
+            for m in self._available_models:
+                if m not in candidates:
+                    candidates.append(m)
+            for m in _DEFAULT_GEMINI_MODELS:
+                if m not in candidates:
+                    candidates.append(m)
         else:
             for m in self._available_models:
                 if m not in candidates:
@@ -252,7 +270,7 @@ class LocalLLMPane(BaseSocPane):
         options.append(("(Manual / Custom)", _MANUAL_MODEL_VALUE))
         if current_model and current_model in candidates:
             selected = current_model
-        elif provider in COPILOT_LLM_PROVIDERS and candidates:
+        elif provider in (*COPILOT_LLM_PROVIDERS, "gemini") and candidates:
             selected = candidates[0]
         else:
             selected = _MANUAL_MODEL_VALUE
@@ -294,7 +312,7 @@ class LocalLLMPane(BaseSocPane):
         session_options = [(s.display_label(), s.session_id) for s in self._sessions.values()]
 
         yield Static(
-            "AI Analyst (Local LLM & Microsoft Copilot Multi-Agent)",
+            "AI Analyst (Local LLM, Gemini API & Microsoft Copilot Multi-Agent)",
             classes="pane-title",
             markup=False,
         )
@@ -737,6 +755,7 @@ class LocalLLMPane(BaseSocPane):
             "",
             DEFAULT_OLLAMA_BASE_URL,
             DEFAULT_OPENAI_BASE_URL,
+            DEFAULT_GEMINI_BASE_URL,
             DEFAULT_M365_COPILOT_GRAPH_URL,
             DEFAULT_COPILOT_DIRECTLINE_URL,
         }
@@ -757,7 +776,7 @@ class LocalLLMPane(BaseSocPane):
         with model_sel.prevent(Select.Changed):
             model_sel.set_options(options)
             model_sel.value = selected
-        if new_provider in COPILOT_LLM_PROVIDERS:
+        if new_provider in (*COPILOT_LLM_PROVIDERS, "gemini"):
             with model_inp.prevent(Input.Changed):
                 model_inp.value = "" if selected == _MANUAL_MODEL_VALUE else selected
         self._active_session.model = self._resolve_model()

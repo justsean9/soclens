@@ -1,4 +1,4 @@
-"""Local LLM client supporting Ollama and OpenAI-compatible inference servers."""
+"""AI LLM client supporting Ollama, OpenAI-compatible, Google Gemini API, and Microsoft Copilot."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -301,7 +302,7 @@ def _extract_error_detail(response: requests.Response) -> str:
 
 
 class LocalLLMClient:
-    """HTTP client for local LLMs (Ollama/OpenAI-compatible) and Microsoft Copilot agents."""
+    """HTTP client for Ollama, OpenAI-compatible, Google Gemini API, and Microsoft Copilot agents."""
 
     def __init__(
         self,
@@ -602,15 +603,49 @@ class LocalLLMClient:
         }
         if self.config.provider == "openai" and self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
+        elif self.config.provider == "gemini" and self.config.api_key:
+            headers["x-goog-api-key"] = self.config.api_key
         return headers
 
-    def _endpoint_url(self, kind: str) -> str:
+    @staticmethod
+    def _normalize_gemini_model_id(model: str) -> str:
+        cleaned = model.strip()
+        if cleaned.startswith("models/"):
+            cleaned = cleaned[len("models/") :]
+        return cleaned
+
+    def _endpoint_url(self, kind: str, *, model: str | None = None) -> str:
         base = self.config.base_url.rstrip("/")
         if self.config.provider == "ollama":
             if kind == "models":
                 return f"{base}/api/tags"
             if kind == "chat":
                 return f"{base}/api/chat"
+            raise LocalLLMConfigError(f"Unknown endpoint kind: {kind}")
+
+        if self.config.provider == "gemini":
+            if base.lower().endswith("/models"):
+                base = base[: -len("/models")].rstrip("/")
+            low = base.lower()
+            has_ver = (
+                low.endswith("/v1beta")
+                or "/v1beta/" in low
+                or low.endswith("/v1")
+                or "/v1/" in low
+            )
+            prefix = "" if has_ver else "/v1beta"
+            if kind == "models":
+                return f"{base}{prefix}/models"
+            model_id = self._normalize_gemini_model_id(model or self.config.model or "")
+            if not model_id:
+                raise LocalLLMConfigError(
+                    "No Gemini model specified. Set RF_LLM_MODEL / GEMINI_MODEL or pass model explicitly."
+                )
+            encoded_model = quote(model_id, safe=".-_:")
+            if kind == "chat":
+                return f"{base}{prefix}/models/{encoded_model}:generateContent"
+            if kind == "chat_stream":
+                return f"{base}{prefix}/models/{encoded_model}:streamGenerateContent?alt=sse"
             raise LocalLLMConfigError(f"Unknown endpoint kind: {kind}")
 
         # OpenAI-compatible endpoints: avoid duplicating /v1 if base_url already includes it
@@ -751,6 +786,59 @@ class LocalLLMClient:
             if default_label not in names:
                 names.insert(0, default_label)
             return names
+
+        if self.config.provider == "gemini":
+            base_url = self._endpoint_url("models")
+            models_out: list[str] = []
+            seen_models: set[str] = set()
+            next_token: str | None = None
+            for _page in range(5):
+                url = (
+                    f"{base_url}?pageToken={quote(next_token, safe='')}"
+                    if next_token
+                    else base_url
+                )
+                response = self._request("GET", url)
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise LocalLLMError(
+                        f"Invalid JSON returned by {url}: {exc}",
+                        status_code=response.status_code,
+                        provider=self.config.provider,
+                        endpoint=url,
+                    ) from exc
+                finally:
+                    response.close()
+
+                if not isinstance(payload, dict):
+                    break
+                raw_items = payload.get("models")
+                if isinstance(raw_items, list):
+                    for item in raw_items:
+                        if isinstance(item, dict):
+                            methods = item.get("supportedGenerationMethods")
+                            if (
+                                isinstance(methods, list)
+                                and methods
+                                and "generateContent" not in methods
+                            ):
+                                continue
+                            candidate = item.get("name") or item.get("id")
+                        elif isinstance(item, str):
+                            candidate = item
+                        else:
+                            candidate = None
+                        if isinstance(candidate, str):
+                            cleaned = self._normalize_gemini_model_id(candidate)
+                            if cleaned and cleaned not in seen_models:
+                                seen_models.add(cleaned)
+                                models_out.append(cleaned)
+                raw_next = payload.get("nextPageToken")
+                next_token = str(raw_next).strip() if isinstance(raw_next, str) else ""
+                if not next_token:
+                    break
+            return models_out
 
         url = self._endpoint_url("models")
         response = self._request("GET", url)
@@ -910,6 +998,264 @@ class LocalLLMClient:
 
         return out
 
+    @classmethod
+    def _sanitize_gemini_schema(cls, schema: Any) -> Any:
+        """Recursively strip JSON Schema fields unsupported by Gemini functionDeclarations."""
+        if isinstance(schema, list):
+            return [cls._sanitize_gemini_schema(item) for item in schema]
+        if not isinstance(schema, Mapping):
+            return schema
+
+        unsupported = {
+            "additionalProperties",
+            "$schema",
+            "$id",
+            "$defs",
+            "definitions",
+            "title",
+            "default",
+            "examples",
+        }
+        cleaned: dict[str, Any] = {}
+        for key, val in schema.items():
+            if key in unsupported:
+                continue
+            if key == "type" and isinstance(val, list):
+                non_null = [t for t in val if isinstance(t, str) and t != "null"]
+                if non_null:
+                    cleaned["type"] = non_null[0]
+                if "null" in val:
+                    cleaned["nullable"] = True
+            elif key == "properties" and isinstance(val, Mapping):
+                cleaned["properties"] = {
+                    str(prop_k): cls._sanitize_gemini_schema(prop_v)
+                    for prop_k, prop_v in val.items()
+                }
+            elif key == "items":
+                cleaned["items"] = cls._sanitize_gemini_schema(val)
+            else:
+                cleaned[key] = val
+        return cleaned
+
+    @classmethod
+    def _build_gemini_tools(cls, tools: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Convert OpenAI-style tool schemas into Gemini ``functionDeclarations``."""
+        declarations: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, Mapping):
+                continue
+            fn_raw = tool.get("function")
+            fn = fn_raw if isinstance(fn_raw, Mapping) else tool
+            name = str(fn.get("name") or "").strip()
+            if not name:
+                continue
+            decl: dict[str, Any] = {"name": name}
+            desc = fn.get("description")
+            if isinstance(desc, str) and desc.strip():
+                decl["description"] = desc.strip()
+            params = fn.get("parameters")
+            if isinstance(params, Mapping) and params:
+                sanitized = cls._sanitize_gemini_schema(params)
+                if isinstance(sanitized, dict) and sanitized:
+                    decl["parameters"] = sanitized
+            declarations.append(decl)
+        return [{"functionDeclarations": declarations}] if declarations else []
+
+    @staticmethod
+    def _build_gemini_tool_config(
+        tool_choice: str | Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, str):
+            mode_map = {"none": "NONE", "auto": "AUTO", "required": "ANY", "any": "ANY"}
+            mapped = mode_map.get(tool_choice.strip().lower())
+            if mapped:
+                return {"functionCallingConfig": {"mode": mapped}}
+            return None
+        if isinstance(tool_choice, Mapping):
+            fn_raw = tool_choice.get("function")
+            fn = fn_raw if isinstance(fn_raw, Mapping) else tool_choice
+            name = str(fn.get("name") or "").strip()
+            if name:
+                return {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": [name],
+                    }
+                }
+        return None
+
+    def _build_gemini_payload(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        system_prompt: str | None,
+        temperature: float,
+        max_tokens: int | None,
+        tools: Sequence[Mapping[str, Any]],
+        tool_choice: str | Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Translate canonical chat messages & tools into a Gemini generateContent payload."""
+        system_parts: list[str] = []
+        clean_system = (system_prompt or "").strip()
+        if clean_system:
+            system_parts.append(clean_system)
+
+        contents: list[dict[str, Any]] = []
+
+        def _append_turn(gemini_role: str, parts: list[dict[str, Any]]) -> None:
+            if not parts:
+                return
+            if contents and contents[-1]["role"] == gemini_role:
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": gemini_role, "parts": parts})
+
+        for msg in messages:
+            role = str(msg.get("role") or "user").strip().lower()
+            raw_content = msg.get("content")
+            content_text = "" if raw_content is None else str(raw_content)
+
+            if role == "system":
+                stripped_sys = content_text.strip()
+                if stripped_sys and stripped_sys not in system_parts:
+                    system_parts.append(stripped_sys)
+                continue
+
+            if role in ("assistant", "model"):
+                parts: list[dict[str, Any]] = []
+                if content_text:
+                    parts.append({"text": content_text})
+                raw_tcs = msg.get("tool_calls")
+                if (
+                    isinstance(raw_tcs, Sequence)
+                    and not isinstance(raw_tcs, (str, bytes))
+                    and raw_tcs
+                ):
+                    for tc in raw_tcs:
+                        if not isinstance(tc, Mapping):
+                            continue
+                        fn_raw = tc.get("function")
+                        fn = fn_raw if isinstance(fn_raw, Mapping) else tc
+                        name = str(fn.get("name") or "").strip()
+                        if not name:
+                            continue
+                        raw_args = fn.get("arguments")
+                        args_dict: dict[str, Any] = {}
+                        if isinstance(raw_args, Mapping):
+                            args_dict = dict(raw_args)
+                        elif isinstance(raw_args, str):
+                            stripped_args = raw_args.strip()
+                            if stripped_args:
+                                try:
+                                    parsed_args = json.loads(stripped_args)
+                                    if isinstance(parsed_args, Mapping):
+                                        args_dict = dict(parsed_args)
+                                except ValueError:
+                                    args_dict = {}
+                        fc_part: dict[str, Any] = {
+                            "functionCall": {"name": name, "args": args_dict}
+                        }
+                        sig = tc.get("thoughtSignature") or tc.get("thought_signature")
+                        if isinstance(sig, str) and sig:
+                            fc_part["thoughtSignature"] = sig
+                        parts.append(fc_part)
+                _append_turn("model", parts)
+                continue
+
+            if role == "tool":
+                tool_name = str(msg.get("name") or msg.get("tool_name") or "tool").strip() or "tool"
+                resp_obj: dict[str, Any]
+                stripped_content = content_text.strip()
+                if stripped_content:
+                    try:
+                        parsed_val = json.loads(stripped_content)
+                        if isinstance(parsed_val, Mapping):
+                            resp_obj = dict(parsed_val)
+                        else:
+                            resp_obj = {"result": parsed_val}
+                    except ValueError:
+                        resp_obj = {"result": content_text}
+                else:
+                    resp_obj = {"result": ""}
+                _append_turn(
+                    "user",
+                    [{"functionResponse": {"name": tool_name, "response": resp_obj}}],
+                )
+                continue
+
+            # Default: user message
+            _append_turn("user", [{"text": content_text}])
+
+        generation_config: dict[str, Any] = {"temperature": temperature}
+        if max_tokens is not None:
+            generation_config["maxOutputTokens"] = max_tokens
+
+        payload: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": generation_config,
+        }
+        if system_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+        if tools:
+            gemini_tools = self._build_gemini_tools(tools)
+            if gemini_tools:
+                payload["tools"] = gemini_tools
+                tool_cfg = self._build_gemini_tool_config(tool_choice)
+                if tool_cfg is not None:
+                    payload["toolConfig"] = tool_cfg
+        return payload
+
+    @staticmethod
+    def _extract_gemini_parts(
+        candidate: Mapping[str, Any],
+        *,
+        start_call_idx: int = 1,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Extract visible text and normalized tool calls from a Gemini candidate."""
+        content_obj = candidate.get("content")
+        if not isinstance(content_obj, Mapping):
+            return "", []
+        parts = content_obj.get("parts")
+        if not isinstance(parts, Sequence) or isinstance(parts, (str, bytes)):
+            return "", []
+
+        text_chunks: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        call_idx = start_call_idx
+        for part in parts:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("thought") is True:
+                continue
+            text_val = part.get("text")
+            if isinstance(text_val, str) and text_val:
+                text_chunks.append(text_val)
+            fc = part.get("functionCall")
+            if isinstance(fc, Mapping):
+                name = str(fc.get("name") or "").strip()
+                if not name:
+                    continue
+                raw_args = fc.get("args")
+                if isinstance(raw_args, Mapping):
+                    args_str = json.dumps(dict(raw_args), ensure_ascii=False, default=str)
+                elif raw_args is None:
+                    args_str = "{}"
+                else:
+                    args_str = json.dumps(raw_args, ensure_ascii=False, default=str)
+                tc_entry: dict[str, Any] = {
+                    "id": f"call_{call_idx}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str},
+                }
+                sig = part.get("thoughtSignature")
+                if isinstance(sig, str) and sig:
+                    tc_entry["thoughtSignature"] = sig
+                tool_calls.append(tc_entry)
+                call_idx += 1
+        return "".join(text_chunks), tool_calls
+
     def chat(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -984,51 +1330,64 @@ class LocalLLMClient:
                 "No local LLM model specified. Set RF_LLM_MODEL or pass model explicitly."
             )
 
-        full_messages: list[dict[str, Any]] = []
-        clean_system = (system_prompt or "").strip()
-        if clean_system:
-            if not (
-                messages
-                and messages[0].get("role") == "system"
-                and str(messages[0].get("content") or "").strip() == clean_system
-            ):
-                full_messages.append({"role": "system", "content": clean_system})
-        for msg in messages:
-            full_messages.append(self._format_outgoing_message(msg))
-
         eff_temp = self.config.temperature if temperature is None else float(temperature)
         eff_max_tokens = self.config.max_tokens if max_tokens is None else int(max_tokens)
         streaming = stream_callback is not None
         tool_list = [dict(t) for t in tools] if tools else []
 
-        url = self._endpoint_url("chat")
-        if self.config.provider == "ollama":
-            options: dict[str, Any] = {"temperature": eff_temp}
-            if eff_max_tokens is not None:
-                options["num_predict"] = eff_max_tokens
-            payload: dict[str, Any] = {
-                "model": selected_model,
-                "messages": full_messages,
-                "stream": streaming,
-                "options": options,
-            }
-            if tool_list:
-                payload["tools"] = tool_list
+        if self.config.provider == "gemini":
+            url = self._endpoint_url(
+                "chat_stream" if streaming else "chat", model=selected_model
+            )
+            payload = self._build_gemini_payload(
+                messages,
+                system_prompt=system_prompt,
+                temperature=eff_temp,
+                max_tokens=eff_max_tokens,
+                tools=tool_list,
+                tool_choice=tool_choice,
+            )
         else:
-            payload = {
-                "model": selected_model,
-                "messages": full_messages,
-                "stream": streaming,
-                "temperature": eff_temp,
-            }
-            if eff_max_tokens is not None:
-                payload["max_tokens"] = eff_max_tokens
-            if tool_list:
-                payload["tools"] = tool_list
-                if tool_choice is not None:
-                    payload["tool_choice"] = (
-                        dict(tool_choice) if isinstance(tool_choice, Mapping) else tool_choice
-                    )
+            full_messages: list[dict[str, Any]] = []
+            clean_system = (system_prompt or "").strip()
+            if clean_system:
+                if not (
+                    messages
+                    and messages[0].get("role") == "system"
+                    and str(messages[0].get("content") or "").strip() == clean_system
+                ):
+                    full_messages.append({"role": "system", "content": clean_system})
+            for msg in messages:
+                full_messages.append(self._format_outgoing_message(msg))
+
+            url = self._endpoint_url("chat")
+            if self.config.provider == "ollama":
+                options: dict[str, Any] = {"temperature": eff_temp}
+                if eff_max_tokens is not None:
+                    options["num_predict"] = eff_max_tokens
+                payload = {
+                    "model": selected_model,
+                    "messages": full_messages,
+                    "stream": streaming,
+                    "options": options,
+                }
+                if tool_list:
+                    payload["tools"] = tool_list
+            else:
+                payload = {
+                    "model": selected_model,
+                    "messages": full_messages,
+                    "stream": streaming,
+                    "temperature": eff_temp,
+                }
+                if eff_max_tokens is not None:
+                    payload["max_tokens"] = eff_max_tokens
+                if tool_list:
+                    payload["tools"] = tool_list
+                    if tool_choice is not None:
+                        payload["tool_choice"] = (
+                            dict(tool_choice) if isinstance(tool_choice, Mapping) else tool_choice
+                        )
 
         response = self._request("POST", url, json_payload=payload, stream=streaming)
         try:
@@ -1069,6 +1428,7 @@ class LocalLLMClient:
             )
 
         raw_tool_calls: Any = None
+        pre_normalized_tcs: list[dict[str, Any]] | None = None
         if self.config.provider == "ollama":
             msg = data.get("message")
             content = str(msg.get("content") or "") if isinstance(msg, dict) else ""
@@ -1076,6 +1436,23 @@ class LocalLLMClient:
                 raw_tool_calls = msg.get("tool_calls")
             resp_model = str(data.get("model") or selected_model)
             done = bool(data.get("done", True))
+        elif self.config.provider == "gemini":
+            candidates = data.get("candidates")
+            content = ""
+            pre_normalized_tcs = []
+            if isinstance(candidates, list) and candidates and isinstance(candidates[0], Mapping):
+                content, pre_normalized_tcs = self._extract_gemini_parts(candidates[0])
+            else:
+                feedback = data.get("promptFeedback")
+                if isinstance(feedback, Mapping) and feedback.get("blockReason"):
+                    raise LocalLLMError(
+                        f"Gemini blocked the request: {feedback.get('blockReason')}",
+                        status_code=response.status_code,
+                        provider=self.config.provider,
+                        endpoint=url,
+                    )
+            resp_model = str(data.get("modelVersion") or selected_model)
+            done = True
         else:
             choices = data.get("choices")
             content = ""
@@ -1096,7 +1473,11 @@ class LocalLLMClient:
             "done": done,
             "raw": data,
         }
-        normalized_tcs = self._normalize_tool_calls(raw_tool_calls)
+        normalized_tcs = (
+            pre_normalized_tcs
+            if pre_normalized_tcs is not None
+            else self._normalize_tool_calls(raw_tool_calls)
+        )
         if normalized_tcs:
             result["tool_calls"] = normalized_tcs
         return result
@@ -1112,6 +1493,7 @@ class LocalLLMClient:
         chunks: list[str] = []
         raw_events: list[dict[str, Any]] = []
         ollama_tool_calls: list[dict[str, Any]] = []
+        gemini_tool_calls: list[dict[str, Any]] = []
         openai_tool_call_acc: dict[int, dict[str, Any]] = {}
         resp_model = selected_model
         done = False
@@ -1156,6 +1538,47 @@ class LocalLLMClient:
                 if event.get("done"):
                     done = True
                     break
+            elif self.config.provider == "gemini":
+                if stripped.startswith(":"):
+                    continue
+                if stripped.startswith("data:"):
+                    data_str = stripped[5:].strip()
+                else:
+                    data_str = stripped
+                if data_str == "[DONE]":
+                    done = True
+                    break
+                try:
+                    event = json.loads(data_str)
+                except ValueError as exc:
+                    raise LocalLLMError(
+                        f"Malformed Gemini SSE chunk from {url}: {exc}",
+                        provider=self.config.provider,
+                        endpoint=url,
+                    ) from exc
+                if not isinstance(event, dict):
+                    continue
+                raw_events.append(event)
+                if event.get("modelVersion"):
+                    resp_model = str(event["modelVersion"])
+                candidates = event.get("candidates")
+                if (
+                    isinstance(candidates, list)
+                    and candidates
+                    and isinstance(candidates[0], Mapping)
+                ):
+                    cand = candidates[0]
+                    delta_text, chunk_tcs = self._extract_gemini_parts(
+                        cand, start_call_idx=len(gemini_tool_calls) + 1
+                    )
+                    if delta_text:
+                        chunks.append(delta_text)
+                        if stream_callback is not None:
+                            stream_callback(delta_text)
+                    if chunk_tcs:
+                        gemini_tool_calls.extend(chunk_tcs)
+                    if cand.get("finishReason") is not None:
+                        done = True
             else:
                 if stripped.startswith(":"):
                     continue
@@ -1242,6 +1665,8 @@ class LocalLLMClient:
         }
         if self.config.provider == "ollama":
             normalized_tcs = self._normalize_tool_calls(ollama_tool_calls)
+        elif self.config.provider == "gemini":
+            normalized_tcs = gemini_tool_calls
         else:
             ordered = [openai_tool_call_acc[k] for k in sorted(openai_tool_call_acc)]
             normalized_tcs = self._normalize_tool_calls(ordered)

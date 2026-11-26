@@ -100,13 +100,22 @@ class SentinelOneConfig:
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_M365_COPILOT_GRAPH_URL = "https://graph.microsoft.com/beta"
 DEFAULT_COPILOT_DIRECTLINE_URL = "https://directline.botframework.com/v3/directline"
 COPILOT_LLM_PROVIDERS: frozenset[str] = frozenset(
     {"m365_copilot", "copilot_studio", "copilot_directline", "security_copilot"}
 )
 SUPPORTED_LLM_PROVIDERS: frozenset[str] = frozenset(
-    {"ollama", "openai", "m365_copilot", "copilot_studio", "copilot_directline", "security_copilot"}
+    {
+        "ollama",
+        "openai",
+        "gemini",
+        "m365_copilot",
+        "copilot_studio",
+        "copilot_directline",
+        "security_copilot",
+    }
 )
 
 
@@ -1086,6 +1095,11 @@ def _normalize_llm_provider(raw_provider: str | None) -> str:
     aliases = {
         "openai-compatible": "openai",
         "openai_compatible": "openai",
+        "google": "gemini",
+        "google_gemini": "gemini",
+        "google-gemini": "gemini",
+        "gemini-api": "gemini",
+        "gemini_api": "gemini",
         "copilot": "m365_copilot",
         "m365": "m365_copilot",
         "m365-copilot": "m365_copilot",
@@ -1308,8 +1322,8 @@ def get_local_llm_config(
 ) -> LocalLLMConfig:
     """Load AI analyst configuration from explicit arguments, environment variables, or settings.
 
-    Supports ``ollama``, ``openai``, ``m365_copilot``, ``copilot_directline``,
-    and ``security_copilot``.
+    Supports ``ollama``, ``openai``, ``gemini``, ``m365_copilot``,
+    ``copilot_studio``, ``copilot_directline``, and ``security_copilot``.
     """
     resolved_visible = parse_visible_llm_providers(get_effective_setting("llm_visible_providers"))
     raw_provider = provider if provider is not None else os.environ.get("RF_LLM_PROVIDER")
@@ -1331,6 +1345,8 @@ def get_local_llm_config(
 
     if resolved_provider == "openai":
         default_url = DEFAULT_OPENAI_BASE_URL
+    elif resolved_provider == "gemini":
+        default_url = DEFAULT_GEMINI_BASE_URL
     elif resolved_provider in ("m365_copilot", "security_copilot"):
         default_url = resolved_graph_url
     elif resolved_provider == "copilot_studio":
@@ -1340,25 +1356,43 @@ def get_local_llm_config(
     else:
         default_url = DEFAULT_OLLAMA_BASE_URL
 
-    env_base_url = (
-        _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
-        if resolved_provider in ("ollama", "openai")
-        else None
-    )
+    if resolved_provider in ("ollama", "openai"):
+        env_base_url = _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
+    elif resolved_provider == "gemini":
+        env_base_url = _clean_optional_str(os.environ.get("GEMINI_BASE_URL")) or (
+            _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
+            if _clean_optional_str(os.environ.get("RF_LLM_PROVIDER"))
+            and _normalize_llm_provider(os.environ.get("RF_LLM_PROVIDER")) == "gemini"
+            else None
+        )
+    else:
+        env_base_url = None
     raw_url = _clean_optional_str(base_url) or env_base_url or default_url
     if raw_url and not raw_url.lower().startswith(("http://", "https://")):
-        scheme = "https://" if resolved_provider in COPILOT_LLM_PROVIDERS else "http://"
+        scheme = (
+            "https://"
+            if resolved_provider in COPILOT_LLM_PROVIDERS or resolved_provider == "gemini"
+            else "http://"
+        )
         raw_url = f"{scheme}{raw_url}"
     normalized_url = raw_url.rstrip("/")
 
     resolved_model = _clean_optional_str(
-        model if model is not None else os.environ.get("RF_LLM_MODEL")
+        model
+        if model is not None
+        else (
+            os.environ.get("RF_LLM_MODEL")
+            or (os.environ.get("GEMINI_MODEL") if resolved_provider == "gemini" else None)
+        )
     )
-    resolved_api_key = (
-        _clean_optional_str(api_key)
-        if api_key is not None
-        else get_effective_setting("rf_llm_api_key")
-    )
+    if api_key is not None:
+        resolved_api_key = _clean_optional_str(api_key)
+    elif resolved_provider == "gemini":
+        resolved_api_key = get_effective_setting("gemini_api_key") or get_effective_setting(
+            "rf_llm_api_key"
+        )
+    else:
+        resolved_api_key = get_effective_setting("rf_llm_api_key")
     raw_timeout: float | str | None = (
         timeout if timeout is not None else os.environ.get("RF_LLM_TIMEOUT")
     )

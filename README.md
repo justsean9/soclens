@@ -44,8 +44,8 @@ Insikt Group & local Sigma rule browsing with live pySigma `savedsearches.conf` 
 
 ![Sigma Rules & Splunk Export](docs/screenshots/sigma-rules.svg)
 
-### AI Analyst: Local LLM & Microsoft Copilot Multi-Agent (`F7`)
-Ollama, OpenAI-compatible, Enterprise M365 Copilot Chat, Copilot Studio (Direct Line / Token Endpoint), and Microsoft Security Copilot triage assistant with multiple concurrent chat windows, attached investigation context, and SPL generation (see [docs/MICROSOFT_COPILOT_GUIDE.md](docs/MICROSOFT_COPILOT_GUIDE.md)):
+### AI Analyst: Local LLM, Google Gemini API & Microsoft Copilot Multi-Agent (`F7`)
+Ollama, OpenAI-compatible, Google Gemini API (`GEMINI_API_KEY`), Enterprise M365 Copilot Chat, Copilot Studio (Direct Line / Token Endpoint), and Microsoft Security Copilot triage assistant with multiple concurrent chat windows, attached investigation context, and SPL generation (see [docs/MICROSOFT_COPILOT_GUIDE.md](docs/MICROSOFT_COPILOT_GUIDE.md)):
 
 ![Local LLM SOC Copilot](docs/screenshots/local-llm.svg)
 
