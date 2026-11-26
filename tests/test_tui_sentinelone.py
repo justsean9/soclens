@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -29,6 +30,14 @@ from soclens.tui.screens.s1_modals import (
 from soclens.tui.screens.sentinelone import SentinelOnePane
 
 
+def _recent_iso(hours_ago: float = 1.0) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _future_iso(days_ahead: int = 365) -> str:
+    return (datetime.now(UTC) + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _make_mock_s1_client() -> MagicMock:
     s1 = MagicMock()
     s1.console_url = "https://tenant.sentinelone.net"
@@ -52,7 +61,7 @@ def _make_mock_s1_client() -> MagicMock:
                 "analystVerdict": "undefined",
                 "incidentStatus": "unresolved",
                 "mitigationStatus": "active",
-                "createdAt": "2026-11-25T10:00:00Z",
+                "createdAt": _recent_iso(2.0),
             },
             "agentRealtimeInfo": {
                 "agentComputerName": "FIN-WKSTN-01",
@@ -80,14 +89,14 @@ def _make_mock_s1_client() -> MagicMock:
         }
     ]
     s1.list_sites.return_value = [
-        {"id": "site-1", "name": "MDR-1234", "state": "active", "updatedAt": "2026-11-25T00:00:00Z"}
+        {"id": "site-1", "name": "MDR-1234", "state": "active", "updatedAt": _recent_iso(4.0)}
     ]
     s1.list_activities.return_value = [
         {
             "id": "act-1",
             "primaryDescription": "Agent isolated",
             "siteName": "MDR-1234",
-            "createdAt": "2026-11-25T12:00:00Z",
+            "createdAt": _recent_iso(1.5),
         }
     ]
     s1.disconnect_agent.return_value = {"data": {"affected": 1}}
@@ -107,7 +116,7 @@ def _make_mock_s1_client() -> MagicMock:
                 "alertId": "ca-505",
                 "incidentStatus": "UNRESOLVED",
                 "analystVerdict": "UNDEFINED",
-                "createdAt": "2026-11-25T13:00:00Z",
+                "createdAt": _recent_iso(1.0),
             },
             "ruleInfo": {"name": "STAR: Unusual Script", "severity": "High"},
             "agentDetectionInfo": {
@@ -133,7 +142,7 @@ def _make_mock_s1_client() -> MagicMock:
         "sha1": "",
         "createdAt": (rec.get("alertInfo") or {}).get("createdAt")
         or rec.get("createdAt")
-        or "2026-11-25T13:00:00Z",
+        or _recent_iso(1.0),
     }
     s1.list_users.return_value = [
         {
@@ -149,7 +158,7 @@ def _make_mock_s1_client() -> MagicMock:
             "id": "svc-1",
             "name": "soclens-automation",
             "scope": "site",
-            "expirationDate": "2027-12-31T00:00:00Z",
+            "expirationDate": _future_iso(365),
         }
     ]
     s1.list_rbac_roles.return_value = [
@@ -1646,7 +1655,7 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
             "networkStatus": "connected",
             "infected": False,
             "siteName": "MDR-1001",
-            "createdAt": f"2026-11-25T{i // 60:02d}:{i % 60:02d}:00Z",
+            "createdAt": (datetime.now(UTC) - timedelta(minutes=240 - i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         for i in [5, 119, 0, *range(1, 5), *range(6, 119)]
     ]
@@ -1659,7 +1668,7 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
                 "incidentStatus": "unresolved",
                 "mitigationStatus": "active",
                 "sha1": "a" * 40,
-                "createdAt": "2026-11-24T01:00:00Z",
+                "createdAt": _recent_iso(30.0),
             },
             "agentRealtimeInfo": {"agentComputerName": "HOST-OLD", "siteName": "MDR-1001"},
         },
@@ -1671,7 +1680,7 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
                 "incidentStatus": "unresolved",
                 "mitigationStatus": "active",
                 "sha1": "b" * 40,
-                "createdAt": "2026-11-25T12:00:00Z",
+                "createdAt": _recent_iso(2.0),
             },
             "agentRealtimeInfo": {"agentComputerName": "HOST-NEW", "siteName": "MDR-1001"},
         },
@@ -1683,7 +1692,7 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
                 "incidentStatus": "unresolved",
                 "mitigationStatus": "active",
                 "sha1": "c" * 40,
-                "createdAt": "2026-11-25T06:00:00Z",
+                "createdAt": _recent_iso(10.0),
             },
             "agentRealtimeInfo": {"agentComputerName": "HOST-MID", "siteName": "MSSP-2001"},
         },
@@ -1691,20 +1700,20 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
     s1.list_cloud_alerts.return_value = [
         {
             "id": "ca-old",
-            "alertInfo": {"alertId": "ca-old", "createdAt": "2026-11-24T08:00:00Z"},
+            "alertInfo": {"alertId": "ca-old", "createdAt": _recent_iso(28.0)},
             "ruleInfo": {"name": "OldCloudRule", "severity": "Medium"},
             "agentDetectionInfo": {"siteName": "MDR-1001", "agentComputerName": "HOST-1"},
         },
         {
             "id": "ca-new",
-            "alertInfo": {"alertId": "ca-new", "createdAt": "2026-11-25T14:00:00Z"},
+            "alertInfo": {"alertId": "ca-new", "createdAt": _recent_iso(1.5)},
             "ruleInfo": {"name": "NewCloudRule", "severity": "High"},
             "agentDetectionInfo": {"siteName": "MDR-1001", "agentComputerName": "HOST-2"},
         },
     ]
     s1.list_activities.return_value = [
-        {"id": "act-old", "primaryDescription": "Older Activity", "createdAt": "2026-11-24T09:00:00Z"},
-        {"id": "act-new", "primaryDescription": "Newer Activity", "createdAt": "2026-11-25T15:00:00Z"},
+        {"id": "act-old", "primaryDescription": "Older Activity", "createdAt": _recent_iso(27.0)},
+        {"id": "act-new", "primaryDescription": "Newer Activity", "createdAt": _recent_iso(1.0)},
     ]
 
     app = create_app(
@@ -2044,9 +2053,5 @@ def test_s1_admin_actions_double_vs_single_approval(tmp_path: Path) -> None:
             s1.send_reset_password_email.assert_called_once_with(["usr-1"])
 
     asyncio.run(_run())
-
-
-
-
 
 

@@ -263,7 +263,7 @@ def test_v21_f6_pinned_custom_fields_appear_in_metadata_inspector_tab(
             await pilot.pause()
 
             detail_text = "\n".join(line.text for line in pane.query_one("#es-detail", RichLog).lines)
-            assert "--- Custom / Org Fields ---" in detail_text
+            assert "Custom / Org Fields" in detail_text
             assert "business_unit" in detail_text
             assert "ticket_ref" in detail_text
 

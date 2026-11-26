@@ -238,6 +238,9 @@ def test_v21_f10_tier_plus_file_hash_cross_tier_bulk_isolation(
             await app.workers.wait_for_complete()
             await _wait_until(pilot, lambda: len(pane._records) >= 6)
 
+            pane.query_one("#s1-tier-all-btn", Button).press()
+            await pilot.pause()
+
             grp_sel = pane.query_one("#s1-grouping-select", Select)
             grp_sel.value = "tier_hash"
             await pilot.pause()

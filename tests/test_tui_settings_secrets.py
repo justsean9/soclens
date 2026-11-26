@@ -266,7 +266,7 @@ def test_tui_settings_dynamic_input_to_vault_dropdown_swap_including_llm_key(
     tmp_path: Path,
     isolated_settings_env: Path,
 ) -> None:
-    assert len(_SECRET_MANAGED_VAULT_FIELDS) == 13
+    assert len(_SECRET_MANAGED_VAULT_FIELDS) == len(SECRET_MANAGED_SETTING_KEYS)
     assert tuple(k for k, _, _ in _SECRET_MANAGED_VAULT_FIELDS) == SECRET_MANAGED_SETTING_KEYS
 
     app = create_app(

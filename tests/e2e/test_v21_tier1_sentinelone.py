@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -195,6 +196,9 @@ def test_v21_f9_tui_tier_filter_pills_site_multiselect_and_four_grouping_modes(
             await app.workers.wait_for_complete()
             await pilot.pause()
 
+            await pilot.click("#s1-tier-all-btn")
+            await pilot.pause()
+
             table = app.query_one("#s1-table", DataTable)
             assert table.row_count == 6
 
@@ -346,6 +350,9 @@ def test_v21_f10_tui_alerts_workbench_unified_triage_and_mitigate(
             await app.workers.wait_for_complete()
             await pilot.pause()
 
+            await pilot.click("#s1-tier-all-btn")
+            await pilot.pause()
+
             assert app.query_one("#s1-table", DataTable).row_count == 8
 
             await pilot.click("#s1-triage-btn")
@@ -405,6 +412,9 @@ def test_v21_f10_tui_alerts_enrich_in_rf_pivot(
             await pilot.click("#s1-refresh-btn")
             await pilot.pause()
             await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.click("#s1-tier-all-btn")
             await pilot.pause()
 
             assert app.query_one("#s1-table", DataTable).row_count == 6
@@ -532,6 +542,9 @@ def test_v21_f11_tui_sites_admin_user_view_read_only_vs_f2_admin_create_and_dele
             await pilot.click("#s1-sites-btn")
             await pilot.pause()
             await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.click("#s1-tier-all-btn")
             await pilot.pause()
 
             table = app.query_one("#s1-table", DataTable)
@@ -995,6 +1008,9 @@ def test_v21_f12_tui_agents_and_blocklist_ops_vs_admin_gating(
             await app.workers.wait_for_complete()
             await pilot.pause()
 
+            await pilot.click("#s1-tier-all-btn")
+            await pilot.pause()
+
             assert app.query_one("#s1-table", DataTable).row_count == 5
 
             await pilot.click("#s1-isolate-btn")
@@ -1134,13 +1150,12 @@ def test_v21_f9_unlimited_pagination_and_newest_first_sorting_e2e(
     mock_s1_server: MockSentinelOneServer,
 ) -> None:
     base_threat = dict(mock_s1_server.state["threats"][0])
+    bulk_base = datetime.now(UTC).replace(microsecond=0) - timedelta(days=45)
     # Seed 260 threats in ascending chronological order (oldest first in server storage)
     for idx in range(260):
         item = json.loads(json.dumps(base_threat))
         item["id"] = f"thr-bulk-{idx:03d}"
-        day = 1 + (idx // 24)
-        hour = idx % 24
-        ts = f"2026-10-{day:02d}T{hour:02d}:00:00Z"
+        ts = (bulk_base + timedelta(hours=idx)).strftime("%Y-%m-%dT%H:%M:%SZ")
         item["threatInfo"]["threatId"] = item["id"]
         item["threatInfo"]["threatName"] = f"bulk_threat_{idx:03d}.exe"
         item["threatInfo"]["createdAt"] = ts
@@ -1151,9 +1166,7 @@ def test_v21_f9_unlimited_pagination_and_newest_first_sorting_e2e(
         ag = json.loads(json.dumps(base_agent))
         ag["id"] = f"ag-bulk-{idx:03d}"
         ag["computerName"] = f"bulk-host-{idx:03d}.example.test"
-        day = 1 + (idx // 24)
-        hour = idx % 24
-        ag["createdAt"] = f"2026-10-{day:02d}T{hour:02d}:00:00Z"
+        ag["createdAt"] = (bulk_base + timedelta(hours=idx)).strftime("%Y-%m-%dT%H:%M:%SZ")
         mock_s1_server.state["agents"].append(ag)
 
     cfg = get_sentinelone_config(required=True)

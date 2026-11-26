@@ -1116,6 +1116,9 @@ def test_t3_v21_11_s1_tier_rules_tier_hash_bulk_action_no_cross_tier_leak(
             await app.workers.wait_for_complete()
             await pilot.pause()
 
+            await pilot.click("#s1-tier-all-btn")
+            await pilot.pause()
+
             pane.query_one("#s1-grouping-select", Select).value = "tier_hash"
             await pilot.pause()
 
@@ -1341,7 +1344,7 @@ def test_t3_v21_13_es_event_attributes_log_review_fallback_pinned_fields_and_rol
             await pilot.click("#es-insp-tab-metadata")
             await pilot.pause()
             meta_text = extract_richlog_text(pane.query_one("#es-detail", RichLog))
-            assert "--- Custom / Org Fields ---" in meta_text
+            assert "Custom / Org Fields" in meta_text
             assert "business_unit" in meta_text
             assert "Finance" in meta_text
 

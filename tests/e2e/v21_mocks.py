@@ -131,10 +131,33 @@ _THREAT_INTEL_COLLECTIONS: frozenset[str] = frozenset(
 )
 
 _SHA1_HEX_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_FIXTURE_SHIFT_TS_RE = re.compile(r"(2026|2027)-11-25T(\d{2}):(\d{2}):(\d{2})Z")
+_FIXTURE_ANCHOR_UTC = datetime(2026, 11, 25, 3, 0, 0, tzinfo=UTC)
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _shift_fixture_timestamps(node: Any, delta: Any) -> Any:
+    if isinstance(node, str):
+        if "2026-11-25T" not in node and "2027-11-25T" not in node:
+            return node
+
+        def _repl(match: re.Match[str]) -> str:
+            year = int(match.group(1))
+            hour = int(match.group(2))
+            minute = int(match.group(3))
+            second = int(match.group(4))
+            orig = datetime(year, 11, 25, hour, minute, second, tzinfo=UTC)
+            return (orig + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        return _FIXTURE_SHIFT_TS_RE.sub(_repl, node)
+    if isinstance(node, list):
+        return [_shift_fixture_timestamps(item, delta) for item in node]
+    if isinstance(node, dict):
+        return {k: _shift_fixture_timestamps(v, delta) for k, v in node.items()}
+    return node
 
 
 def _load_fixture(filename: str, fixture_path: Path | None = None) -> dict[str, Any]:
@@ -142,7 +165,11 @@ def _load_fixture(filename: str, fixture_path: Path | None = None) -> dict[str, 
     raw = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"Expected JSON object in fixture {target}")
-    return copy.deepcopy(raw)
+    data = copy.deepcopy(raw)
+    if target.name in {"v21_sentinelone.json", "v21_splunk_es.json"}:
+        delta = datetime.now(UTC).replace(microsecond=0) - _FIXTURE_ANCHOR_UTC
+        data = _shift_fixture_timestamps(data, delta)
+    return data
 
 
 def _header_ci(headers: Mapping[str, str], name: str) -> str:

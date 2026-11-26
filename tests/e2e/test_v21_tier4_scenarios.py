@@ -754,6 +754,8 @@ def test_t4_v21_05_s1_multi_tenant_tier_hash_isolation_and_delete_site_gate(
             pane = app.query_one(SentinelOnePane)
             assert app.is_admin_view is False
 
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.pause()
             await pilot.click("#s1-refresh-btn")
             await pilot.pause()
             await app.workers.wait_for_complete()
@@ -785,6 +787,9 @@ def test_t4_v21_05_s1_multi_tenant_tier_hash_isolation_and_delete_site_gate(
             await pilot.click("#s1-refresh-btn")
             await pilot.pause()
             await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.click("#s1-tier-all-btn")
             await pilot.pause()
 
             pane.query_one("#s1-grouping-select", Select).value = "tier_hash"
@@ -1271,6 +1276,9 @@ def test_t4_v21_09_s1_agent_move_decommission_and_blocklist_admin_lifecycle(
             await pilot.click("#s1-move-apply-btn")
             await pilot.pause()
             await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.click("#s1-tier-all-btn")
             await pilot.pause()
 
             _select_table_row_containing(table, pane._table_rows, "ag-3001-1")

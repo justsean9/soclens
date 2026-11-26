@@ -684,6 +684,15 @@ def test_v21_f4_zero_disk_token_persistence_on_save_and_hydration(
     ):
         monkeypatch.delenv(env_key, raising=False)
 
+    mock_vault_server.state["secrets"]["soclens/llm"]["gemini_api_key"] = (
+        "e2e-vault-gemini-api-key"
+    )
+    mock_vault_server.state["secrets"]["soclens/copilot"] = {
+        "bearer_token": "e2e-vault-copilot-bearer-token",
+        "token_endpoint": "https://login.example.test/oauth2/token",
+        "directline_secret": "e2e-vault-copilot-directline-secret",
+    }
+
     vault_map = {
         "rf_api_token": "hashicorp_vault:soclens/rf:api_token",
         "rf_sandbox_token": "hashicorp_vault:soclens/rf:sandbox_token",
@@ -695,6 +704,10 @@ def test_v21_f4_zero_disk_token_persistence_on_save_and_hydration(
         "splunk_password": "hashicorp_vault:soclens/splunk:password",
         "s1_api_token": "hashicorp_vault:soclens/edr:s1_api_token",
         "rf_llm_api_key": "hashicorp_vault:soclens/llm:api_key",
+        "gemini_api_key": "hashicorp_vault:soclens/llm:gemini_api_key",
+        "ms_copilot_bearer_token": "hashicorp_vault:soclens/copilot:bearer_token",
+        "ms_copilot_token_endpoint": "hashicorp_vault:soclens/copilot:token_endpoint",
+        "ms_copilot_directline_secret": "hashicorp_vault:soclens/copilot:directline_secret",
     }
     assert set(vault_map) == set(SECRET_MANAGED_SETTING_KEYS)
 
