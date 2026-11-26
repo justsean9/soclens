@@ -354,6 +354,11 @@ def test_cli_llm_status_models_chat_and_explain_sigma(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
     mock_llm = MagicMock(spec=LocalLLMClient)
     mock_llm.__enter__.return_value = mock_llm
     mock_llm.__exit__.return_value = None
@@ -1016,8 +1021,15 @@ def test_gemini_prompt_blocked_and_audit_redaction() -> None:
 
 
 def test_cli_llm_gemini_status_and_chat(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
     fake_llm = MagicMock(spec=LocalLLMClient)
     fake_llm.__enter__.return_value = fake_llm
     fake_llm.__exit__.return_value = None
