@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 from dataclasses import dataclass, field
@@ -11,8 +12,10 @@ from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import Button, Input, RichLog, Select, Static
+from textual.widgets import Button, Input, RichLog, Select, Static, TabbedContent, TabPane
 
+from soclens.agent_audit import AuditLogStore
+from soclens.agent_policy import AIPolicyStore
 from soclens.config import (
     COPILOT_LLM_PROVIDERS,
     DEFAULT_COPILOT_DIRECTLINE_URL,
@@ -24,6 +27,7 @@ from soclens.config import (
     has_rf_ssl_config_override,
 )
 from soclens.llm import SOC_PROMPT_TEMPLATES, LocalLLMClient, LocalLLMError
+from soclens.tui.ai_widgets import AIControlPanelWidget, AuditLogViewWidget
 from soclens.tui.pivot import format_copilot_context
 from soclens.tui.screens.base import BaseSocPane, SelectableRichLog, extract_richlog_text
 
@@ -117,8 +121,19 @@ class LocalLLMPane(BaseSocPane):
     """Interactive AI Analyst pane with Local LLMs, Microsoft Copilot agents, and multi-chat tabs."""
 
     DEFAULT_CSS: ClassVar[str] = """
+    LocalLLMPane #llm-subtabs {
+        width: 1fr;
+        height: 1fr;
+    }
+    LocalLLMPane #llm-tab-chat,
+    LocalLLMPane #llm-tab-control-panel,
+    LocalLLMPane #llm-tab-audit-log {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+    }
     LocalLLMPane #llm-transcript {
-        min-height: 5;
+        min-height: 5 !important;
     }
     LocalLLMPane #llm-session-bar {
         height: 1;
@@ -136,6 +151,13 @@ class LocalLLMPane(BaseSocPane):
     }
     LocalLLMPane.llm-compact #llm-template-select {
         width: 18;
+    }
+    LocalLLMPane.llm-short #llm-status {
+        height: 1 !important;
+        min-height: 1 !important;
+    }
+    LocalLLMPane.llm-short #llm-transcript {
+        min-height: 3 !important;
     }
     """
 
@@ -283,85 +305,135 @@ class LocalLLMPane(BaseSocPane):
             markup=False,
         )
 
-        with Horizontal(id="llm-session-bar", classes="action-row toolbar-row"):
-            yield Select(
-                session_options,
-                allow_blank=False,
-                value=self._active_session_id,
-                id="llm-session-select",
-                compact=True,
-            )
-            yield Button("+ New Chat", id="llm-new-chat-btn", variant="primary", compact=True)
-            yield Button("Close Chat", id="llm-close-chat-btn", compact=True)
+        policy_store, audit_store, registry = self._resolve_ai_stores()
 
-        with Horizontal(classes="action-row toolbar-row"):
-            yield Select(
-                provider_options,
-                allow_blank=False,
-                value=cfg.provider,
-                id="llm-provider-select",
-                compact=True,
-            )
-            yield Input(
-                value=cfg.base_url,
-                placeholder="Base URL or Copilot Token Endpoint",
-                id="llm-base-url-input",
-                compact=True,
-            )
-            yield Button("Check Connection", id="llm-check-btn", compact=True)
-            yield Button("Refresh Models", id="llm-refresh-models-btn", compact=True)
+        with TabbedContent(initial="llm-tab-chat", id="llm-subtabs"):
+            with TabPane("AI Chat", id="llm-tab-chat"):
+                with Horizontal(id="llm-session-bar", classes="action-row toolbar-row"):
+                    yield Select(
+                        session_options,
+                        allow_blank=False,
+                        value=self._active_session_id,
+                        id="llm-session-select",
+                        compact=True,
+                    )
+                    yield Button("+ New Chat", id="llm-new-chat-btn", variant="primary", compact=True)
+                    yield Button("Close Chat", id="llm-close-chat-btn", compact=True)
 
-        with Horizontal(classes="action-row filter-bar"):
-            yield Select(
-                model_options,
-                allow_blank=False,
-                value=initial_model_select,
-                id="llm-model-select",
-                compact=True,
-            )
-            yield Input(
-                value=cfg.model or "",
-                placeholder="Model or Copilot Agent name (e.g. llama3.2, SOC Triage Agent)",
-                id="llm-model-input",
-                compact=True,
-            )
-            yield Select(
-                list(_TEMPLATE_OPTIONS),
-                allow_blank=False,
-                value="freeform",
-                id="llm-template-select",
-                compact=True,
-            )
+                with Horizontal(classes="action-row toolbar-row"):
+                    yield Select(
+                        provider_options,
+                        allow_blank=False,
+                        value=cfg.provider,
+                        id="llm-provider-select",
+                        compact=True,
+                    )
+                    yield Input(
+                        value=cfg.base_url,
+                        placeholder="Base URL or Copilot Token Endpoint",
+                        id="llm-base-url-input",
+                        compact=True,
+                    )
+                    yield Button("Check Connection", id="llm-check-btn", compact=True)
+                    yield Button("Refresh Models", id="llm-refresh-models-btn", compact=True)
 
-        with Horizontal(id="llm-copilot-bar", classes="action-row toolbar-row"):
-            yield Button("Attack Chain", id="llm-attack-chain-btn", compact=True)
-            yield Button("Closing Note", id="llm-closing-note-btn", compact=True)
-            yield Button("Copy Reply", id="llm-copy-reply-btn", compact=True)
-            yield Button("Detach Ctx", id="llm-clear-context-btn", compact=True)
+                with Horizontal(classes="action-row filter-bar"):
+                    yield Select(
+                        model_options,
+                        allow_blank=False,
+                        value=initial_model_select,
+                        id="llm-model-select",
+                        compact=True,
+                    )
+                    yield Input(
+                        value=cfg.model or "",
+                        placeholder="Model or Copilot Agent name (e.g. llama3.2, SOC Triage Agent)",
+                        id="llm-model-input",
+                        compact=True,
+                    )
+                    yield Select(
+                        list(_TEMPLATE_OPTIONS),
+                        allow_blank=False,
+                        value="freeform",
+                        id="llm-template-select",
+                        compact=True,
+                    )
 
-        yield Static("", id="llm-context-badge", classes="rf-summary-bar", markup=False)
-        yield SelectableRichLog(
-            id="llm-transcript",
-            classes="primary-log",
-            highlight=False,
-            markup=False,
-            wrap=True,
-        )
+                with Horizontal(id="llm-copilot-bar", classes="action-row toolbar-row"):
+                    yield Button("Attack Chain", id="llm-attack-chain-btn", compact=True)
+                    yield Button("Closing Note", id="llm-closing-note-btn", compact=True)
+                    yield Button("Copy Reply", id="llm-copy-reply-btn", compact=True)
+                    yield Button("Detach Ctx", id="llm-clear-context-btn", compact=True)
 
-        with Horizontal(classes="action-row toolbar-row"):
-            yield Input(
-                placeholder="Ask the AI analyst or add instructions for attached context...",
-                id="llm-prompt",
-                compact=True,
-            )
-            yield Button("Send", id="llm-send-btn", variant="primary", compact=True)
-            yield Button("Stop", id="llm-stop-btn", variant="warning", compact=True)
-            yield Button("Clear", id="llm-clear-btn", compact=True)
+                yield Static("", id="llm-context-badge", classes="rf-summary-bar", markup=False)
+                yield SelectableRichLog(
+                    id="llm-transcript",
+                    classes="primary-log",
+                    highlight=False,
+                    markup=False,
+                    wrap=True,
+                )
+
+                with Horizontal(classes="action-row toolbar-row"):
+                    yield Input(
+                        placeholder="Ask the AI analyst or add instructions for attached context...",
+                        id="llm-prompt",
+                        compact=True,
+                    )
+                    yield Button("Send", id="llm-send-btn", variant="primary", compact=True)
+                    yield Button("Stop", id="llm-stop-btn", variant="warning", compact=True)
+                    yield Button("Clear", id="llm-clear-btn", compact=True)
+
+            with TabPane("AI Control Panel", id="llm-tab-control-panel"):
+                yield AIControlPanelWidget(
+                    policy_store=policy_store,
+                    audit_store=audit_store,
+                    registry=registry,
+                    id="llm-ai-control-panel",
+                )
+
+            with TabPane("Audit Log", id="llm-tab-audit-log"):
+                yield AuditLogViewWidget(
+                    audit_store=audit_store,
+                    id="llm-ai-audit-log",
+                )
+
+    def _resolve_ai_stores(self) -> tuple[AIPolicyStore, AuditLogStore, Any]:
+        policy_store = getattr(self.app, "ai_policy_store", None)
+        audit_store = getattr(self.app, "ai_audit_store", None)
+        registry = getattr(self.app, "ai_tool_registry", None)
+        cache_dir = self.workspace_dir / ".soclens_cache"
+        if not isinstance(policy_store, AIPolicyStore):
+            policy_store = AIPolicyStore(path=cache_dir / "ai_policy.json")
+        if not isinstance(audit_store, AuditLogStore):
+            audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl")
+        return policy_store, audit_store, registry
 
     def on_mount(self) -> None:
         self._sync_compact_class()
         badge = self.query_one("#llm-context-badge", Static)
         badge.display = False
+
+    def on_tab_activated(self) -> None:
+        self._sync_compact_class()
+        self._sync_subtab_views()
+
+    def _sync_subtab_views(self, active_tab_id: str | None = None) -> None:
+        target = active_tab_id
+        if target is None:
+            with contextlib.suppress(Exception):
+                target = str(self.query_one("#llm-subtabs", TabbedContent).active or "")
+        if target == "llm-tab-control-panel":
+            with contextlib.suppress(Exception):
+                self.query_one(AIControlPanelWidget).sync_from_store()
+        elif target == "llm-tab-audit-log":
+            with contextlib.suppress(Exception):
+                self.query_one(AuditLogViewWidget).refresh_entries()
+
+    @on(TabbedContent.TabActivated, "#llm-subtabs")
+    def handle_subtab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane is not None:
+            self._sync_subtab_views(str(event.pane.id or ""))
 
     def on_resize(self) -> None:
         self._sync_compact_class()
@@ -369,6 +441,7 @@ class LocalLLMPane(BaseSocPane):
     def _sync_compact_class(self) -> None:
         try:
             self.set_class(self.size.width < 96, "llm-compact")
+            self.set_class(self.size.height <= 26, "llm-short")
         except Exception:
             pass
 
@@ -538,6 +611,10 @@ class LocalLLMPane(BaseSocPane):
             pass
         if self._active_stop_event is None or self._active_stop_event.is_set():
             self.set_status(f"Settings reloaded ({cfg.provider} @ {cfg.base_url}).")
+        with contextlib.suppress(Exception):
+            self.query_one(AIControlPanelWidget).sync_from_store()
+        with contextlib.suppress(Exception):
+            self.query_one(AuditLogViewWidget).refresh_entries()
 
     def _current_provider(self) -> str:
         val = self.query_one("#llm-provider-select", Select).value

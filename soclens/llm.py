@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -443,8 +443,10 @@ class LocalLLMClient:
 
         self.max_retries = max(0, int(max_retries))
         self.backoff_base = max(0.0, float(backoff_base))
+        self._owns_stop_event = stop_event is None
         self._stop_event = stop_event if stop_event is not None else threading.Event()
         self._owns_session = session is None
+        self._ephemeral_for_orchestrator: bool = False
         self._initial_conversation_id = (conversation_id or "").strip() or None
         self._initial_conversation_token = (conversation_token or "").strip() or None
         self._initial_watermark = (watermark or "").strip() or None
@@ -821,9 +823,96 @@ class LocalLLMClient:
                 "error": str(exc),
             }
 
+    @staticmethod
+    def _normalize_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
+        """Normalize Ollama or OpenAI tool_calls into canonical OpenAI function-call dicts."""
+        if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes)):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for idx, item in enumerate(raw_tool_calls, start=1):
+            if not isinstance(item, Mapping):
+                continue
+            fn_raw = item.get("function")
+            fn = fn_raw if isinstance(fn_raw, Mapping) else item
+            name = str(fn.get("name") or "").strip()
+            if not name:
+                continue
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, Mapping):
+                args_str = json.dumps(dict(raw_args), ensure_ascii=False, default=str)
+            elif isinstance(raw_args, str):
+                args_str = raw_args.strip() or "{}"
+            elif raw_args is None:
+                args_str = "{}"
+            else:
+                args_str = json.dumps(raw_args, ensure_ascii=False, default=str)
+            call_id = str(item.get("id") or f"call_{idx}").strip() or f"call_{idx}"
+            normalized.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str},
+                }
+            )
+        return normalized
+
+    def _format_outgoing_message(self, msg: Mapping[str, Any]) -> dict[str, Any]:
+        """Format a canonical message dict for Ollama or OpenAI-compatible chat endpoints."""
+        role = str(msg.get("role") or "user").strip()
+        raw_content = msg.get("content")
+        content = "" if raw_content is None else str(raw_content)
+        out: dict[str, Any] = {"role": role, "content": content}
+
+        if role == "assistant":
+            raw_tcs = msg.get("tool_calls")
+            if isinstance(raw_tcs, Sequence) and not isinstance(raw_tcs, (str, bytes)) and raw_tcs:
+                if self.config.provider == "ollama":
+                    ollama_tcs: list[dict[str, Any]] = []
+                    for tc in raw_tcs:
+                        if not isinstance(tc, Mapping):
+                            continue
+                        fn_raw = tc.get("function")
+                        fn = fn_raw if isinstance(fn_raw, Mapping) else tc
+                        name = str(fn.get("name") or "").strip()
+                        if not name:
+                            continue
+                        raw_args = fn.get("arguments")
+                        args_dict: dict[str, Any] = {}
+                        if isinstance(raw_args, Mapping):
+                            args_dict = dict(raw_args)
+                        elif isinstance(raw_args, str):
+                            stripped_args = raw_args.strip()
+                            if stripped_args:
+                                try:
+                                    parsed_args = json.loads(stripped_args)
+                                    if isinstance(parsed_args, Mapping):
+                                        args_dict = dict(parsed_args)
+                                except ValueError:
+                                    args_dict = {}
+                        ollama_tcs.append({"function": {"name": name, "arguments": args_dict}})
+                    if ollama_tcs:
+                        out["tool_calls"] = ollama_tcs
+                else:
+                    norm_tcs = self._normalize_tool_calls(raw_tcs)
+                    if norm_tcs:
+                        out["tool_calls"] = norm_tcs
+        elif role == "tool":
+            if self.config.provider == "ollama":
+                tool_name = msg.get("tool_name") or msg.get("name")
+                if tool_name:
+                    out["tool_name"] = str(tool_name)
+            else:
+                if msg.get("tool_call_id"):
+                    out["tool_call_id"] = str(msg["tool_call_id"])
+                tool_name = msg.get("name") or msg.get("tool_name")
+                if tool_name:
+                    out["name"] = str(tool_name)
+
+        return out
+
     def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[Mapping[str, Any]],
         *,
         model: str | None = None,
         system_prompt: str | None = None,
@@ -831,6 +920,8 @@ class LocalLLMClient:
         max_tokens: int | None = None,
         stream_callback: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: str | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Send a chat completion request (streaming or non-streaming)."""
         if not messages:
@@ -841,15 +932,36 @@ class LocalLLMClient:
                 (model if model is not None else self.config.model or "").strip()
                 or self._default_copilot_model_label()
             )
-            # Extract latest user prompt
-            latest_user = ""
-            for msg in reversed(messages):
-                if str(msg.get("role") or "user").strip().lower() == "user":
-                    latest_user = str(msg.get("content") or "").strip()
-                    if latest_user:
+            last_role = str(messages[-1].get("role") or "").strip().lower()
+            if last_role == "tool":
+                trailing_tools: list[Mapping[str, Any]] = []
+                for msg in reversed(messages):
+                    if str(msg.get("role") or "").strip().lower() == "tool":
+                        trailing_tools.append(msg)
+                    else:
                         break
-            if not latest_user:
-                latest_user = str(messages[-1].get("content") or "").strip()
+                trailing_tools.reverse()
+                tool_blocks: list[str] = []
+                for tmsg in trailing_tools:
+                    tname = str(tmsg.get("name") or tmsg.get("tool_name") or "tool").strip()
+                    tcontent = str(tmsg.get("content") or "").strip()
+                    if "<tool_result" in tcontent or "[Tool Result" in tcontent:
+                        tool_blocks.append(tcontent)
+                    else:
+                        tool_blocks.append(f"[Tool Result: {tname}]\n{tcontent}")
+                latest_user = "\n\n".join(b for b in tool_blocks if b).strip()
+                if not latest_user:
+                    latest_user = str(messages[-1].get("content") or "").strip()
+            else:
+                # Extract latest user prompt
+                latest_user = ""
+                for msg in reversed(messages):
+                    if str(msg.get("role") or "user").strip().lower() == "user":
+                        latest_user = str(msg.get("content") or "").strip()
+                        if latest_user:
+                            break
+                if not latest_user:
+                    latest_user = str(messages[-1].get("content") or "").strip()
 
             clean_system = (system_prompt or "").strip()
             freeform_sys = SOC_PROMPT_TEMPLATES["freeform"]["system_prompt"].strip()
@@ -872,23 +984,22 @@ class LocalLLMClient:
                 "No local LLM model specified. Set RF_LLM_MODEL or pass model explicitly."
             )
 
-        full_messages: list[dict[str, str]] = []
+        full_messages: list[dict[str, Any]] = []
         clean_system = (system_prompt or "").strip()
         if clean_system:
             if not (
                 messages
                 and messages[0].get("role") == "system"
-                and messages[0].get("content", "").strip() == clean_system
+                and str(messages[0].get("content") or "").strip() == clean_system
             ):
                 full_messages.append({"role": "system", "content": clean_system})
         for msg in messages:
-            role = str(msg.get("role") or "user").strip()
-            content = str(msg.get("content") or "")
-            full_messages.append({"role": role, "content": content})
+            full_messages.append(self._format_outgoing_message(msg))
 
         eff_temp = self.config.temperature if temperature is None else float(temperature)
         eff_max_tokens = self.config.max_tokens if max_tokens is None else int(max_tokens)
         streaming = stream_callback is not None
+        tool_list = [dict(t) for t in tools] if tools else []
 
         url = self._endpoint_url("chat")
         if self.config.provider == "ollama":
@@ -901,6 +1012,8 @@ class LocalLLMClient:
                 "stream": streaming,
                 "options": options,
             }
+            if tool_list:
+                payload["tools"] = tool_list
         else:
             payload = {
                 "model": selected_model,
@@ -910,6 +1023,12 @@ class LocalLLMClient:
             }
             if eff_max_tokens is not None:
                 payload["max_tokens"] = eff_max_tokens
+            if tool_list:
+                payload["tools"] = tool_list
+                if tool_choice is not None:
+                    payload["tool_choice"] = (
+                        dict(tool_choice) if isinstance(tool_choice, Mapping) else tool_choice
+                    )
 
         response = self._request("POST", url, json_payload=payload, stream=streaming)
         try:
@@ -949,9 +1068,12 @@ class LocalLLMClient:
                 endpoint=url,
             )
 
+        raw_tool_calls: Any = None
         if self.config.provider == "ollama":
             msg = data.get("message")
             content = str(msg.get("content") or "") if isinstance(msg, dict) else ""
+            if isinstance(msg, dict):
+                raw_tool_calls = msg.get("tool_calls")
             resp_model = str(data.get("model") or selected_model)
             done = bool(data.get("done", True))
         else:
@@ -963,16 +1085,21 @@ class LocalLLMClient:
                     msg = first.get("message")
                     if isinstance(msg, dict):
                         content = str(msg.get("content") or "")
+                        raw_tool_calls = msg.get("tool_calls")
             resp_model = str(data.get("model") or selected_model)
             done = True
 
-        return {
+        result: dict[str, Any] = {
             "content": content,
             "model": resp_model,
             "provider": self.config.provider,
             "done": done,
             "raw": data,
         }
+        normalized_tcs = self._normalize_tool_calls(raw_tool_calls)
+        if normalized_tcs:
+            result["tool_calls"] = normalized_tcs
+        return result
 
     def _consume_stream(
         self,
@@ -984,6 +1111,8 @@ class LocalLLMClient:
     ) -> dict[str, Any]:
         chunks: list[str] = []
         raw_events: list[dict[str, Any]] = []
+        ollama_tool_calls: list[dict[str, Any]] = []
+        openai_tool_call_acc: dict[int, dict[str, Any]] = {}
         resp_model = selected_model
         done = False
 
@@ -1019,6 +1148,11 @@ class LocalLLMClient:
                         chunks.append(delta)
                         if stream_callback is not None:
                             stream_callback(delta)
+                    chunk_tcs = msg.get("tool_calls")
+                    if isinstance(chunk_tcs, list):
+                        ollama_tool_calls.extend(
+                            dict(tc) for tc in chunk_tcs if isinstance(tc, Mapping)
+                        )
                 if event.get("done"):
                     done = True
                     break
@@ -1056,16 +1190,64 @@ class LocalLLMClient:
                                 chunks.append(delta)
                                 if stream_callback is not None:
                                     stream_callback(delta)
+                            delta_tcs = delta_obj.get("tool_calls")
+                            if isinstance(delta_tcs, list):
+                                for frag in delta_tcs:
+                                    if not isinstance(frag, Mapping):
+                                        continue
+                                    raw_idx = frag.get("index", 0)
+                                    idx = (
+                                        raw_idx
+                                        if isinstance(raw_idx, int)
+                                        and not isinstance(raw_idx, bool)
+                                        else 0
+                                    )
+                                    acc_entry = openai_tool_call_acc.setdefault(
+                                        idx,
+                                        {
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""},
+                                        },
+                                    )
+                                    if frag.get("id"):
+                                        acc_entry["id"] = str(frag["id"])
+                                    if frag.get("type"):
+                                        acc_entry["type"] = str(frag["type"])
+                                    frag_fn = frag.get("function")
+                                    if isinstance(frag_fn, Mapping):
+                                        if frag_fn.get("name"):
+                                            acc_entry["function"]["name"] = str(frag_fn["name"])
+                                        if frag_fn.get("arguments") is not None:
+                                            frag_args = frag_fn["arguments"]
+                                            if isinstance(frag_args, Mapping):
+                                                acc_entry["function"]["arguments"] = json.dumps(
+                                                    dict(frag_args),
+                                                    ensure_ascii=False,
+                                                    default=str,
+                                                )
+                                            else:
+                                                acc_entry["function"]["arguments"] = str(
+                                                    acc_entry["function"]["arguments"]
+                                                ) + str(frag_args)
                         if first.get("finish_reason") is not None:
                             done = True
 
-        return {
+        result: dict[str, Any] = {
             "content": "".join(chunks),
             "model": resp_model,
             "provider": self.config.provider,
             "done": done,
             "raw": raw_events,
         }
+        if self.config.provider == "ollama":
+            normalized_tcs = self._normalize_tool_calls(ollama_tool_calls)
+        else:
+            ordered = [openai_tool_call_acc[k] for k in sorted(openai_tool_call_acc)]
+            normalized_tcs = self._normalize_tool_calls(ordered)
+        if normalized_tcs:
+            result["tool_calls"] = normalized_tcs
+        return result
 
     def analyze_with_template(
         self,

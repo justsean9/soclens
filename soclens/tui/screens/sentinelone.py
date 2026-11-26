@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 from collections.abc import Mapping, Sequence
@@ -12,7 +13,9 @@ from rich.table import Table
 from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.coordinate import Coordinate
 from textual.dom import DOMNode
 from textual.widget import Widget
 from textual.widgets import (
@@ -32,6 +35,7 @@ from soclens.config import (
     get_s1_tier_config,
     get_sentinelone_config,
 )
+from soclens.event_tracker import UniqueEvent, infer_s1_source_kind, normalize_unique_event
 from soclens.sentinelone import (
     SentinelOneAuthError,
     SentinelOneClient,
@@ -40,6 +44,7 @@ from soclens.sentinelone import (
     _sanitize_scope_roles,
     sort_s1_records_newest_first,
 )
+from soclens.tui.ai_widgets import EventAIPanelWidget
 from soclens.tui.filters import (
     S1_PRESETS_BY_VIEW,
     TIMEFRAME_OPTIONS,
@@ -186,6 +191,10 @@ class SentinelOnePane(BaseSocPane):
     STATUS_ID = "s1-status"
     LOG_ID = ""
     LOG_SOURCE = "sentinelone"
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("m", "open_context_menu", "Menu"),
+    ]
 
     DEFAULT_CSS: ClassVar[str] = """
     SentinelOnePane {
@@ -512,6 +521,7 @@ class SentinelOnePane(BaseSocPane):
                     markup=False,
                     wrap=True,
                 )
+                yield EventAIPanelWidget(id="s1-ai-panel")
 
     def on_mount(self) -> None:
         table = self.query_one("#s1-table", DoubleClickDataTable)
@@ -622,14 +632,22 @@ class SentinelOnePane(BaseSocPane):
             self.call_after_refresh(self._fit_table)
 
     def _update_split_layout(self) -> None:
+        split_horizontal = self.size.width >= _SPLIT_HORIZONTAL_MIN_WIDTH
         try:
             ws = self.query_one("#s1-workspace", Container)
-            if self.size.width >= _SPLIT_HORIZONTAL_MIN_WIDTH:
+            if split_horizontal:
                 ws.add_class("split-horizontal")
             else:
                 ws.remove_class("split-horizontal")
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            ai_panel = self.query_one("#s1-ai-panel", EventAIPanelWidget)
+            ai_panel.display = self.size.height > 26
+            ai_panel.set_class(
+                not split_horizontal and self.size.height < 40,
+                "ai-panel-compact",
+            )
 
     def _sync_workbench_pills(self) -> None:
         wb_map = {
@@ -786,6 +804,7 @@ class SentinelOnePane(BaseSocPane):
             pass
 
     def _render_empty_detail(self) -> None:
+        self.sync_event_ai_panel("#s1-ai-panel", None)
         try:
             detail = self.query_one("#s1-detail-log", RichLog)
             detail.clear()
@@ -1238,11 +1257,108 @@ class SentinelOnePane(BaseSocPane):
         self._update_summary_bar()
         self.call_after_refresh(self._fit_table)
 
+    def _active_unique_event(self, rec: dict[str, Any] | None = None) -> UniqueEvent | None:
+        if self._current_view != "threats":
+            return None
+        target = rec if rec is not None else self._selected_record
+        if not isinstance(target, dict) or target.get("_is_group_header"):
+            return None
+        source_kind = infer_s1_source_kind(target)
+        try:
+            return normalize_unique_event(source_kind, target)
+        except (TypeError, ValueError):
+            return None
+
+    def refresh_event_ai_panel_if_matching(self, event: UniqueEvent) -> None:
+        """Refresh the SentinelOne AI panel when the active selection matches ``event``."""
+        cur = self._active_unique_event()
+        if cur is not None and cur.event_key == event.event_key:
+            self.sync_event_ai_panel("#s1-ai-panel", cur)
+
+    @on(EventAIPanelWidget.AskRequested, "#s1-ai-panel")
+    def handle_ai_ask_requested(self, message: EventAIPanelWidget.AskRequested) -> None:
+        _ = message
+        self.request_ask_event_ai("#s1-ai-panel", self._active_unique_event())
+
+    @on(EventAIPanelWidget.FullInvestigateRequested, "#s1-ai-panel")
+    def handle_ai_full_requested(
+        self, message: EventAIPanelWidget.FullInvestigateRequested
+    ) -> None:
+        _ = message
+        self.request_full_event_ai("#s1-ai-panel", self._active_unique_event())
+
+    def action_open_context_menu(self) -> None:
+        """Open the contextual AI/pivot menu for the selected threat or cloud alert."""
+        if self._current_view != "threats":
+            return
+        rec = self._selected_record
+        if not isinstance(rec, dict) or rec.get("_is_group_header"):
+            return
+        table = self.query_one("#s1-table", DoubleClickDataTable)
+        origin = (table.region.x + 4, table.region.y + 2)
+        self._open_event_context_menu(rec, origin=origin)
+
+    def open_event_row_context_menu(
+        self, row_index: int, *, origin: tuple[int, int]
+    ) -> bool:
+        """Select ``row_index`` and open the SentinelOne threat/alert context menu."""
+        if self._current_view != "threats":
+            return False
+        rec = self._record_for_row_index(row_index)
+        if rec is None or rec.get("_is_group_header"):
+            return False
+        if self._active_unique_event(rec) is None:
+            return False
+        with contextlib.suppress(Exception):
+            table = self.query_one("#s1-table", DoubleClickDataTable)
+            table.cursor_coordinate = Coordinate(row_index, 0)
+        self._select_record(rec)
+        self._open_event_context_menu(rec, origin=origin)
+        return True
+
+    def _open_event_context_menu(
+        self, rec: dict[str, Any], *, origin: tuple[int, int]
+    ) -> None:
+        event = self._active_unique_event(rec)
+        if event is None:
+            return
+        items: list[tuple[str, str]] = [
+            ("ai_ask_event", "Ask AI / Copilot (Event Only)..."),
+            ("ai_full_investigate", "Full AI Investigation (Cross-Search)"),
+            ("pivot_es", "Pivot to Splunk ES"),
+            ("pivot_rf", "Pivot to RF Intel"),
+            ("pivot_llm", "Send to AI Analyst (F7)"),
+            ("copy_detail", "Copy Detail Panel"),
+        ]
+
+        def _on_select(action_id: str) -> None:
+            if action_id == "ai_ask_event":
+                self.request_ask_event_ai("#s1-ai-panel", event)
+            elif action_id == "ai_full_investigate":
+                self.request_full_event_ai("#s1-ai-panel", event)
+            elif action_id == "pivot_es":
+                self._emit_pivot_target("tab-splunk-es")
+            elif action_id == "pivot_rf":
+                self._emit_pivot_target("tab-rf-intel")
+            elif action_id == "pivot_llm":
+                self._emit_pivot_target("tab-llm")
+            elif action_id == "copy_detail":
+                self.handle_copy_detail()
+
+        title = _truncate(event.title or event.native_id, 40) or "SentinelOne Alert"
+        self.open_context_menu(
+            items,
+            title=title,
+            origin=origin,
+            on_select=_on_select,
+        )
+
     def _select_record(self, rec: dict[str, Any]) -> None:
         self._selected_record = rec
         try:
             header = self.query_one("#s1-detail-header", Static)
             if rec.get("_is_group_header"):
+                self.sync_event_ai_panel("#s1-ai-panel", None)
                 gkey = str(rec.get("_group_label") or "Group")
                 header.update(f"Group Summary ({gkey})")
                 detail = self.query_one("#s1-detail-log", RichLog)
@@ -1286,6 +1402,7 @@ class SentinelOnePane(BaseSocPane):
                         site_name=site_name,
                     )
                 )
+            self.sync_event_ai_panel("#s1-ai-panel", self._active_unique_event(rec))
         except Exception:
             pass
 

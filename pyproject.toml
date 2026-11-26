@@ -71,6 +71,7 @@ markers = [
     "tier2: Tier 2 boundary and error-handling E2E tests",
     "tier3: Tier 3 pairwise cross-feature E2E tests",
     "tier4: Tier 4 full SOC scenario E2E tests",
+    "tier5: Tier 5 adversarial hardening E2E tests",
     "feature(name): Feature ID tag for requirement traceability",
 ]
 

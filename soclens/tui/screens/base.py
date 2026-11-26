@@ -407,6 +407,22 @@ class DoubleClickDataTable(DataTable[Any]):
             return None
         return col_label, val
 
+    def extract_row_index_at_event(self, event: events.MouseEvent) -> int | None:
+        """Return the valid 0-based data row index under ``event``, or ``None`` if header/outside."""
+        style = getattr(event, "style", None)
+        meta = getattr(style, "meta", None) if style is not None else None
+        if not isinstance(meta, dict) or "row" not in meta:
+            return None
+        if meta.get("out_of_bounds", False):
+            return None
+        try:
+            row_index = int(meta["row"])
+        except (TypeError, ValueError):
+            return None
+        if row_index < 0 or not self.is_valid_row_index(row_index):
+            return None
+        return row_index
+
     def set_row_tooltip_provider(self, provider: Callable[[int], str | None] | None) -> None:
         """Register an optional callback returning custom full-line hover text for a row index."""
         self._row_tooltip_provider = provider
@@ -941,3 +957,56 @@ class BaseSocPane(VerticalScroll):
     def on_timezone_changed(self, tz_name: str) -> None:
         """Hook invoked when the active TUI display timezone changes."""
         _ = tz_name
+
+    def sync_event_ai_panel(self, panel_selector: str, event: Any) -> None:
+        """Bind ``event`` and its persisted AI entries to the pane-scoped ``EventAIPanelWidget``."""
+        from soclens.tui.ai_widgets import EventAIPanelWidget
+
+        try:
+            panel = self.query_one(panel_selector, EventAIPanelWidget)
+        except Exception:
+            return
+        if event is None:
+            panel.set_event(None, ())
+            return
+        store = getattr(self.app, "event_ai_store", None)
+        panels = store.get_panels(event.event_key) if store is not None else ()
+        panel.set_event(event, panels)
+
+    def request_ask_event_ai(self, panel_selector: str, event: Any) -> None:
+        """Prompt for an event-only question and launch an ``ask_only`` investigation."""
+        if self.is_app_shutting_down() or event is None:
+            return
+        from soclens.tui.ai_widgets import AskEventAIModal, EventAIPanelWidget
+
+        modal = AskEventAIModal(
+            event_title=str(getattr(event, "title", "") or getattr(event, "native_id", "")),
+            event_key=str(getattr(event, "event_key", "")),
+        )
+
+        def _on_question(question: str | None) -> None:
+            if not question or not question.strip() or self.is_app_shutting_down():
+                return
+            with contextlib.suppress(Exception):
+                self.query_one(panel_selector, EventAIPanelWidget).show_investigating(
+                    event, "ask_only", question=question.strip()
+                )
+            trigger_fn = getattr(self.app, "trigger_event_ai_investigation", None)
+            if callable(trigger_fn):
+                trigger_fn(event, "ask_only", question=question.strip())
+
+        self.run_on_ui(self.app.push_screen, modal, _on_question)
+
+    def request_full_event_ai(self, panel_selector: str, event: Any) -> None:
+        """Launch a ``full_investigation`` run for ``event`` and show loading state."""
+        if self.is_app_shutting_down() or event is None:
+            return
+        from soclens.tui.ai_widgets import EventAIPanelWidget
+
+        with contextlib.suppress(Exception):
+            self.query_one(panel_selector, EventAIPanelWidget).show_investigating(
+                event, "full_investigation"
+            )
+        trigger_fn = getattr(self.app, "trigger_event_ai_investigation", None)
+        if callable(trigger_fn):
+            trigger_fn(event, "full_investigation")

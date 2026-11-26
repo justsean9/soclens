@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import logging
@@ -30,6 +31,8 @@ from textual.widgets import (
 
 from soclens.alert_cache import CACHE_SOURCE_RF, CACHE_SOURCE_RF_PLAYBOOK
 from soclens.client import RecordedFutureError
+from soclens.event_tracker import EventSourceKind, UniqueEvent, normalize_unique_event
+from soclens.tui.ai_widgets import EventAIPanelWidget
 from soclens.tui.filters import (
     ASSIGNEE_FILTER_BASE_OPTIONS,
     PRIORITY_FILTER_OPTIONS,
@@ -644,6 +647,7 @@ class RFIntelPane(BaseSocPane):
                     markup=False,
                     wrap=True,
                 )
+                yield EventAIPanelWidget(id="rf-ai-panel")
 
     def on_mount(self) -> None:
         table = self.query_one("#rf-results-table", DoubleClickDataTable)
@@ -845,6 +849,13 @@ class RFIntelPane(BaseSocPane):
                 lookup_bar.remove_class("lookup-inline")
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            ai_panel = self.query_one("#rf-ai-panel", EventAIPanelWidget)
+            ai_panel.display = self.size.height > 26
+            ai_panel.set_class(
+                not split_horizontal and self.size.height < 40,
+                "ai-panel-compact",
+            )
         self.call_after_refresh(self._refresh_after_layout)
 
     def _refresh_after_layout(self) -> None:
@@ -1606,6 +1617,42 @@ class RFIntelPane(BaseSocPane):
             return self._visible_items[self._selected_index]
         return None
 
+    def _active_unique_event(self, item: dict[str, Any] | None = None) -> UniqueEvent | None:
+        mode = self._active_mode
+        if mode not in ("alerts_v3", "playbook"):
+            return None
+        target = item if item is not None else self._get_selected_item()
+        if not isinstance(target, dict):
+            return None
+        source_kind: EventSourceKind = "rf_alert" if mode == "alerts_v3" else "rf_playbook"
+        item_id = str(target.get("id") or "").strip()
+        cached_full = self._detail_cache.get((mode, item_id)) if item_id else None
+        payload: dict[str, Any] = (
+            {**cached_full, **target} if isinstance(cached_full, dict) else dict(target)
+        )
+        try:
+            return normalize_unique_event(source_kind, payload)
+        except (TypeError, ValueError):
+            return None
+
+    def refresh_event_ai_panel_if_matching(self, event: UniqueEvent) -> None:
+        """Refresh the RF AI panel when the currently selected event matches ``event``."""
+        cur = self._active_unique_event()
+        if cur is not None and cur.event_key == event.event_key:
+            self.sync_event_ai_panel("#rf-ai-panel", cur)
+
+    @on(EventAIPanelWidget.AskRequested, "#rf-ai-panel")
+    def handle_ai_ask_requested(self, message: EventAIPanelWidget.AskRequested) -> None:
+        _ = message
+        self.request_ask_event_ai("#rf-ai-panel", self._active_unique_event())
+
+    @on(EventAIPanelWidget.FullInvestigateRequested, "#rf-ai-panel")
+    def handle_ai_full_requested(
+        self, message: EventAIPanelWidget.FullInvestigateRequested
+    ) -> None:
+        _ = message
+        self.request_full_event_ai("#rf-ai-panel", self._active_unique_event())
+
     def _write_detail_renderable(self, renderable: Any) -> None:
         log_widget = self.query_one("#rf-log", RichLog)
         avail = log_widget.scrollable_content_region.width
@@ -1833,18 +1880,21 @@ class RFIntelPane(BaseSocPane):
         clear_kitty_images(self.app, self._inline_kitty_ids)
         detail_header = self.query_one("#rf-detail-header", Static)
         if self._last_error_payload is not None:
+            self.sync_event_ai_panel("#rf-ai-panel", None)
             ctx, det = self._last_error_payload
             detail_header.update(Text(f"Error: {ctx}", style="bold red"))
             self._write_detail_renderable(render_error_panel(ctx, det))
             return
 
         if self._active_mode == "welcome":
+            self.sync_event_ai_panel("#rf-ai-panel", None)
             detail_header.update("Inspector (Quick Start)")
             self._write_detail_renderable(render_welcome_view())
             return
 
         item = self._get_selected_item()
         if item is None:
+            self.sync_event_ai_panel("#rf-ai-panel", None)
             raw_items = self._datasets.get(self._active_mode, [])
             msg = (
                 "No records returned for this query."
@@ -1854,6 +1904,8 @@ class RFIntelPane(BaseSocPane):
             detail_header.update("Inspector (Empty)")
             self._write_detail_renderable(Panel(Text(msg, style="dim"), border_style="dim"))
             return
+
+        self.sync_event_ai_panel("#rf-ai-panel", self._active_unique_event(item))
 
         item_id = str(item.get("id") or "")
         cached_full = self._detail_cache.get((self._active_mode, item_id))
@@ -2461,6 +2513,26 @@ class RFIntelPane(BaseSocPane):
         if fn is not None:
             fn()
 
+    def open_event_row_context_menu(
+        self, row_index: int, *, origin: tuple[int, int]
+    ) -> bool:
+        """Select ``row_index`` and open the RF alert/playbook context menu."""
+        if self._active_mode not in ("alerts_v3", "playbook"):
+            return False
+        if not (0 <= row_index < len(self._visible_items)):
+            return False
+        item = self._visible_items[row_index]
+        if self._active_unique_event(item) is None:
+            return False
+        self._selected_index = row_index
+        with contextlib.suppress(Exception):
+            table = self.query_one("#rf-results-table", DoubleClickDataTable)
+            table.cursor_coordinate = Coordinate(row_index, 0)
+        self._update_toolbar_state()
+        self._render_detail_panel()
+        self._open_item_context_menu(item, origin=origin)
+        return True
+
     def _open_item_context_menu(
         self,
         item: dict[str, Any],
@@ -2476,6 +2548,14 @@ class RFIntelPane(BaseSocPane):
         pivot_entity = ""
         pivot_type = ""
         target_sc_id = ""
+
+        if mode in ("alerts_v3", "playbook"):
+            items.extend(
+                [
+                    ("ai_ask_event", "Ask AI / Copilot (Event Only)..."),
+                    ("ai_full_investigate", "Full AI Investigation (Cross-Search)"),
+                ]
+            )
 
         if mode == "alerts_v3":
             items.extend(
@@ -2620,7 +2700,11 @@ class RFIntelPane(BaseSocPane):
         items.append(("reload_view", "Reload Active View"))
 
         def _on_select(action_id: str) -> None:
-            if action_id == "deep_detail":
+            if action_id == "ai_ask_event":
+                self.request_ask_event_ai("#rf-ai-panel", self._active_unique_event(item))
+            elif action_id == "ai_full_investigate":
+                self.request_full_event_ai("#rf-ai-panel", self._active_unique_event(item))
+            elif action_id == "deep_detail":
                 self._trigger_deep_detail(item)
             elif action_id == "triage":
                 self._open_triage_modal(mode, item)

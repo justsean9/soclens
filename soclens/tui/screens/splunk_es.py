@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import re
@@ -17,6 +18,7 @@ from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, Checkbox, Collapsible, DataTable, Input, RichLog, Select, Static
@@ -29,6 +31,7 @@ from soclens.config import (
     get_splunk_config,
     get_splunk_es_tenant_settings,
 )
+from soclens.event_tracker import UniqueEvent, normalize_unique_event
 from soclens.splunk_es import (
     NOTABLE_STATUS_LABELS,
     NOTABLE_STATUS_MAP,
@@ -50,6 +53,7 @@ from soclens.splunk_rf_enrichment import (
     write_enrichment_to_notable,
 )
 from soclens.timezone import parse_iso_datetime
+from soclens.tui.ai_widgets import EventAIPanelWidget
 from soclens.tui.filters import (
     ES_TIMEFRAME_OPTIONS,
     SPLUNK_ES_PRESETS,
@@ -335,6 +339,7 @@ class SplunkESPane(BaseSocPane):
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("space", "toggle_select_row", "Select Row", show=False),
         Binding("slash", "toggle_structured_filters", "Filters", show=False),
+        Binding("m", "open_context_menu", "Menu"),
     ]
 
     DEFAULT_CSS: ClassVar[str] = """
@@ -825,6 +830,7 @@ class SplunkESPane(BaseSocPane):
                     markup=False,
                     wrap=True,
                 )
+                yield EventAIPanelWidget(id="es-ai-panel")
 
     def on_mount(self) -> None:
         table = self.query_one("#es-table", DoubleClickDataTable)
@@ -1074,10 +1080,20 @@ class SplunkESPane(BaseSocPane):
             self._sync_compact_labels(compact_small)
             self._apply_compact_inline_styles(compact_small)
             ws = self.query_one("#es-workspace", Container)
-            if self.size.width >= 110 or (compact_small and self.size.width >= 76):
+            split_horizontal = self.size.width >= 110 or (
+                compact_small and self.size.width >= 76
+            )
+            if split_horizontal:
                 ws.add_class("split-horizontal")
             else:
                 ws.remove_class("split-horizontal")
+            with contextlib.suppress(Exception):
+                ai_panel = self.query_one("#es-ai-panel", EventAIPanelWidget)
+                ai_panel.display = self.size.height > 26
+                ai_panel.set_class(
+                    not split_horizontal and self.size.height < 40,
+                    "ai-panel-compact",
+                )
             if compact_small:
                 self.query_one("#es-structured-filter-collapsible", Collapsible).collapsed = True
                 self.query_one("#es-rf-map-collapsible", Collapsible).collapsed = True
@@ -2850,7 +2866,102 @@ class SplunkESPane(BaseSocPane):
     # Detail Inspector Rendering
     # ------------------------------------------------------------------
 
+    def _active_unique_event(self, row: dict[str, Any] | None = None) -> UniqueEvent | None:
+        if self._current_view != "notables":
+            return None
+        target = row if row is not None else self.get_selected_row()
+        if not isinstance(target, dict) or target.get("_is_group_row"):
+            return None
+        try:
+            return normalize_unique_event("splunk_es", target)
+        except (TypeError, ValueError):
+            return None
+
+    def refresh_event_ai_panel_if_matching(self, event: UniqueEvent) -> None:
+        """Refresh the Splunk ES AI panel when the currently selected notable matches ``event``."""
+        cur = self._active_unique_event()
+        if cur is not None and cur.event_key == event.event_key:
+            self.sync_event_ai_panel("#es-ai-panel", cur)
+
+    @on(EventAIPanelWidget.AskRequested, "#es-ai-panel")
+    def handle_ai_ask_requested(self, message: EventAIPanelWidget.AskRequested) -> None:
+        _ = message
+        self.request_ask_event_ai("#es-ai-panel", self._active_unique_event())
+
+    @on(EventAIPanelWidget.FullInvestigateRequested, "#es-ai-panel")
+    def handle_ai_full_requested(
+        self, message: EventAIPanelWidget.FullInvestigateRequested
+    ) -> None:
+        _ = message
+        self.request_full_event_ai("#es-ai-panel", self._active_unique_event())
+
+    def action_open_context_menu(self) -> None:
+        """Open the contextual AI/pivot menu for the currently selected Splunk ES notable."""
+        if self._current_view != "notables":
+            return
+        row = self.get_selected_row()
+        if row is None:
+            return
+        table = self.query_one("#es-table", DoubleClickDataTable)
+        origin = (table.region.x + 4, table.region.y + 2)
+        self._open_event_context_menu(row, origin=origin)
+
+    def open_event_row_context_menu(
+        self, row_index: int, *, origin: tuple[int, int]
+    ) -> bool:
+        """Select ``row_index`` and open the Splunk ES notable context menu."""
+        if self._current_view != "notables":
+            return False
+        if not (0 <= row_index < len(self._displayed_rows)):
+            return False
+        row = self._displayed_rows[row_index]
+        if row.get("_is_group_row"):
+            return False
+        if self._active_unique_event(row) is None:
+            return False
+        with contextlib.suppress(Exception):
+            table = self.query_one("#es-table", DoubleClickDataTable)
+            table.cursor_coordinate = Coordinate(row_index, 0)
+        self._render_detail(row_index)
+        self._open_event_context_menu(row, origin=origin)
+        return True
+
+    def _open_event_context_menu(
+        self, row: dict[str, Any], *, origin: tuple[int, int]
+    ) -> None:
+        event = self._active_unique_event(row)
+        if event is None:
+            return
+        items: list[tuple[str, str]] = [
+            ("ai_ask_event", "Ask AI / Copilot (Event Only)..."),
+            ("ai_full_investigate", "Full AI Investigation (Cross-Search)"),
+            ("pivot_search", "Pivot to Splunk Search (F8)"),
+            ("pivot_s1", "Pivot to SentinelOne (9)"),
+            ("pivot_llm", "Send to AI Analyst (F7)"),
+        ]
+
+        def _on_select(action_id: str) -> None:
+            if action_id == "ai_ask_event":
+                self.request_ask_event_ai("#es-ai-panel", event)
+            elif action_id == "ai_full_investigate":
+                self.request_full_event_ai("#es-ai-panel", event)
+            elif action_id == "pivot_search":
+                self.handle_pivot_to_search()
+            elif action_id == "pivot_s1":
+                self.handle_pivot_to_sentinelone()
+            elif action_id == "pivot_llm":
+                self.handle_pivot_to_llm_copilot()
+
+        title = str(event.title or event.native_id or "Splunk ES Notable")[:40]
+        self.open_context_menu(
+            items,
+            title=title,
+            origin=origin,
+            on_select=_on_select,
+        )
+
     def _clear_detail(self, message: str = "") -> None:
+        self.sync_event_ai_panel("#es-ai-panel", None)
         detail = self.query_one("#es-detail", RichLog)
         detail.clear()
         self.query_one("#es-detail-header", Static).update("Detail")
@@ -2865,11 +2976,17 @@ class SplunkESPane(BaseSocPane):
         detail.clear()
 
         if row.get("_is_group_row"):
+            self.sync_event_ai_panel("#es-ai-panel", None)
             tkey = str(row.get("_group_tenant") or "-")
             self.query_one("#es-detail-header", Static).update(f"Tenant Group - {tkey}")
             detail.write(str(row.get("title") or ""))
             detail.write("Press Space or Enter on this group header row to expand/collapse.")
             return
+
+        if self._current_view == "notables":
+            self.sync_event_ai_panel("#es-ai-panel", self._active_unique_event(row))
+        else:
+            self.sync_event_ai_panel("#es-ai-panel", None)
 
         title_hint = (
             row.get("rule_title")

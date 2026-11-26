@@ -8,6 +8,7 @@ import inspect
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import datetime
@@ -24,6 +25,10 @@ from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Select, Static, TabbedContent, TabPane
 
+from soclens.agent_audit import AuditLogStore
+from soclens.agent_orchestrator import InvestigationResult, SocAgentOrchestrator
+from soclens.agent_policy import AIPolicyStore, InvestigationMode
+from soclens.agent_tools import ReadOnlyToolRegistry, build_default_readonly_registry
 from soclens.alert_cache import (
     CACHE_SOURCE_ES,
     CACHE_SOURCE_RF,
@@ -46,11 +51,13 @@ from soclens.config import (
     IMAGE_VIEWER_OS,
     UI_VIEW_ADMIN,
     UI_VIEW_USER,
+    ConfigurationError,
     PivotPayload,
     classify_site_tier,
     ensure_utf8_console,
     format_image_viewer_status,
     get_image_viewer_mode,
+    get_local_llm_config,
     get_rf_sandbox_token,
     get_rf_token,
     get_rf_verify_ssl,
@@ -64,6 +71,9 @@ from soclens.config import (
     save_tui_settings,
     suppress_insecure_ssl_warnings,
 )
+from soclens.event_tracker import BackgroundTriageQueue, EventAIStore, UniqueEvent
+from soclens.llm import LocalLLMClient
+from soclens.osint import OSINTClient
 from soclens.sentinelone import SentinelOneAuthError, SentinelOneClient
 from soclens.settings import (
     clear_session_overrides,
@@ -71,6 +81,8 @@ from soclens.settings import (
     invalidate_settings_cache,
     is_settings_locked,
 )
+from soclens.splunk import SplunkClient
+from soclens.splunk_es import SPLUNK_ES_APP, SplunkESClient
 from soclens.tui.image_render import (
     get_recommended_image_viewer_mode,
     get_terminal_probe_result,
@@ -880,6 +892,16 @@ class SocLensApp(App[None]):
     #llm-template-select {
         width: 24;
     }
+    #llm-transcript {
+        min-height: 5;
+    }
+    .llm-short #llm-status {
+        height: 1;
+        min-height: 1;
+    }
+    .llm-short #llm-transcript {
+        min-height: 3;
+    }
     Collapsible {
         width: 1fr;
         height: auto;
@@ -1195,6 +1217,7 @@ class SocLensApp(App[None]):
         self._custom_osint_client_injected = osint_client is not None
         self._custom_workspace_injected = workspace_dir is not None
         self._ui_mounted = False
+        self._ui_loop: asyncio.AbstractEventLoop | None = None
         self.client = (
             client if client is not None else RecordedFutureClient(stop_event=self._stop_event)
         )
@@ -1262,6 +1285,37 @@ class SocLensApp(App[None]):
         )
         self.api_access = ApiAccessRegistry(
             state_path=self.workspace_dir / ".soclens_cache" / "api_access.json"
+        )
+        self.splunk_client: Any = getattr(self, "splunk_client", None)
+        self.splunk_es_client: Any = getattr(self, "splunk_es_client", None)
+        self.llm_client: Any = getattr(self, "llm_client", None)
+        ai_cache_root = self.workspace_dir / ".soclens_cache"
+        self.ai_policy_store = AIPolicyStore(path=ai_cache_root / "ai_policy.json")
+        self.ai_audit_store = AuditLogStore(path=ai_cache_root / "ai_audit.jsonl")
+        self.event_ai_store = EventAIStore(path=ai_cache_root / "event_ai_panels.json")
+        self._default_alert_cache = self.alert_cache
+        self._default_api_access = self.api_access
+        self._default_ai_policy_store = self.ai_policy_store
+        self._default_ai_audit_store = self.ai_audit_store
+        self._default_event_ai_store = self.event_ai_store
+        self.ai_tool_registry: ReadOnlyToolRegistry = build_default_readonly_registry(
+            rf_client=self._get_ai_rf_client,
+            s1_client=self._get_ai_s1_client,
+            splunk_client=self._get_ai_splunk_client,
+            splunk_es_client=self._get_ai_splunk_es_client,
+            osint_client=self._get_ai_osint_client,
+        )
+        self.ai_orchestrator = SocAgentOrchestrator(
+            registry=self.ai_tool_registry,
+            policy_store=self.ai_policy_store,
+            audit_store=self.ai_audit_store,
+            llm_client_factory=self._get_ai_llm_client,
+        )
+        self.background_triage_queue = BackgroundTriageQueue(
+            orchestrator=self.ai_orchestrator,
+            policy_store=self.ai_policy_store,
+            event_store=self.event_ai_store,
+            on_complete=self._on_background_triage_complete,
         )
         if not self.is_headless or os.environ.get("SOCLENS_DEBUG_LOG", "").strip().lower() in (
             "1",
@@ -1838,6 +1892,18 @@ class SocLensApp(App[None]):
         with contextlib.suppress(Exception):
             widget, _region = self.screen.get_widget_at(event.screen_x, event.screen_y)
             if isinstance(widget, DoubleClickDataTable):
+                row_index = widget.extract_row_index_at_event(event)
+                if row_index is not None:
+                    for anc in widget.ancestors:
+                        open_event_menu = getattr(anc, "open_event_row_context_menu", None)
+                        if callable(open_event_menu):
+                            if open_event_menu(
+                                row_index,
+                                origin=(event.screen_x, event.screen_y),
+                            ):
+                                event.stop()
+                                return
+                            break
                 cell_hit = widget.extract_cell_at_event(event)
                 if cell_hit is not None:
                     col_label, cell_val = cell_hit
@@ -1953,16 +2019,31 @@ class SocLensApp(App[None]):
         if not self._custom_s1_client_injected:
             self.s1_client = None
         if not self._custom_workspace_injected:
-            self.workspace_dir = get_workspace_dir()
+            old_workspace = self.workspace_dir
+            new_workspace = get_workspace_dir()
+            self.workspace_dir = new_workspace
+            if new_workspace != old_workspace:
+                new_cache_root = new_workspace / ".soclens_cache"
+                if self.alert_cache is self._default_alert_cache:
+                    self.alert_cache.rebind_cache_dir(new_cache_root / "alerts")
+                if self.api_access is self._default_api_access:
+                    self.api_access.rebind_path(new_cache_root / "api_access.json")
+                if self.ai_policy_store is self._default_ai_policy_store:
+                    self.ai_policy_store.rebind_path(new_cache_root / "ai_policy.json")
+                if self.ai_audit_store is self._default_ai_audit_store:
+                    self.ai_audit_store.rebind_path(new_cache_root / "ai_audit.jsonl")
+                if self.event_ai_store is self._default_event_ai_store:
+                    self.event_ai_store.rebind_path(new_cache_root / "event_ai_panels.json")
         for attr in ("splunk_client", "splunk_es_client", "llm_client"):
             if hasattr(self, attr) and not getattr(self, f"_custom_{attr}_injected", False):
                 setattr(self, attr, None)
         self._update_subtitle()
-        for pane in self.query(BaseSocPane):
-            try:
-                pane.on_settings_updated()
-            except Exception:
-                pass
+        if self._ui_mounted:
+            for pane in self.query(BaseSocPane):
+                try:
+                    pane.on_settings_updated()
+                except Exception:
+                    pass
         if self._ui_mounted and self._should_preload_alerts() and not is_settings_locked():
             self._start_alert_preloader()
 
@@ -1978,6 +2059,8 @@ class SocLensApp(App[None]):
     def on_mount(self) -> None:
         """Install logging bridge and apply initial UI view mode once mounted."""
         self._ui_mounted = True
+        with contextlib.suppress(RuntimeError):
+            self._ui_loop = asyncio.get_running_loop()
         self._logging_bridge.install(self)
         if not self._has_explicit_image_viewer and not self.is_headless:
             rec = get_recommended_image_viewer_mode(is_headless=False, app=self)
@@ -1991,6 +2074,7 @@ class SocLensApp(App[None]):
             self._apply_view_mode_to_ui()
             self._sync_responsive_chrome()
             self._focus_main_tabs()
+        self.background_triage_queue.start()
         cache_dir = self.alert_cache.cache_dir
         err_log_path = self.workspace_dir / "logs" / "rf_api_errors.jsonl"
         if (cache_dir is not None and cache_dir.is_dir()) or err_log_path.is_file():
@@ -2809,6 +2893,10 @@ class SocLensApp(App[None]):
                 source="cache",
                 logger_name="AlertPreloader",
             )
+        with contextlib.suppress(Exception):
+            entry = self.alert_cache.get(source)
+            if entry is not None and entry.items:
+                self.background_triage_queue.enqueue_cache_batch(source, entry.items)
 
         def _apply() -> None:
             if self._shutting_down:
@@ -2828,8 +2916,12 @@ class SocLensApp(App[None]):
                 with contextlib.suppress(Exception):
                     hydrate_fn(force=False)
 
-        with contextlib.suppress(Exception):
-            self.call_from_thread(_apply)
+        if threading.get_ident() == getattr(self, "_thread_id", None):
+            with contextlib.suppress(Exception):
+                _apply()
+        else:
+            with contextlib.suppress(Exception):
+                self.call_from_thread(_apply)
 
     def _prompt_settings_unlock(self) -> None:
         """Open the master passphrase unlock dialog when settings.json is locked."""
@@ -2963,6 +3055,138 @@ class SocLensApp(App[None]):
                 logger_name=logger_name,
             )
 
+    def _get_ai_rf_client(self) -> RecordedFutureClient | None:
+        return self.client
+
+    def _get_ai_s1_client(self) -> SentinelOneClient | None:
+        if self.s1_client is not None:
+            return self.s1_client
+        try:
+            cfg = get_sentinelone_config(
+                verify_ssl=self.get_effective_verify_ssl(),
+                required=False,
+            )
+            if not cfg.has_auth:
+                return None
+            return SentinelOneClient(config=cfg, stop_event=self._stop_event)
+        except ConfigurationError:
+            return None
+
+    def _get_ai_splunk_client(self) -> SplunkClient | None:
+        if self.splunk_client is not None:
+            return self.splunk_client  # type: ignore[no-any-return]
+        try:
+            cfg = get_splunk_config(required=False)
+            if not cfg.has_auth:
+                return None
+            return SplunkClient()
+        except ConfigurationError:
+            return None
+
+    def _get_ai_splunk_es_client(self) -> SplunkESClient | None:
+        if self.splunk_es_client is not None:
+            return self.splunk_es_client  # type: ignore[no-any-return]
+        try:
+            cfg = get_splunk_config(app=SPLUNK_ES_APP, required=False)
+            if not cfg.has_auth:
+                return None
+            return SplunkESClient()
+        except ConfigurationError:
+            return None
+
+    def _get_ai_osint_client(self) -> OSINTClient | None:
+        if self.osint_client is not None:
+            return self.osint_client  # type: ignore[no-any-return]
+        return OSINTClient()
+
+    def _get_ai_llm_client(self) -> LocalLLMClient:
+        if self.llm_client is not None:
+            return self.llm_client  # type: ignore[no-any-return]
+        cfg = get_local_llm_config()
+        client = LocalLLMClient(cfg, stop_event=self._stop_event)
+        client._ephemeral_for_orchestrator = True
+        return client
+
+    def _refresh_mounted_event_ai_panels(self, event: UniqueEvent) -> None:
+        if self._shutting_down or not self._ui_mounted:
+            return
+        for pane in self.query(BaseSocPane):
+            refresh_fn = getattr(pane, "refresh_event_ai_panel_if_matching", None)
+            if callable(refresh_fn):
+                with contextlib.suppress(Exception):
+                    refresh_fn(event)
+
+    def _on_background_triage_complete(
+        self, event: UniqueEvent, result: InvestigationResult
+    ) -> None:
+        _ = result
+        if self._shutting_down or not self._ui_mounted:
+            return
+        loop = self._ui_loop
+        if loop is not None and not loop.is_closed():
+            with contextlib.suppress(Exception):
+                loop.call_soon_threadsafe(self._refresh_mounted_event_ai_panels, event)
+            return
+
+        def _refresh() -> None:
+            self._refresh_mounted_event_ai_panels(event)
+
+        with contextlib.suppress(Exception):
+            self.call_from_thread(_refresh)
+
+    @work(thread=True, exit_on_error=False)
+    def trigger_event_ai_investigation(
+        self,
+        event: UniqueEvent,
+        mode: InvestigationMode,
+        question: str = "",
+        on_complete: Callable[[InvestigationResult], None] | None = None,
+    ) -> None:
+        """Run an agentic SOC investigation in a background worker and update event panels."""
+        if self._shutting_down or self._stop_event.is_set():
+            return
+        try:
+            result = self.ai_orchestrator.investigate(
+                event_key=event.event_key,
+                event_context=event.to_llm_context(),
+                mode=mode,
+                question=question,
+                stop_event=self._stop_event,
+                auto_triggered=False,
+            )
+        except Exception as exc:
+            if self._shutting_down or self._stop_event.is_set():
+                return
+            result = InvestigationResult(
+                run_id=uuid.uuid4().hex,
+                event_key=event.event_key,
+                mode=mode,
+                provider="unknown",
+                model="",
+                question=question,
+                answer_markdown="",
+                tool_calls=[],
+                blocked_actions=[],
+                status="error",
+                error=str(exc),
+            )
+
+        if result.status != "cancelled" and not self._shutting_down:
+            with contextlib.suppress(Exception):
+                self.event_ai_store.attach_ai_response(event, result, auto_triggered=False)
+
+        def _finish() -> None:
+            if self._shutting_down or not self._ui_mounted:
+                return
+            self._refresh_mounted_event_ai_panels(event)
+            if on_complete is not None:
+                with contextlib.suppress(Exception):
+                    on_complete(result)
+
+        if not self._shutting_down and self._ui_mounted:
+            with contextlib.suppress(Exception):
+                self.call_from_thread(_finish)
+
     def exit(
         self,
         result: None = None,
@@ -2972,13 +3196,18 @@ class SocLensApp(App[None]):
         """Signal background workers to stop before exiting the application."""
         self._shutting_down = True
         self._stop_event.set()
+        with contextlib.suppress(Exception):
+            self.background_triage_queue.stop(timeout=0.1)
         super().exit(result=result, return_code=return_code, message=message)
 
     def on_unmount(self) -> None:
         """Restore console logging handlers and ensure background API retries abort cleanly."""
         self._ui_mounted = False
+        self._ui_loop = None
         self._shutting_down = True
         self._stop_event.set()
+        with contextlib.suppress(Exception):
+            self.background_triage_queue.stop(timeout=2.0)
         if self._alert_refresh_timer is not None:
             with contextlib.suppress(Exception):
                 self._alert_refresh_timer.stop()

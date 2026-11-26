@@ -179,6 +179,19 @@ class AlertCacheStore:
     def cache_dir(self) -> Path | None:
         return self._cache_dir
 
+    def rebind_cache_dir(self, cache_dir: Path | str | None) -> None:
+        """Thread-safely rebind cache directory and reset stale in-memory entries."""
+        new_dir = Path(cache_dir) if cache_dir is not None else None
+        with self._io_lock:
+            with self._lock:
+                self._cache_dir = new_dir
+                self._entries.clear()
+                self._images.clear()
+                self._prepared_images.clear()
+                self._unavailable_images.clear()
+        if new_dir is not None and new_dir.is_dir():
+            self.load_from_disk_sources()
+
     def _entry_path(self, source: str) -> Path | None:
         if self._cache_dir is None:
             return None

@@ -121,6 +121,17 @@ class ApiAccessRegistry:
     def state_path(self) -> Path | None:
         return self._state_path
 
+    def rebind_path(self, state_path: Path | str | None) -> None:
+        """Thread-safely rebind API access registry path and reload state."""
+        new_path = Path(state_path) if state_path is not None else None
+        with self._io_lock:
+            with self._lock:
+                self._state_path = new_path
+                self._entries.clear()
+                self._loaded = False
+        if new_path is not None and new_path.is_file():
+            self.load()
+
     def load(self) -> int:
         """Load persisted capability access records from disk."""
         if self._state_path is None or not self._state_path.is_file():
