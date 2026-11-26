@@ -250,16 +250,34 @@ def test_s1_confirm_action_modal_guardrail_cancel_and_approve(tmp_path: Path) ->
             await app.workers.wait_for_complete()
             await pilot.pause()
 
-            # Click Isolate -> ConfirmActionModal must open; Cancel blocks API call
+            # Click Isolate -> Step 1 ConfirmActionModal must open; Cancel blocks Step 2 & API call
             await pilot.click("#s1-isolate-btn")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-cancel-btn")
             await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionModal)
             s1.disconnect_agent.assert_not_called()
 
-            # Click Isolate again -> Approve executes disconnect_agent
+            # Click Isolate -> Approve Step 1 -> Step 2 opens -> Cancel at Step 2 blocks API call
             await pilot.click("#s1-isolate-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            step1_screen = app.screen
+            await pilot.click("#confirm-approve-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            assert app.screen is not step1_screen
+            await pilot.click("#confirm-cancel-btn")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionModal)
+            s1.disconnect_agent.assert_not_called()
+
+            # Click Isolate -> Approve Step 1 and Step 2 executes disconnect_agent
+            await pilot.click("#s1-isolate-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-approve-btn")
@@ -1117,8 +1135,11 @@ def test_s1_pivot_edge_cases_row_kind_guards_and_mixed_group_triage(tmp_path: Pa
             )
             s1.add_threat_note.assert_called_once_with("th-mix-1", "Triaged group")
 
-            # Mitigate Kill on mixed group only sends endpoint threat ID
+            # Mitigate Kill on mixed group only sends endpoint threat ID (requires double approval)
             await pilot.click("#s1-kill-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-approve-btn")
@@ -1231,6 +1252,9 @@ def test_s1_threat_exclude_guards_cloud_alerts_and_partitions_mixed_group(tmp_pa
             assert pane._selected_record is not None
             assert len(pane._selected_record.get("_group_records", [])) == 3
             await pilot.click("#s1-threat-exclude-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionModal)
             await pilot.click("#confirm-approve-btn")
@@ -1746,6 +1770,281 @@ def test_s1_pane_loads_over_100_records_and_sorts_newest_first(tmp_path: Path) -
             ]
 
     asyncio.run(_run())
+
+
+def test_s1_threat_mitigations_require_double_approval_and_s1_warning(tmp_path: Path) -> None:
+    s1 = _make_mock_s1_client()
+    app = create_app(
+        client=MagicMock(),
+        s1_client=s1,
+        dry_run=False,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(SentinelOnePane)
+            await pilot.click("#s1-wb-alerts-btn")
+            pane.query_one("#s1-timeframe-select", Select).value = "any"
+            await pilot.pause()
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            for btn_id, action in (
+                ("#s1-kill-btn", "kill"),
+                ("#s1-quarantine-btn", "quarantine"),
+                ("#s1-remediate-btn", "remediate"),
+                ("#s1-rollback-btn", "rollback"),
+            ):
+                s1.mitigate_threat.reset_mock()
+
+                # Cancel Step 2 via Escape -> zero API calls
+                await pilot.click(btn_id)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                step1 = app.screen
+                assert step1.focused is step1.query_one("#confirm-cancel-btn", Button)
+                assert "[Step 1/2]" in str(step1.query_one("#confirm-title", Static).render())
+                step1_warn = str(step1.query_one("#confirm-warning", Static).render())
+                assert "SentinelOne" in step1_warn
+                assert "Recorded Future" not in step1_warn
+
+                await pilot.click("#confirm-approve-btn")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                step2 = app.screen
+                assert step2 is not step1
+                assert step2.focused is step2.query_one("#confirm-cancel-btn", Button)
+                assert "[Step 2/2]" in str(step2.query_one("#confirm-title", Static).render())
+                step2_warn = str(step2.query_one("#confirm-warning", Static).render())
+                assert "SentinelOne" in step2_warn
+                assert "Recorded Future" not in step2_warn
+
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmActionModal)
+                s1.mitigate_threat.assert_not_called()
+
+                # Approve both Step 1 and Step 2 -> executes mitigate_threat
+                await pilot.click(btn_id)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                await pilot.click("#confirm-approve-btn")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                await pilot.click("#confirm-approve-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                s1.mitigate_threat.assert_called_once_with(["th-202"], action)
+
+    asyncio.run(_run())
+
+
+def test_s1_endpoint_actions_double_vs_single_approval(tmp_path: Path) -> None:
+    s1 = _make_mock_s1_client()
+    s1.connect_agent.return_value = {"data": {"affected": 1}}
+    s1.reboot_agent.return_value = {"data": {"affected": 1}}
+    s1.uninstall_agent.return_value = {"data": {"affected": 1}}
+    s1.decommission_agents.return_value = {"data": {"affected": 1}}
+    s1.initiate_scan.return_value = {"data": {"affected": 1}}
+    s1.fetch_agent_logs.return_value = {"data": {"affected": 1}}
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=s1,
+        dry_run=False,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+        view_mode="admin",
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.pause()
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            # High-impact endpoint actions require 2 approvals
+            for btn_id, attr in (
+                ("#s1-isolate-btn", "disconnect_agent"),
+                ("#s1-reconnect-btn", "connect_agent"),
+                ("#s1-reboot-btn", "reboot_agent"),
+                ("#s1-uninstall-btn", "uninstall_agent"),
+                ("#s1-decommission-btn", "decommission_agents"),
+            ):
+                method = getattr(s1, attr)
+                method.reset_mock()
+
+                await pilot.click(btn_id)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                step1 = app.screen
+                await pilot.click("#confirm-approve-btn")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                assert app.screen is not step1
+                method.assert_not_called()
+
+                await pilot.click("#confirm-approve-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmActionModal)
+                method.assert_called_once_with(["ag-101"])
+
+            # Lower-impact endpoint actions require 1 approval
+            for btn_id, attr in (
+                ("#s1-scan-btn", "initiate_scan"),
+                ("#s1-fetch-logs-btn", "fetch_agent_logs"),
+            ):
+                method = getattr(s1, attr)
+                method.reset_mock()
+
+                await pilot.click(btn_id)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                assert "[Step 1/2]" not in str(
+                    app.screen.query_one("#confirm-title", Static).render()
+                )
+                await pilot.click("#confirm-approve-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmActionModal)
+                method.assert_called_once_with(["ag-101"])
+
+    asyncio.run(_run())
+
+
+def test_s1_admin_actions_double_vs_single_approval(tmp_path: Path) -> None:
+    s1 = _make_mock_s1_client()
+    s1.expire_site.return_value = {"data": {"state": "expired"}}
+    s1.reactivate_site.return_value = {"data": {"state": "active"}}
+    s1.regenerate_site_key.return_value = {"data": {"registrationToken": "tok-new"}}
+    s1.delete_user.return_value = {"data": {"success": True}}
+    s1.reset_2fa.return_value = {"data": {"success": True}}
+    s1.logout_user.return_value = {"data": {"success": True}}
+    s1.send_reset_password_email.return_value = {"data": {"success": True}}
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=s1,
+        dry_run=False,
+        initial_tab="tab-sentinelone",
+        workspace_dir=tmp_path,
+        view_mode="admin",
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+
+            # Exclusions delete -> double approval (Step 2 cancel aborts)
+            await pilot.click("#s1-wb-exclusions-btn")
+            await pilot.pause()
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.click("#s1-delete-excl-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-cancel-btn")
+            await pilot.pause()
+            s1.delete_exclusions.assert_not_called()
+
+            # Blocklist delete -> double approval (Step 2 cancel aborts)
+            await pilot.click("#s1-wb-agents-btn")
+            await pilot.click("#s1-goto-blocklist-btn")
+            await pilot.pause()
+            await pilot.click("#s1-refresh-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.click("#s1-delete-block-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-cancel-btn")
+            await pilot.pause()
+            s1.remove_from_blocklist.assert_not_called()
+
+            # Sites: expire & rotate-token require 2 approvals; reactivate requires 1
+            await pilot.click("#s1-wb-sites-btn")
+            await pilot.click("#s1-sites-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            for btn_id, attr in (
+                ("#s1-site-expire-btn", "expire_site"),
+                ("#s1-site-rotate-token-btn", "regenerate_site_key"),
+            ):
+                method = getattr(s1, attr)
+                method.reset_mock()
+                await pilot.click(btn_id)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                await pilot.click("#confirm-approve-btn")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                method.assert_not_called()
+                await pilot.click("#confirm-approve-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                method.assert_called_once_with("site-1")
+
+            await pilot.click("#s1-site-reactivate-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionModal)
+            s1.reactivate_site.assert_called_once_with("site-1", unlimited=True)
+
+            # Users: delete, reset-2fa, logout require 2 approvals; reset-pw requires 1
+            await pilot.click("#s1-wb-users-btn")
+            await pilot.click("#s1-users-load-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            for btn_id, attr in (
+                ("#s1-user-reset-2fa-btn", "reset_2fa"),
+                ("#s1-user-logout-btn", "logout_user"),
+                ("#s1-user-delete-btn", "delete_user"),
+            ):
+                method = getattr(s1, attr)
+                method.reset_mock()
+                await pilot.click(btn_id)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                await pilot.click("#confirm-approve-btn")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmActionModal)
+                method.assert_not_called()
+                await pilot.click("#confirm-approve-btn")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                method.assert_called_once()
+
+            await pilot.click("#s1-user-reset-pw-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-approve-btn")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionModal)
+            s1.send_reset_password_email.assert_called_once_with(["usr-1"])
+
+    asyncio.run(_run())
+
 
 
 

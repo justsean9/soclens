@@ -264,14 +264,15 @@ def test_v21_f10_tier_plus_file_hash_cross_tier_bulk_isolation(
             pane.query_one("#s1-quarantine-btn", Button).press()
             await _wait_until(
                 pilot,
-                lambda: any(
-                    r["path"] == "/web/api/v2.1/threats/mitigate/quarantine"
-                    for r in mock_s1_server.requests_log
-                )
-                or hasattr(app.screen, "handle_approve"),
+                lambda: hasattr(app.screen, "handle_approve"),
             )
-            if hasattr(app.screen, "handle_approve"):
-                app.screen.query_one("#confirm-approve-btn", Button).press()
+            step1_modal = app.screen
+            step1_modal.query_one("#confirm-approve-btn", Button).press()
+            await _wait_until(
+                pilot,
+                lambda: hasattr(app.screen, "handle_approve") and app.screen is not step1_modal,
+            )
+            app.screen.query_one("#confirm-approve-btn", Button).press()
             await _wait_until(
                 pilot,
                 lambda: any(

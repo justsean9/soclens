@@ -126,6 +126,13 @@ _S1_ENDPOINT_STATUS_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Healthy (Not Infected)", "healthy"),
 )
 
+S1_HIGH_IMPACT_ENDPOINT_ACTIONS: frozenset[str] = frozenset(
+    {"disconnect", "connect", "reboot", "uninstall", "decommission"}
+)
+S1_HIGH_IMPACT_MITIGATION_ACTIONS: frozenset[str] = frozenset(
+    {"kill", "quarantine", "remediate", "rollback"}
+)
+
 _TABLE_SPECS: dict[str, tuple[tuple[str, str, float, int], ...]] = {
     "endpoints": (
         ("name", "Hostname", 0.22, 12),
@@ -2030,11 +2037,22 @@ class SentinelOnePane(BaseSocPane):
             return
         if self._block_if_dry_run(verb, f"endpoint {hostname} ({agent_id})"):
             return
+        is_high_impact = action_key in S1_HIGH_IMPACT_ENDPOINT_ACTIONS
+        warning_text = (
+            "Step 1 of 2: Double approval is required for this high-impact SentinelOne endpoint action."
+            if is_high_impact
+            else "Approval required: this action dispatches a SentinelOne endpoint command."
+        )
         self.confirm_destructive_action(
             title=title,
             message=f"Execute SentinelOne '{verb}' on endpoint {hostname}?",
             details=f"Agent ID: {agent_id}\nHostname: {hostname}\nSite: {rec.get('siteName') or '-'}",
             confirm_label=confirm_label,
+            warning_text=warning_text,
+            double_confirm=is_high_impact,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): This high-impact SentinelOne endpoint action will execute immediately."
+            ),
             on_approved=lambda: self._endpoint_action_worker(action_key, agent_id, hostname),
         )
 
@@ -2191,11 +2209,22 @@ class SentinelOnePane(BaseSocPane):
             f"threat {threat_name} ({len(ep_ids)} selected)",
         ):
             return
+        is_high_impact = action.strip().lower() in S1_HIGH_IMPACT_MITIGATION_ACTIONS
+        warning_text = (
+            "Step 1 of 2: Double approval is required for this high-impact SentinelOne threat mitigation."
+            if is_high_impact
+            else "Approval required: this action executes a SentinelOne threat mitigation."
+        )
         self.confirm_destructive_action(
             title=f"SentinelOne Threat Mitigation: {label}",
             message=f"Run '{action}' mitigation on {threat_name} ({len(ep_ids)} threat(s))?",
             details=f"Threat IDs: {', '.join(ep_ids[:5])}\nAction: {action}",
             confirm_label=f"Approve {label}",
+            warning_text=warning_text,
+            double_confirm=is_high_impact,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): This high-impact SentinelOne threat mitigation will execute immediately."
+            ),
             on_approved=lambda: self._mitigate_threat_worker(ep_ids, action),
         )
 
@@ -2259,6 +2288,13 @@ class SentinelOnePane(BaseSocPane):
             ),
             details="\n".join(details_lines),
             confirm_label="Approve Exclusion",
+            warning_text=(
+                "Step 1 of 2: Double approval is required to suppress future SentinelOne detections for this threat."
+            ),
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): Threat exclusion will be added immediately in SentinelOne."
+            ),
             on_approved=lambda: self._threat_exclude_worker(ep_ids),
         )
 
@@ -2320,6 +2356,11 @@ class SentinelOnePane(BaseSocPane):
             message=f"Delete exclusion '{val}'?",
             details=f"Exclusion ID: {excl_id}\nType: {excl_type or '-'}",
             confirm_label="Approve Delete",
+            warning_text="Step 1 of 2: Double approval is required to delete a SentinelOne exclusion.",
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): Exclusion will be deleted immediately in SentinelOne."
+            ),
             on_approved=lambda: self._delete_exclusion_worker(excl_id, excl_type),
         )
 
@@ -2402,6 +2443,13 @@ class SentinelOnePane(BaseSocPane):
             message=f"Remove hash '{sha1}' from the SentinelOne blocklist?",
             details=f"Restriction ID: {entry_id}\nSHA-1: {sha1}",
             confirm_label="Approve Remove",
+            warning_text=(
+                "Step 1 of 2: Double approval is required to remove a SHA-1 hash from the SentinelOne blocklist."
+            ),
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): Blocklist hash will be removed immediately in SentinelOne."
+            ),
             on_approved=lambda: self._delete_blocklist_worker(entry_id),
         )
 
@@ -2507,6 +2555,11 @@ class SentinelOnePane(BaseSocPane):
             message=f"Immediately expire site '{site_name}' ({site_id})?",
             details="Agents in an expired site lose active console licensing.",
             confirm_label="Approve Expire",
+            warning_text="Step 1 of 2: Double approval is required to immediately expire a SentinelOne site.",
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): Site licensing will expire immediately in SentinelOne."
+            ),
             on_approved=lambda: self._site_lifecycle_worker("expire", site_id, site_name),
         )
 
@@ -2525,6 +2578,7 @@ class SentinelOnePane(BaseSocPane):
             title="Reactivate SentinelOne Site",
             message=f"Reactivate site '{site_name}' ({site_id}) with unlimited expiration?",
             confirm_label="Approve Reactivate",
+            warning_text="Approval required: this action reactivates a SentinelOne site.",
             on_approved=lambda: self._site_lifecycle_worker("reactivate", site_id, site_name),
         )
 
@@ -2544,6 +2598,13 @@ class SentinelOnePane(BaseSocPane):
             message=f"Regenerate agent registration token for site '{site_name}'?",
             details="Previous registration tokens for this site will be invalidated.",
             confirm_label="Approve Rotate",
+            warning_text=(
+                "Step 1 of 2: Double approval is required to invalidate existing SentinelOne site registration tokens."
+            ),
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): Existing registration tokens will be invalidated immediately."
+            ),
             on_approved=lambda: self._site_lifecycle_worker("rotate_token", site_id, site_name),
         )
 
@@ -2663,6 +2724,7 @@ class SentinelOnePane(BaseSocPane):
             title="Send Reset Password Email",
             message=f"Send password reset email to {email} ({uid})?",
             confirm_label="Approve Reset",
+            warning_text="Approval required: this action sends a SentinelOne password reset email.",
             on_approved=lambda: self._user_action_worker("reset_pw", uid, email),
         )
 
@@ -2681,6 +2743,11 @@ class SentinelOnePane(BaseSocPane):
             title="Reset User 2FA",
             message=f"Reset 2FA enrollment for {email} ({uid})?",
             confirm_label="Approve Reset 2FA",
+            warning_text="Step 1 of 2: Double approval is required to reset SentinelOne 2FA enrollment.",
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): User 2FA enrollment will be reset immediately in SentinelOne."
+            ),
             on_approved=lambda: self._user_action_worker("reset_2fa", uid, email),
         )
 
@@ -2694,6 +2761,13 @@ class SentinelOnePane(BaseSocPane):
             title="Logout Current SentinelOne API Session",
             message="Invalidate the currently authenticated SentinelOne API session?",
             confirm_label="Approve Logout",
+            warning_text=(
+                "Step 1 of 2: Double approval is required to invalidate the active SentinelOne API session."
+            ),
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): Active SentinelOne API session will be invalidated immediately."
+            ),
             on_approved=lambda: self._user_action_worker("logout", "", "session"),
         )
 
@@ -2713,6 +2787,11 @@ class SentinelOnePane(BaseSocPane):
             title="Delete SentinelOne User",
             message=f"Permanently delete '{label}' ({uid})?",
             confirm_label="Approve Delete",
+            warning_text="Step 1 of 2: Double approval is required to permanently delete a SentinelOne user.",
+            double_confirm=True,
+            second_warning_text=(
+                "FINAL APPROVAL (Step 2 of 2): User will be permanently deleted from SentinelOne."
+            ),
             on_approved=lambda: self._user_action_worker(
                 "delete_service" if is_service else "delete",
                 uid,

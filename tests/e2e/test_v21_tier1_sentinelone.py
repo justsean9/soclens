@@ -366,6 +366,8 @@ def test_v21_f10_tui_alerts_workbench_unified_triage_and_mitigate(
             await pilot.pause()
             await pilot.click("#confirm-approve-btn")
             await pilot.pause()
+            await pilot.click("#confirm-approve-btn")
+            await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
 
@@ -640,15 +642,18 @@ def test_v21_f11_tui_sites_policy_modal_copy_and_lifecycle_actions(
                 await pilot.click("#s1-policy-cancel-btn")
                 await pilot.pause()
 
-            for btn_id, expected_suffix in (
-                ("#s1-site-expire-btn", "/expire-now"),
-                ("#s1-site-reactivate-btn", "/reactivate"),
-                ("#s1-site-rotate-token-btn", "/regenerate-key"),
+            for btn_id, expected_suffix, needs_double in (
+                ("#s1-site-expire-btn", "/expire-now", True),
+                ("#s1-site-reactivate-btn", "/reactivate", False),
+                ("#s1-site-rotate-token-btn", "/regenerate-key", True),
             ):
                 await pilot.click(btn_id)
                 await pilot.pause()
                 await pilot.click("#confirm-approve-btn")
                 await pilot.pause()
+                if needs_double:
+                    await pilot.click("#confirm-approve-btn")
+                    await pilot.pause()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 assert any(
@@ -993,6 +998,8 @@ def test_v21_f12_tui_agents_and_blocklist_ops_vs_admin_gating(
             assert app.query_one("#s1-table", DataTable).row_count == 5
 
             await pilot.click("#s1-isolate-btn")
+            await pilot.pause()
+            await pilot.click("#confirm-approve-btn")
             await pilot.pause()
             await pilot.click("#confirm-approve-btn")
             await pilot.pause()
