@@ -3223,6 +3223,17 @@ def build_parser() -> argparse.ArgumentParser:
     llm_chat.add_argument("--file", default=None, help="Optional file path to include as analysis content")
     llm_chat.add_argument("--temperature", type=float, default=None, help="Sampling temperature (0.0-2.0)")
     llm_chat.add_argument("--max-tokens", type=int, default=None, help="Optional max output tokens")
+    llm_chat.add_argument(
+        "--tools",
+        action="store_true",
+        default=False,
+        help="Enable read-only SOC tools (Splunk, Splunk ES, SentinelOne, Recorded Future, OSINT) governed by AI Control Panel policy and audit log",
+    )
+    llm_chat.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace directory for AI policy and audit log storage",
+    )
 
     llm_sigma = llm_subparsers.add_parser(
         "explain-sigma",
@@ -5431,8 +5442,102 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
 
             template_key = getattr(args, "template", "freeform") or "freeform"
             system_override = getattr(args, "system", None)
+            use_tools = bool(getattr(args, "tools", False))
 
-            if system_override:
+            if use_tools and template_key == "freeform":
+                from soclens.agent_audit import AuditLogStore
+                from soclens.agent_orchestrator import SocAgentOrchestrator
+                from soclens.agent_policy import AIPolicyStore
+                from soclens.agent_tools import build_default_readonly_registry
+                from soclens.splunk import SplunkClient
+                from soclens.splunk_es import SPLUNK_ES_APP, SplunkESClient
+
+                cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
+                policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
+                audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl")
+
+                def _cli_rf() -> RecordedFutureClient | None:
+                    try:
+                        return _build_rf_client(args)
+                    except ConfigurationError:
+                        return None
+
+                def _cli_s1() -> SentinelOneClient | None:
+                    try:
+                        cfg = get_sentinelone_config(required=False)
+                        return SentinelOneClient(config=cfg) if cfg.has_auth else None
+                    except ConfigurationError:
+                        return None
+
+                def _cli_splunk() -> SplunkClient | None:
+                    try:
+                        cfg = get_splunk_config(required=False)
+                        return SplunkClient() if cfg.has_auth else None
+                    except ConfigurationError:
+                        return None
+
+                def _cli_splunk_es() -> SplunkESClient | None:
+                    try:
+                        cfg = get_splunk_config(app=SPLUNK_ES_APP, required=False)
+                        return SplunkESClient() if cfg.has_auth else None
+                    except ConfigurationError:
+                        return None
+
+                registry = build_default_readonly_registry(
+                    rf_client=_cli_rf,
+                    s1_client=_cli_s1,
+                    splunk_client=_cli_splunk,
+                    splunk_es_client=_cli_splunk_es,
+                    osint_client=lambda: OSINTClient(),
+                )
+                orchestrator = SocAgentOrchestrator(
+                    registry=registry,
+                    policy_store=policy_store,
+                    audit_store=audit_store,
+                )
+
+                def _cli_tool_cb(ev: dict[str, Any]) -> None:
+                    if use_json:
+                        return
+                    kind = str(ev.get("kind") or "")
+                    if kind == "tool_result":
+                        state = "OK" if ev.get("ok") else f"ERROR: {ev.get('error', '')}"
+                        print(
+                            f"[Tool {ev.get('step', '?')}] {ev.get('tool_name', '')} -> {state}",
+                            file=sys.stderr,
+                        )
+                    elif kind == "tool_blocked":
+                        print(
+                            f"[Tool Blocked] {ev.get('tool_name', '')} "
+                            f"({ev.get('rule', 'blocked')}): {ev.get('reason', '')}",
+                            file=sys.stderr,
+                        )
+
+                chat_res = orchestrator.chat(
+                    user_prompt=prompt_text,
+                    attached_context=file_content or None,
+                    attached_title=Path(file_arg).name if file_arg else None,
+                    session_id="cli-chat",
+                    client=llm,
+                    provider=llm.provider,
+                    model=getattr(args, "model", None),
+                    system_prompt_override=system_override,
+                    enable_tools=True,
+                    tool_event_callback=_cli_tool_cb,
+                )
+                if chat_res.status == "error":
+                    raise LocalLLMError(chat_res.error or "CLI agentic chat failed.", provider=llm.provider)
+                result = {
+                    "provider": chat_res.provider,
+                    "model": chat_res.model,
+                    "done": chat_res.done,
+                    "content": chat_res.content,
+                    "conversation_id": chat_res.conversation_id,
+                    "run_id": chat_res.run_id,
+                    "tool_calls": chat_res.tool_calls,
+                    "blocked_actions": chat_res.blocked_actions,
+                }
+            elif system_override:
                 combined = (
                     f"{file_content.strip()}\n\n{prompt_text}".strip()
                     if file_content and prompt_text
@@ -5472,6 +5577,10 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                 }
                 if result.get("conversation_id"):
                     out_payload["conversation_id"] = result["conversation_id"]
+                if "tool_calls" in result:
+                    out_payload["run_id"] = result.get("run_id", "")
+                    out_payload["tool_calls"] = result.get("tool_calls", [])
+                    out_payload["blocked_actions"] = result.get("blocked_actions", [])
                 _emit_json(out_payload)
             else:
                 print(result["content"])

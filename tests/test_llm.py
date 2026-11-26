@@ -1066,3 +1066,64 @@ def test_cli_llm_gemini_status_and_chat(
         chat_out = json.loads(capsys.readouterr().out)
         assert chat_out["content"] == "Gemini triage summary."
         assert chat_out["provider"] == "gemini"
+
+
+def test_cli_llm_chat_with_tools_flag_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tests.e2e.agentic_mocks import MockAgenticLLMAndCopilotServer
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
+    fake_splunk = MagicMock()
+    fake_splunk.run_search.return_value = [{"host": "cli-host-01", "count": 7}]
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+        monkeypatch.setenv("SPLUNK_HOST", "https://splunk.local:8089")
+        monkeypatch.setenv("SPLUNK_TOKEN", "cli-splunk-token")
+
+        server.queue_scripted_turn(
+            provider="openai",
+            tool_calls=[{"name": "splunk_search", "arguments": {"spl": "index=main | head 5"}}],
+        )
+        server.queue_scripted_turn(
+            provider="openai",
+            content="CLI tools summary: 7 events on cli-host-01.",
+        )
+
+        with patch("soclens.splunk.SplunkClient", return_value=fake_splunk):
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "soclens",
+                    "llm",
+                    "chat",
+                    "--provider",
+                    "openai",
+                    "--prompt",
+                    "Find recent events in Splunk",
+                    "--tools",
+                    "--workspace",
+                    str(tmp_path),
+                    "--json",
+                ],
+            )
+            cli.main()
+
+        out = json.loads(capsys.readouterr().out)
+        assert out["provider"] == "openai"
+        assert "cli-host-01" in out["content"]
+        assert len(out["tool_calls"]) == 1
+        assert out["tool_calls"][0]["tool_name"] == "splunk_search"
+        assert out["tool_calls"][0]["ok"] is True
+        assert out["blocked_actions"] == []
+        assert out["run_id"]
+        assert (tmp_path / ".soclens_cache" / "ai_audit.jsonl").is_file()
+

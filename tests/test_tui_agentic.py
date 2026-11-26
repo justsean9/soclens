@@ -17,6 +17,7 @@ from textual.widgets import (
     Input,
     OptionList,
     RichLog,
+    Select,
     Static,
     Switch,
     TabbedContent,
@@ -873,4 +874,213 @@ def test_reload_settings_rebinds_ai_stores_and_respects_custom_injected(
     app_custom.reload_settings()
     assert app_custom.workspace_dir == ws1
     assert app_custom.ai_policy_store.path == tmp_path / "custom_policy.json"
+
+
+def test_freeform_chat_tui_uses_readonly_tools_toggle_and_audit_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.agent_orchestrator import SocAgentOrchestrator
+    from soclens.agent_policy import (
+        SOURCE_CATEGORY_RF,
+        SOURCE_CATEGORY_SPLUNK,
+    )
+    from soclens.agent_tools import ReadOnlyToolRegistry, ReadOnlyToolSpec
+    from tests.e2e.agentic_mocks import MockAgenticLLMAndCopilotServer
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+
+    reg = ReadOnlyToolRegistry()
+    splunk_calls: list[str] = []
+    rf_calls: list[str] = []
+    reg.register(
+        ReadOnlyToolSpec(
+            name="splunk_search",
+            source_category=SOURCE_CATEGORY_SPLUNK,
+            description="Read-only Splunk SPL search",
+            parameters_schema={
+                "type": "object",
+                "properties": {"spl": {"type": "string"}},
+                "required": ["spl"],
+            },
+            handler=lambda args: (
+                splunk_calls.append(str(args.get("spl") or ""))
+                or {"rows": [{"host": "srv-web-01", "count": 4}]}
+            ),
+            readonly=True,
+        )
+    )
+    reg.register(
+        ReadOnlyToolSpec(
+            name="rf_lookup_ioc",
+            source_category=SOURCE_CATEGORY_RF,
+            description="Read-only Recorded Future IOC lookup",
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "entity_type": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["entity_type", "value"],
+            },
+            handler=lambda args: (
+                rf_calls.append(str(args.get("value") or ""))
+                or {"entity": args.get("value"), "risk_score": 91}
+            ),
+            readonly=True,
+        )
+    )
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+
+        app = create_app(
+            client=MagicMock(),
+            dry_run=True,
+            initial_tab="tab-llm",
+            workspace_dir=tmp_path,
+            no_secret_store=True,
+            preload_alerts=False,
+        )
+        app.ai_tool_registry = reg
+        app.ai_orchestrator = SocAgentOrchestrator(
+            registry=reg,
+            policy_store=app.ai_policy_store,
+            audit_store=app.ai_audit_store,
+        )
+
+        async def _run() -> None:
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                llm_pane = app.query_one(LocalLLMPane)
+                toggle_btn = llm_pane.query_one("#llm-tools-toggle-btn", Button)
+                assert "Tools: ON" in str(toggle_btn.label)
+
+                # 1. Freeform prompt triggers both RF and Splunk read-only tools
+                server.queue_scripted_turn(
+                    provider="openai",
+                    tool_calls=[
+                        {"name": "rf_lookup_ioc", "arguments": {"entity_type": "ip", "value": "203.0.113.5"}},
+                        {"name": "splunk_search", "arguments": {"spl": "index=main 203.0.113.5 | head 5"}},
+                    ],
+                )
+                server.queue_scripted_turn(
+                    provider="openai",
+                    content="Freeform finding: 203.0.113.5 has RF risk 91 and 4 Splunk hits on srv-web-01.",
+                )
+
+                llm_pane.query_one("#llm-prompt", Input).value = "Check 203.0.113.5 across RF and Splunk"
+                llm_pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                transcript = _richlog_text(llm_pane.query_one("#llm-transcript", RichLog))
+                assert "[Tool 1] rf_lookup_ioc -> OK" in transcript
+                assert "[Tool 2] splunk_search -> OK" in transcript
+                assert "RF risk 91 and 4 Splunk hits" in transcript
+                assert rf_calls == ["203.0.113.5"]
+                assert len(splunk_calls) == 1
+
+                # 2. Disabling Splunk in AI Control Panel blocks Splunk in freeform chat
+                subtabs = llm_pane.query_one("#llm-subtabs", TabbedContent)
+                subtabs.active = "llm-tab-control-panel"
+                await pilot.pause()
+                llm_pane.query_one("#ai-ctrl-splunk-search", Switch).value = False
+                await pilot.pause()
+                subtabs.active = "llm-tab-chat"
+                await pilot.pause()
+
+                server.queue_scripted_turn(
+                    provider="openai",
+                    tool_calls=[
+                        {"name": "splunk_search", "arguments": {"spl": "index=main | head 1"}},
+                    ],
+                )
+                server.queue_scripted_turn(
+                    provider="openai",
+                    content="Splunk search was blocked by AI Control Panel policy.",
+                )
+                llm_pane.query_one("#llm-prompt", Input).value = "Run a Splunk search"
+                llm_pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                transcript2 = _richlog_text(llm_pane.query_one("#llm-transcript", RichLog))
+                assert "[Tool Blocked] splunk_search" in transcript2
+                assert len(splunk_calls) == 1  # unchanged!
+
+                # 3. Per-session Tools: OFF toggle isolates Chat 2 from Chat 1
+                llm_pane.query_one("#llm-new-chat-btn", Button).press()
+                await pilot.pause()
+                assert "Tools: ON" in str(toggle_btn.label)
+                toggle_btn.press()
+                await pilot.pause()
+                assert "Tools: OFF" in str(toggle_btn.label)
+
+                server.queue_scripted_turn(
+                    provider="openai",
+                    tool_calls=[
+                        {"name": "rf_lookup_ioc", "arguments": {"entity_type": "ip", "value": "1.1.1.1"}},
+                    ],
+                )
+                server.queue_scripted_turn(
+                    provider="openai",
+                    content="Chat-only reply without tools.",
+                )
+                llm_pane.query_one("#llm-prompt", Input).value = "Check 1.1.1.1"
+                llm_pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert rf_calls == ["203.0.113.5"]  # unchanged in Tools: OFF mode
+
+                # Switching back to Chat 1 restores Tools: ON
+                llm_pane.query_one("#llm-session-select", Select).value = "chat-1"
+                await pilot.pause()
+                assert "Tools: ON" in str(toggle_btn.label)
+
+                # 4. Audit Log view shows freeform_chat entries and blocked_action
+                subtabs.active = "llm-tab-audit-log"
+                await pilot.pause()
+                await pilot.click("#ai-audit-refresh")
+                await pilot.pause()
+                audit_entries = app.ai_audit_store.query(event_key="freeform_chat::chat-1")
+                assert any(e.event_type == "tool_result" and e.tool_name == "rf_lookup_ioc" for e in audit_entries)
+                assert any(e.event_type == "blocked_action" and e.tool_name == "splunk_search" for e in audit_entries)
+
+        asyncio.run(_run())
+
+
+def test_freeform_chat_tools_toggle_fits_80x24_layout(tmp_path: Path) -> None:
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            llm_pane = app.query_one(LocalLLMPane)
+            for widget_id in (
+                "#llm-session-select",
+                "#llm-new-chat-btn",
+                "#llm-close-chat-btn",
+                "#llm-tools-toggle-btn",
+                "#llm-transcript",
+                "#llm-prompt",
+            ):
+                w = llm_pane.query_one(widget_id)
+                assert w.region.width > 0 and w.region.height > 0
+                assert w.region.right <= 80
+                assert w.region.bottom <= 24
+
+    asyncio.run(_run())
+
 

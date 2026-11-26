@@ -15,7 +15,9 @@ from textual.containers import Horizontal
 from textual.widgets import Button, Input, RichLog, Select, Static, TabbedContent, TabPane
 
 from soclens.agent_audit import AuditLogStore
-from soclens.agent_policy import AIPolicyStore
+from soclens.agent_orchestrator import SocAgentOrchestrator
+from soclens.agent_policy import AIPolicyStore, evaluate_tool_permission
+from soclens.agent_tools import ReadOnlyToolRegistry, build_default_readonly_registry
 from soclens.config import (
     COPILOT_LLM_PROVIDERS,
     DEFAULT_COPILOT_DIRECTLINE_URL,
@@ -92,6 +94,7 @@ class _ChatSession:
     remote_conversation_id: str | None = None
     remote_conversation_token: str | None = None
     remote_watermark: str | None = None
+    tools_enabled: bool = True
     stop_event: threading.Event | None = None
     busy: bool = False
 
@@ -153,6 +156,9 @@ class LocalLLMPane(BaseSocPane):
     LocalLLMPane #llm-copilot-bar {
         height: 1;
         width: 1fr;
+    }
+    LocalLLMPane.llm-compact #llm-session-select {
+        width: 24;
     }
     LocalLLMPane.llm-compact #llm-provider-select {
         width: 16;
@@ -337,6 +343,7 @@ class LocalLLMPane(BaseSocPane):
                     )
                     yield Button("+ New Chat", id="llm-new-chat-btn", variant="primary", compact=True)
                     yield Button("Close Chat", id="llm-close-chat-btn", compact=True)
+                    yield Button("Tools: ON", id="llm-tools-toggle-btn", variant="success", compact=True)
 
                 with Horizontal(classes="action-row toolbar-row"):
                     yield Select(
@@ -427,6 +434,63 @@ class LocalLLMPane(BaseSocPane):
             audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl")
         return policy_store, audit_store, registry
 
+    def _resolve_orchestrator(self) -> SocAgentOrchestrator:
+        existing = getattr(self.app, "ai_orchestrator", None)
+        if isinstance(existing, SocAgentOrchestrator):
+            return existing
+        policy_store, audit_store, registry = self._resolve_ai_stores()
+        eff_registry = (
+            registry
+            if isinstance(registry, ReadOnlyToolRegistry)
+            else build_default_readonly_registry()
+        )
+        return SocAgentOrchestrator(
+            registry=eff_registry,
+            policy_store=policy_store,
+            audit_store=audit_store,
+        )
+
+    def _sync_tools_toggle_button(self, enabled: bool) -> None:
+        try:
+            btn = self.query_one("#llm-tools-toggle-btn", Button)
+            btn.label = "Tools: ON" if enabled else "Tools: OFF"
+            btn.variant = "success" if enabled else "default"
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#llm-tools-toggle-btn")
+    def handle_toggle_tools(self) -> None:
+        sess = self._active_session
+        sess.tools_enabled = not sess.tools_enabled
+        self._sync_tools_toggle_button(sess.tools_enabled)
+        if sess.tools_enabled:
+            policy_store, _audit_store, registry = self._resolve_ai_stores()
+            policy = policy_store.load()
+            permitted_cnt = 0
+            if isinstance(registry, ReadOnlyToolRegistry):
+                specs = registry.list_tools()
+                names = {s.name for s in specs}
+                permitted_cnt = sum(
+                    1
+                    for s in specs
+                    if evaluate_tool_permission(
+                        s.name,
+                        s.source_category,
+                        s.readonly,
+                        "full_investigation",
+                        policy,
+                        registered_tools=names,
+                    ).allowed
+                )
+            self.set_status(
+                f"Freeform read-only SOC tools enabled for Chat {sess.index} "
+                f"({permitted_cnt} tool(s) permitted by AI Control Panel)."
+            )
+        else:
+            self.set_status(
+                f"Freeform tools disabled for Chat {sess.index} (chat-only mode)."
+            )
+
     def on_mount(self) -> None:
         self._sync_compact_class()
         badge = self.query_one("#llm-context-badge", Static)
@@ -509,6 +573,8 @@ class LocalLLMPane(BaseSocPane):
 
         with tpl_sel.prevent(Select.Changed):
             tpl_sel.value = sess.template if sess.template in SOC_PROMPT_TEMPLATES else "freeform"
+
+        self._sync_tools_toggle_button(sess.tools_enabled)
 
         if sess.attached_context:
             tpl_label = SOC_PROMPT_TEMPLATES.get(sess.template, SOC_PROMPT_TEMPLATES["freeform"])[
@@ -995,6 +1061,7 @@ class LocalLLMPane(BaseSocPane):
         remote_conv_id = sess.remote_conversation_id
         remote_conv_token = sess.remote_conversation_token
         remote_watermark = sess.remote_watermark
+        tools_enabled = sess.tools_enabled
 
         if not user_prompt and not attached_ctx:
             self.set_status("Enter a prompt or attach context before sending.")
@@ -1039,6 +1106,7 @@ class LocalLLMPane(BaseSocPane):
             session_id=session_id,
             user_prompt=user_prompt,
             attached_ctx=attached_ctx,
+            attached_title=attached_title,
             template_key=template_key,
             provider=provider,
             base_url=base_url,
@@ -1047,6 +1115,7 @@ class LocalLLMPane(BaseSocPane):
             remote_conversation_id=remote_conv_id,
             remote_conversation_token=remote_conv_token,
             remote_watermark=remote_watermark,
+            tools_enabled=tools_enabled,
             stop_event=stop_event,
         )
 
@@ -1057,6 +1126,7 @@ class LocalLLMPane(BaseSocPane):
         session_id: str,
         user_prompt: str,
         attached_ctx: str | None,
+        attached_title: str | None = None,
         template_key: str,
         provider: str | None = None,
         base_url: str | None = None,
@@ -1065,6 +1135,7 @@ class LocalLLMPane(BaseSocPane):
         remote_conversation_id: str | None = None,
         remote_conversation_token: str | None = None,
         remote_watermark: str | None = None,
+        tools_enabled: bool = True,
         stop_event: threading.Event,
     ) -> None:
         eff_provider = provider or "ollama"
@@ -1072,6 +1143,34 @@ class LocalLLMPane(BaseSocPane):
             if session_id == self._active_session_id:
                 self.set_status(f"Querying {eff_provider} ({model})...")
             updated_freeform_pair: list[dict[str, str]] | None = None
+            tool_call_count = 0
+
+            def _on_tool_event(ev: dict[str, Any]) -> None:
+                kind = str(ev.get("kind") or "")
+                tname = str(ev.get("tool_name") or "")
+                if kind == "tool_start":
+                    if session_id == self._active_session_id:
+                        self.set_status(
+                            f"Running read-only tool: {tname} (step {ev.get('step', '?')})..."
+                        )
+                elif kind == "tool_result":
+                    line = Text()
+                    line.append(f"[Tool {ev.get('step', '?')}] ", style="bold cyan")
+                    line.append(tname)
+                    if ev.get("ok"):
+                        line.append(" -> OK", style="green")
+                    else:
+                        line.append(f" -> ERROR: {ev.get('error', '')}", style="red")
+                    self._write_transcript(line, session_id=session_id)
+                elif kind == "tool_blocked":
+                    line = Text()
+                    line.append("[Tool Blocked] ", style="bold yellow")
+                    line.append(
+                        f"{tname} ({ev.get('rule', 'blocked')}): {ev.get('reason', '')}",
+                        style="yellow",
+                    )
+                    self._write_transcript(line, session_id=session_id)
+
             with self.log_scope("llm"):
                 with self._build_client(
                     provider=eff_provider,
@@ -1082,33 +1181,51 @@ class LocalLLMPane(BaseSocPane):
                     watermark=remote_watermark,
                     stop_event=stop_event,
                 ) as client:
-                    if attached_ctx is not None:
+                    if template_key != "freeform":
+                        target_content = attached_ctx if attached_ctx is not None else user_prompt
+                        extra_instr = user_prompt if attached_ctx is not None else ""
                         result = client.analyze_with_template(
                             template_key,
-                            attached_ctx,
-                            extra_instruction=user_prompt,
-                            model=model,
-                        )
-                    elif template_key != "freeform":
-                        result = client.analyze_with_template(
-                            template_key,
-                            user_prompt,
+                            target_content,
+                            extra_instruction=extra_instr,
                             model=model,
                         )
                     else:
-                        messages = [
-                            *(history_snapshot if history_snapshot is not None else []),
-                            {"role": "user", "content": user_prompt},
-                        ]
-                        system_prompt = SOC_PROMPT_TEMPLATES["freeform"]["system_prompt"]
-                        result = client.chat(
-                            messages,
+                        orchestrator = self._resolve_orchestrator()
+                        chat_res = orchestrator.chat(
+                            user_prompt=user_prompt,
+                            history=history_snapshot,
+                            attached_context=attached_ctx,
+                            attached_title=attached_title,
+                            session_id=session_id,
+                            client=client,
+                            provider=eff_provider,
                             model=model,
-                            system_prompt=system_prompt,
+                            enable_tools=tools_enabled,
+                            stop_event=stop_event,
+                            tool_event_callback=_on_tool_event,
                         )
+                        if chat_res.status == "cancelled":
+                            raise LocalLLMError("AI request cancelled by user.", provider=eff_provider)
+                        if chat_res.status == "error":
+                            raise LocalLLMError(
+                                chat_res.error or "Freeform chat failed.",
+                                provider=eff_provider,
+                            )
+                        tool_call_count = len(chat_res.tool_calls)
+                        result = {
+                            "content": chat_res.content,
+                            "model": chat_res.model or model,
+                            "provider": chat_res.provider or eff_provider,
+                            "conversation_id": chat_res.conversation_id,
+                            "conversation_token": chat_res.conversation_token,
+                            "watermark": chat_res.watermark,
+                            "done": chat_res.done,
+                        }
+                        history_user_text = user_prompt or f"Analyze {attached_title or 'attached context'}"
                         updated_freeform_pair = [
-                            {"role": "user", "content": user_prompt},
-                            {"role": "assistant", "content": str(result.get("content") or "")},
+                            {"role": "user", "content": history_user_text},
+                            {"role": "assistant", "content": str(chat_res.content or "")},
                         ]
 
             reply = str(result.get("content") or "").strip()
@@ -1132,6 +1249,8 @@ class LocalLLMPane(BaseSocPane):
                 if updated_freeform_pair is not None:
                     target.history.extend(updated_freeform_pair)
                 self._refresh_session_select()
+                with contextlib.suppress(Exception):
+                    self.query_one(AuditLogViewWidget).refresh_entries()
 
             self.run_on_ui(_record_reply)
             header = Text()
@@ -1140,7 +1259,8 @@ class LocalLLMPane(BaseSocPane):
             self._write_transcript(reply or "(Empty response)", session_id=session_id)
             self._write_transcript("", session_id=session_id)
 
-            status_msg = f"Response received from {result.get('provider')} ({resp_model})."
+            tool_suffix = f" [{tool_call_count} tool call(s)]" if tool_call_count else ""
+            status_msg = f"Response received from {result.get('provider')} ({resp_model}){tool_suffix}."
             if session_id == self._active_session_id:
                 self.set_status(status_msg)
             else:
