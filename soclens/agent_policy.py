@@ -33,13 +33,29 @@ SOURCE_CATEGORY_TOGGLE_MAP: dict[str, str] = {
     SOURCE_CATEGORY_OSINT: "watchlists_osint_enabled",
 }
 
-DEFAULT_MAX_TOOL_STEPS: int = 8
+DEFAULT_MAX_TOOL_STEPS: int = 50
 MIN_TOOL_STEPS: int = 1
-MAX_TOOL_STEPS: int = 50
+MAX_TOOL_STEPS: int = 500
 
 DEFAULT_MAX_IDENTICAL_TOOL_CALLS: int = 2
 MIN_IDENTICAL_TOOL_CALLS: int = 1
-MAX_IDENTICAL_TOOL_CALLS: int = 20
+MAX_IDENTICAL_TOOL_CALLS: int = 50
+
+DEFAULT_MAX_SAME_TOOL_FAILURES: int = 10
+MIN_SAME_TOOL_FAILURES: int = 1
+MAX_SAME_TOOL_FAILURES: int = 100
+
+DEFAULT_KILL_SWITCH_LABEL: str = "KILL AI"
+MAX_KILL_SWITCH_LABEL_LEN: int = 20
+DEFAULT_KILL_SWITCH_HOTKEY: str = "f12"
+VALID_KILL_SWITCH_HOTKEYS: tuple[str, ...] = ("f12", "f11", "ctrl+backslash", "none")
+
+_KILL_SWITCH_HOTKEY_BADGES: dict[str, str] = {
+    "f12": "[F12]",
+    "f11": "[F11]",
+    "ctrl+backslash": "[Ctrl+\\]",
+    "none": "",
+}
 
 _REGISTRY_LOCK = threading.Lock()
 _REGISTERED_READONLY_TOOLS: set[str] = set()
@@ -115,6 +131,36 @@ def _normalize_disabled_tools(value: Any) -> list[str]:
     return normalized
 
 
+def _normalize_kill_switch_label(value: Any) -> str:
+    if not isinstance(value, str):
+        return DEFAULT_KILL_SWITCH_LABEL
+    collapsed = " ".join(value.split()).strip()
+    if not collapsed:
+        return DEFAULT_KILL_SWITCH_LABEL
+    return collapsed[:MAX_KILL_SWITCH_LABEL_LEN].strip() or DEFAULT_KILL_SWITCH_LABEL
+
+
+def _normalize_kill_switch_hotkey(value: Any) -> str:
+    if not isinstance(value, str):
+        return DEFAULT_KILL_SWITCH_HOTKEY
+    cleaned = value.strip().lower()
+    if cleaned in VALID_KILL_SWITCH_HOTKEYS:
+        return cleaned
+    return DEFAULT_KILL_SWITCH_HOTKEY
+
+
+def format_kill_switch_hotkey_badge(hotkey: str) -> str:
+    """Return a compact display badge (e.g. ``[F12]``) for ``hotkey``, or ``''``."""
+    return _KILL_SWITCH_HOTKEY_BADGES.get(_normalize_kill_switch_hotkey(hotkey), "")
+
+
+def _env_max_tool_steps_default() -> int:
+    raw = (os.environ.get("SOCLENS_AI_MAX_TOOL_STEPS") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_TOOL_STEPS
+    return _coerce_bounded_int(raw, DEFAULT_MAX_TOOL_STEPS, MIN_TOOL_STEPS, MAX_TOOL_STEPS)
+
+
 @dataclass
 class AIPolicyConfig:
     """Granular AI Control Panel policy governing read-only agent capabilities."""
@@ -129,6 +175,14 @@ class AIPolicyConfig:
     disabled_tools: list[str] = field(default_factory=list)
     max_tool_steps: int = DEFAULT_MAX_TOOL_STEPS
     max_identical_tool_calls: int = DEFAULT_MAX_IDENTICAL_TOOL_CALLS
+    max_same_tool_failures: int = DEFAULT_MAX_SAME_TOOL_FAILURES
+    ai_kill_switch_active: bool = False
+    kill_switch_visible: bool = True
+    kill_switch_confirm_engage: bool = False
+    kill_switch_confirm_resume: bool = False
+    kill_switch_persist_across_restarts: bool = True
+    kill_switch_label: str = DEFAULT_KILL_SWITCH_LABEL
+    kill_switch_hotkey: str = DEFAULT_KILL_SWITCH_HOTKEY
 
     def __post_init__(self) -> None:
         self.background_triage_enabled = _coerce_bool(self.background_triage_enabled, False)
@@ -151,6 +205,21 @@ class AIPolicyConfig:
             MIN_IDENTICAL_TOOL_CALLS,
             MAX_IDENTICAL_TOOL_CALLS,
         )
+        self.max_same_tool_failures = _coerce_bounded_int(
+            self.max_same_tool_failures,
+            DEFAULT_MAX_SAME_TOOL_FAILURES,
+            MIN_SAME_TOOL_FAILURES,
+            MAX_SAME_TOOL_FAILURES,
+        )
+        self.ai_kill_switch_active = _coerce_bool(self.ai_kill_switch_active, False)
+        self.kill_switch_visible = _coerce_bool(self.kill_switch_visible, True)
+        self.kill_switch_confirm_engage = _coerce_bool(self.kill_switch_confirm_engage, False)
+        self.kill_switch_confirm_resume = _coerce_bool(self.kill_switch_confirm_resume, False)
+        self.kill_switch_persist_across_restarts = _coerce_bool(
+            self.kill_switch_persist_across_restarts, True
+        )
+        self.kill_switch_label = _normalize_kill_switch_label(self.kill_switch_label)
+        self.kill_switch_hotkey = _normalize_kill_switch_hotkey(self.kill_switch_hotkey)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize policy configuration into a JSON-friendly dictionary."""
@@ -165,6 +234,14 @@ class AIPolicyConfig:
             "disabled_tools": list(self.disabled_tools),
             "max_tool_steps": self.max_tool_steps,
             "max_identical_tool_calls": self.max_identical_tool_calls,
+            "max_same_tool_failures": self.max_same_tool_failures,
+            "ai_kill_switch_active": self.ai_kill_switch_active,
+            "kill_switch_visible": self.kill_switch_visible,
+            "kill_switch_confirm_engage": self.kill_switch_confirm_engage,
+            "kill_switch_confirm_resume": self.kill_switch_confirm_resume,
+            "kill_switch_persist_across_restarts": self.kill_switch_persist_across_restarts,
+            "kill_switch_label": self.kill_switch_label,
+            "kill_switch_hotkey": self.kill_switch_hotkey,
         }
 
     @classmethod
@@ -191,6 +268,21 @@ class AIPolicyConfig:
                 MIN_IDENTICAL_TOOL_CALLS,
                 MAX_IDENTICAL_TOOL_CALLS,
             ),
+            max_same_tool_failures=_coerce_bounded_int(
+                raw.get("max_same_tool_failures"),
+                DEFAULT_MAX_SAME_TOOL_FAILURES,
+                MIN_SAME_TOOL_FAILURES,
+                MAX_SAME_TOOL_FAILURES,
+            ),
+            ai_kill_switch_active=_coerce_bool(raw.get("ai_kill_switch_active"), False),
+            kill_switch_visible=_coerce_bool(raw.get("kill_switch_visible"), True),
+            kill_switch_confirm_engage=_coerce_bool(raw.get("kill_switch_confirm_engage"), False),
+            kill_switch_confirm_resume=_coerce_bool(raw.get("kill_switch_confirm_resume"), False),
+            kill_switch_persist_across_restarts=_coerce_bool(
+                raw.get("kill_switch_persist_across_restarts"), True
+            ),
+            kill_switch_label=_normalize_kill_switch_label(raw.get("kill_switch_label")),
+            kill_switch_hotkey=_normalize_kill_switch_hotkey(raw.get("kill_switch_hotkey")),
         )
 
 
@@ -240,13 +332,13 @@ class AIPolicyStore:
         """Load the persisted AI policy, returning safe defaults if missing or corrupt."""
         with self._io_lock:
             if not self._path.is_file():
-                return AIPolicyConfig()
+                return AIPolicyConfig(max_tool_steps=_env_max_tool_steps_default())
             try:
                 raw_text = self._path.read_text(encoding="utf-8")
                 payload = json.loads(raw_text)
             except (OSError, ValueError) as exc:
                 logger.warning("Failed to load AI policy from %s (%s); using defaults.", self._path, exc)
-                return AIPolicyConfig()
+                return AIPolicyConfig(max_tool_steps=_env_max_tool_steps_default())
 
         if not isinstance(payload, Mapping):
             logger.warning(
@@ -254,7 +346,11 @@ class AIPolicyStore:
                 self._path,
                 type(payload).__name__,
             )
-            return AIPolicyConfig()
+            return AIPolicyConfig(max_tool_steps=_env_max_tool_steps_default())
+        if "max_tool_steps" not in payload or payload.get("max_tool_steps") is None:
+            merged = dict(payload)
+            merged["max_tool_steps"] = _env_max_tool_steps_default()
+            return AIPolicyConfig.from_dict(merged)
         return AIPolicyConfig.from_dict(payload)
 
     def save(self, policy: AIPolicyConfig) -> None:
@@ -331,6 +427,14 @@ def evaluate_tool_permission(
                 f"Tool '{clean_tool or tool_name}' is not a registered read-only tool."
             ),
             rule="readonly_enforced",
+        )
+
+    # 1b. Global AI Kill Switch enforcement (blocks all AI tool execution immediately).
+    if policy.ai_kill_switch_active:
+        return PermissionDecision(
+            allowed=False,
+            reason="AI Kill Switch is active; all AI tool execution is halted.",
+            rule="ai_kill_switch",
         )
 
     # 2. Mode enforcement.
@@ -432,12 +536,18 @@ def evaluate_tool_permission(
 __all__ = [
     "AIPolicyConfig",
     "AIPolicyStore",
+    "DEFAULT_KILL_SWITCH_HOTKEY",
+    "DEFAULT_KILL_SWITCH_LABEL",
     "DEFAULT_MAX_IDENTICAL_TOOL_CALLS",
+    "DEFAULT_MAX_SAME_TOOL_FAILURES",
     "DEFAULT_MAX_TOOL_STEPS",
     "InvestigationMode",
     "MAX_IDENTICAL_TOOL_CALLS",
+    "MAX_KILL_SWITCH_LABEL_LEN",
+    "MAX_SAME_TOOL_FAILURES",
     "MAX_TOOL_STEPS",
     "MIN_IDENTICAL_TOOL_CALLS",
+    "MIN_SAME_TOOL_FAILURES",
     "MIN_TOOL_STEPS",
     "PermissionDecision",
     "SOURCE_CATEGORY_OSINT",
@@ -447,7 +557,9 @@ __all__ = [
     "SOURCE_CATEGORY_SPLUNK_ES",
     "SOURCE_CATEGORY_TOGGLE_MAP",
     "VALID_INVESTIGATION_MODES",
+    "VALID_KILL_SWITCH_HOTKEYS",
     "evaluate_tool_permission",
+    "format_kill_switch_hotkey_badge",
     "get_registered_readonly_tool_names",
     "register_readonly_tool_names",
 ]

@@ -828,28 +828,83 @@ class BaseSocPane(VerticalScroll):
         message: str,
         details: str = "",
         confirm_label: str = "Approve Delete",
+        warning_text: str | None = None,
+        double_confirm: bool = False,
+        second_title: str | None = None,
+        second_message: str | None = None,
+        second_confirm_label: str | None = None,
+        second_warning_text: str | None = None,
         on_approved: Callable[[], Any],
         on_cancelled: Callable[[], Any] | None = None,
     ) -> None:
-        """Display an explicit approval prompt before executing a deletion."""
+        """Display an explicit approval prompt (or two sequential prompts) before acting."""
         if self.is_app_shutting_down():
             return
 
-        def _handle_result(approved: bool | None) -> None:
+        def _handle_final_result(approved: bool | None) -> None:
             if approved:
                 on_approved()
             elif on_cancelled is not None:
                 on_cancelled()
 
+        if not double_confirm:
+            self.run_on_ui(
+                self.app.push_screen,
+                ConfirmActionModal(
+                    title,
+                    message,
+                    details=details,
+                    confirm_label=confirm_label,
+                    warning_text=warning_text,
+                ),
+                _handle_final_result,
+            )
+            return
+
+        step1_title = title if title.startswith("[Step 1/2]") else f"[Step 1/2] {title}"
+        step1_warning = (
+            warning_text
+            if warning_text is not None
+            else "Step 1 of 2: Double approval is required for this high-impact action."
+        )
+        step2_title = second_title or f"[Step 2/2] Final Confirmation: {title}"
+        step2_message = second_message or f"Confirm again: {message}"
+        step2_label = second_confirm_label or f"Confirm {confirm_label}"
+        step2_warning = (
+            second_warning_text
+            if second_warning_text is not None
+            else "FINAL APPROVAL (Step 2 of 2): This high-impact action will execute immediately."
+        )
+
+        def _handle_step1(approved: bool | None) -> None:
+            if not approved:
+                if on_cancelled is not None:
+                    on_cancelled()
+                return
+            if self.is_app_shutting_down():
+                return
+            self.run_on_ui(
+                self.app.push_screen,
+                ConfirmActionModal(
+                    step2_title,
+                    step2_message,
+                    details=details,
+                    confirm_label=step2_label,
+                    warning_text=step2_warning,
+                ),
+                _handle_final_result,
+            )
+
         self.run_on_ui(
             self.app.push_screen,
             ConfirmActionModal(
-                title,
+                step1_title,
                 message,
                 details=details,
                 confirm_label=confirm_label,
+                warning_text=step1_warning,
             ),
-            _handle_result,
+            _handle_step1,
         )
 
     def confirm_action_from_worker(
@@ -977,6 +1032,14 @@ class BaseSocPane(VerticalScroll):
         """Prompt for an event-only question and launch an ``ask_only`` investigation."""
         if self.is_app_shutting_down() or event is None:
             return
+        is_killed_fn = getattr(self.app, "is_ai_killed", None)
+        if callable(is_killed_fn) and is_killed_fn():
+            self.notify_user(
+                "AI Kill Switch is active — all AI actions are halted. Click AI HALTED or press the kill hotkey to resume.",
+                title="AI Halted",
+                severity="warning",
+            )
+            return
         from soclens.tui.ai_widgets import AskEventAIModal, EventAIPanelWidget
 
         modal = AskEventAIModal(
@@ -986,6 +1049,13 @@ class BaseSocPane(VerticalScroll):
 
         def _on_question(question: str | None) -> None:
             if not question or not question.strip() or self.is_app_shutting_down():
+                return
+            if callable(is_killed_fn) and is_killed_fn():
+                self.notify_user(
+                    "AI Kill Switch is active — all AI actions are halted.",
+                    title="AI Halted",
+                    severity="warning",
+                )
                 return
             with contextlib.suppress(Exception):
                 self.query_one(panel_selector, EventAIPanelWidget).show_investigating(
@@ -1000,6 +1070,14 @@ class BaseSocPane(VerticalScroll):
     def request_full_event_ai(self, panel_selector: str, event: Any) -> None:
         """Launch a ``full_investigation`` run for ``event`` and show loading state."""
         if self.is_app_shutting_down() or event is None:
+            return
+        is_killed_fn = getattr(self.app, "is_ai_killed", None)
+        if callable(is_killed_fn) and is_killed_fn():
+            self.notify_user(
+                "AI Kill Switch is active — all AI actions are halted. Click AI HALTED or press the kill hotkey to resume.",
+                title="AI Halted",
+                severity="warning",
+            )
             return
         from soclens.tui.ai_widgets import EventAIPanelWidget
 

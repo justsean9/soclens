@@ -202,6 +202,7 @@ class ConfirmActionModal(ModalScreen[bool]):
         details: str = "",
         confirm_label: str = "Approve Delete",
         cancel_label: str = "Cancel",
+        warning_text: str | None = None,
     ) -> None:
         super().__init__()
         self._title = title
@@ -209,6 +210,11 @@ class ConfirmActionModal(ModalScreen[bool]):
         self._details = details.strip()
         self._confirm_label = confirm_label
         self._cancel_label = cancel_label
+        self._warning_text = (
+            warning_text
+            if warning_text is not None
+            else "Approval required: this destructive action modifies Recorded Future data."
+        )
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
@@ -216,11 +222,12 @@ class ConfirmActionModal(ModalScreen[bool]):
             yield Static(self._message, id="confirm-message", markup=False)
             if self._details:
                 yield Static(self._details, id="confirm-details", markup=False)
-            yield Static(
-                "Approval required: this destructive action modifies Recorded Future data.",
-                id="confirm-warning",
-                markup=False,
-            )
+            if self._warning_text:
+                yield Static(
+                    self._warning_text,
+                    id="confirm-warning",
+                    markup=False,
+                )
             with Horizontal(id="confirm-buttons"):
                 yield Button(
                     self._cancel_label,

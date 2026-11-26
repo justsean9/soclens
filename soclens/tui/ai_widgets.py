@@ -14,12 +14,62 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Collapsible, DataTable, Input, RichLog, Static, Switch
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Collapsible,
+    DataTable,
+    Input,
+    RichLog,
+    Select,
+    Static,
+    Switch,
+)
 
 from soclens.agent_audit import AuditEntry, AuditLogStore, redact_sensitive_data
-from soclens.agent_policy import AIPolicyStore, InvestigationMode
+from soclens.agent_policy import (
+    DEFAULT_KILL_SWITCH_LABEL,
+    MAX_IDENTICAL_TOOL_CALLS,
+    MAX_SAME_TOOL_FAILURES,
+    MAX_TOOL_STEPS,
+    MIN_IDENTICAL_TOOL_CALLS,
+    MIN_SAME_TOOL_FAILURES,
+    MIN_TOOL_STEPS,
+    AIPolicyStore,
+    InvestigationMode,
+)
 from soclens.agent_tools import ReadOnlyToolRegistry
 from soclens.event_tracker import EventAIPanelEntry, UniqueEvent
+
+_KILL_HOTKEY_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("F12 (Default)", "f12"),
+    ("F11", "f11"),
+    ("Ctrl+\\", "ctrl+backslash"),
+    ("Disabled (Button Only)", "none"),
+)
+
+_KILL_CONFIG_SWITCH_SPECS: tuple[tuple[str, str, str], ...] = (
+    (
+        "ai-ctrl-kill-visible",
+        "kill_switch_visible",
+        "Show Kill Switch Button in Every Dashboard",
+    ),
+    (
+        "ai-ctrl-kill-confirm-engage",
+        "kill_switch_confirm_engage",
+        "Require Confirmation Before Halting AI",
+    ),
+    (
+        "ai-ctrl-kill-confirm-resume",
+        "kill_switch_confirm_resume",
+        "Require Confirmation Before Resuming AI",
+    ),
+    (
+        "ai-ctrl-kill-persist",
+        "kill_switch_persist_across_restarts",
+        "Keep AI Halted Across App Restarts",
+    ),
+)
 
 _CONTROL_SWITCH_SPECS: tuple[tuple[str, str, str], ...] = (
     (
@@ -60,7 +110,8 @@ _CONTROL_SWITCH_SPECS: tuple[tuple[str, str, str], ...] = (
 )
 
 _SWITCH_ID_TO_FIELD: dict[str, str] = {
-    sw_id: field_name for sw_id, field_name, _label in _CONTROL_SWITCH_SPECS
+    **{sw_id: field_name for sw_id, field_name, _label in _CONTROL_SWITCH_SPECS},
+    **{sw_id: field_name for sw_id, field_name, _label in _KILL_CONFIG_SWITCH_SPECS},
 }
 
 
@@ -415,6 +466,49 @@ class AIControlPanelWidget(VerticalScroll):
         padding-left: 1;
         color: #e6edf7;
     }
+    AIControlPanelWidget .ai-ctrl-kill-bar {
+        height: auto;
+        width: 1fr;
+        align-vertical: middle;
+        background: #1b1620;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    AIControlPanelWidget .ai-ctrl-kill-bar.ai-halted {
+        background: #3b1219;
+    }
+    AIControlPanelWidget #ai-ctrl-kill-status {
+        width: 1fr;
+        text-style: bold;
+        color: #f0f6ff;
+    }
+    AIControlPanelWidget .ai-ctrl-limits-box {
+        height: auto;
+        width: 1fr;
+        background: #131926;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    AIControlPanelWidget .ai-ctrl-limit-label {
+        width: 30;
+        color: #c5d4f0;
+    }
+    AIControlPanelWidget .ai-ctrl-limit-input {
+        width: 10;
+        margin-right: 1;
+    }
+    AIControlPanelWidget .ai-ctrl-preset-btn {
+        min-width: 5;
+        margin-right: 1;
+    }
+    AIControlPanelWidget #ai-ctrl-kill-label {
+        width: 24;
+        margin-right: 1;
+    }
+    AIControlPanelWidget #ai-ctrl-kill-hotkey {
+        width: 28;
+    }
+    AIControlPanelWidget #ai-ctrl-kill-config-collapsible,
     AIControlPanelWidget #ai-ctrl-tools-collapsible {
         margin-top: 1;
     }
@@ -441,12 +535,71 @@ class AIControlPanelWidget(VerticalScroll):
             classes="ai-ctrl-title",
             markup=False,
         )
+        with Horizontal(id="ai-ctrl-kill-bar", classes="ai-ctrl-kill-bar"):
+            yield Static(
+                "AI Status: HALTED BY KILL SWITCH"
+                if policy.ai_kill_switch_active
+                else "AI Status: ACTIVE",
+                id="ai-ctrl-kill-status",
+                markup=False,
+            )
+            yield Button(
+                "RESUME AI ACTIONS" if policy.ai_kill_switch_active else "HALT ALL AI NOW",
+                id="ai-ctrl-kill-btn",
+                variant="warning" if policy.ai_kill_switch_active else "error",
+                compact=True,
+            )
         yield Static(
-            "Policy toggles persist immediately and record policy_change audit entries.",
+            "Policy toggles and limits persist immediately and record policy_change audit entries.",
             id="ai-ctrl-status",
             classes="status-bar",
             markup=False,
         )
+        with Vertical(classes="ai-ctrl-limits-box"):
+            with Horizontal(classes="ai-ctrl-row"):
+                yield Static(
+                    f"Max Tool Steps ({MIN_TOOL_STEPS}-{MAX_TOOL_STEPS}):",
+                    classes="ai-ctrl-limit-label",
+                    markup=False,
+                )
+                yield Input(
+                    value=str(policy.max_tool_steps),
+                    placeholder=str(policy.max_tool_steps),
+                    id="ai-ctrl-max-tool-steps",
+                    classes="ai-ctrl-limit-input",
+                    compact=True,
+                )
+                yield Button("25", id="ai-ctrl-preset-steps-25", classes="ai-ctrl-preset-btn", compact=True)
+                yield Button("50", id="ai-ctrl-preset-steps-50", classes="ai-ctrl-preset-btn", compact=True)
+                yield Button("100", id="ai-ctrl-preset-steps-100", classes="ai-ctrl-preset-btn", compact=True)
+                yield Button("250", id="ai-ctrl-preset-steps-250", classes="ai-ctrl-preset-btn", compact=True)
+            with Horizontal(classes="ai-ctrl-row"):
+                yield Static(
+                    f"Max Identical Calls ({MIN_IDENTICAL_TOOL_CALLS}-{MAX_IDENTICAL_TOOL_CALLS}):",
+                    classes="ai-ctrl-limit-label",
+                    markup=False,
+                )
+                yield Input(
+                    value=str(policy.max_identical_tool_calls),
+                    placeholder=str(policy.max_identical_tool_calls),
+                    id="ai-ctrl-max-identical-calls",
+                    classes="ai-ctrl-limit-input",
+                    compact=True,
+                )
+                yield Static(
+                    f"Max Failures ({MIN_SAME_TOOL_FAILURES}-{MAX_SAME_TOOL_FAILURES}):",
+                    classes="ai-ctrl-limit-label",
+                    markup=False,
+                )
+                yield Input(
+                    value=str(policy.max_same_tool_failures),
+                    placeholder=str(policy.max_same_tool_failures),
+                    id="ai-ctrl-max-tool-failures",
+                    classes="ai-ctrl-limit-input",
+                    compact=True,
+                )
+                yield Button("Save Limits", id="ai-ctrl-save-limits", variant="primary", compact=True)
+
         for sw_id, field_name, label in _CONTROL_SWITCH_SPECS:
             with Horizontal(classes="ai-ctrl-row"):
                 yield Switch(
@@ -454,6 +607,37 @@ class AIControlPanelWidget(VerticalScroll):
                     id=sw_id,
                 )
                 yield Static(label, classes="ai-ctrl-label", markup=False)
+
+        with Collapsible(
+            title="Global Kill Button Configuration",
+            collapsed=True,
+            id="ai-ctrl-kill-config-collapsible",
+        ):
+            for sw_id, field_name, label in _KILL_CONFIG_SWITCH_SPECS:
+                with Horizontal(classes="ai-ctrl-row"):
+                    yield Switch(
+                        value=bool(getattr(policy, field_name, False)),
+                        id=sw_id,
+                    )
+                    yield Static(label, classes="ai-ctrl-label", markup=False)
+            with Horizontal(classes="ai-ctrl-row"):
+                yield Static("Global Kill Hotkey:", classes="ai-ctrl-limit-label", markup=False)
+                yield Select(
+                    list(_KILL_HOTKEY_OPTIONS),
+                    allow_blank=False,
+                    value=policy.kill_switch_hotkey,
+                    id="ai-ctrl-kill-hotkey",
+                    compact=True,
+                )
+            with Horizontal(classes="ai-ctrl-row"):
+                yield Static("Kill Button Label:", classes="ai-ctrl-limit-label", markup=False)
+                yield Input(
+                    value=policy.kill_switch_label,
+                    placeholder=DEFAULT_KILL_SWITCH_LABEL,
+                    id="ai-ctrl-kill-label",
+                    compact=True,
+                )
+                yield Button("Save Label", id="ai-ctrl-save-kill-label", variant="primary", compact=True)
 
         with Collapsible(
             title="Per-Tool Overrides (Read-Only Tools)",
@@ -476,11 +660,44 @@ class AIControlPanelWidget(VerticalScroll):
         self.sync_from_store()
 
     def sync_from_store(self) -> None:
-        """Synchronize UI switches and per-tool checkboxes from persisted ``AIPolicyStore``."""
+        """Synchronize UI switches, limits, kill-switch config, and tool checkboxes."""
         self._syncing = True
         try:
             policy = self._policy_store.load()
-            for sw_id, field_name, _label in _CONTROL_SWITCH_SPECS:
+            with contextlib.suppress(Exception):
+                kill_bar = self.query_one("#ai-ctrl-kill-bar", Horizontal)
+                kill_bar.set_class(policy.ai_kill_switch_active, "ai-halted")
+            with contextlib.suppress(Exception):
+                self.query_one("#ai-ctrl-kill-status", Static).update(
+                    "AI Status: HALTED BY KILL SWITCH"
+                    if policy.ai_kill_switch_active
+                    else "AI Status: ACTIVE"
+                )
+            with contextlib.suppress(Exception):
+                kbtn = self.query_one("#ai-ctrl-kill-btn", Button)
+                kbtn.label = (
+                    "RESUME AI ACTIONS" if policy.ai_kill_switch_active else "HALT ALL AI NOW"
+                )
+                kbtn.variant = "warning" if policy.ai_kill_switch_active else "error"
+
+            for inp_id, val_str in (
+                ("#ai-ctrl-max-tool-steps", str(policy.max_tool_steps)),
+                ("#ai-ctrl-max-identical-calls", str(policy.max_identical_tool_calls)),
+                ("#ai-ctrl-max-tool-failures", str(policy.max_same_tool_failures)),
+                ("#ai-ctrl-kill-label", policy.kill_switch_label),
+            ):
+                with contextlib.suppress(Exception):
+                    inp = self.query_one(inp_id, Input)
+                    with inp.prevent(Input.Changed):
+                        inp.value = val_str
+
+            with contextlib.suppress(Exception):
+                hsel = self.query_one("#ai-ctrl-kill-hotkey", Select)
+                if hsel.value != policy.kill_switch_hotkey:
+                    with hsel.prevent(Select.Changed):
+                        hsel.value = policy.kill_switch_hotkey
+
+            for sw_id, field_name, _label in (*_CONTROL_SWITCH_SPECS, *_KILL_CONFIG_SWITCH_SPECS):
                 with contextlib.suppress(Exception):
                     sw = self.query_one(f"#{sw_id}", Switch)
                     with sw.prevent(Switch.Changed):
@@ -499,16 +716,13 @@ class AIControlPanelWidget(VerticalScroll):
         with contextlib.suppress(Exception):
             self.query_one("#ai-ctrl-status", Static).update(message)
 
-    @on(Switch.Changed)
-    def handle_switch_changed(self, event: Switch.Changed) -> None:
-        if self._syncing:
-            return
-        sw_id = str(event.switch.id or "")
-        field_name = _SWITCH_ID_TO_FIELD.get(sw_id)
-        if not field_name:
-            return
-        new_val = bool(event.value)
-        self._policy_store.update(**{field_name: new_val})
+    def _sync_app_kill_ui(self) -> None:
+        sync_fn = getattr(self.app, "sync_ai_kill_switch_ui", None)
+        if callable(sync_fn):
+            with contextlib.suppress(Exception):
+                sync_fn()
+
+    def _audit_policy_change(self, field_name: str, reason: str, payload: dict[str, Any]) -> None:
         self._audit_store.append(
             AuditEntry(
                 entry_id="",
@@ -520,10 +734,157 @@ class AIControlPanelWidget(VerticalScroll):
                 event_type="policy_change",
                 tool_name=field_name,
                 allowed=None,
-                reason=f"Control panel set {field_name}={new_val}",
-                payload={"field": field_name, "value": new_val},
+                reason=reason,
+                payload=payload,
             )
         )
+
+    @on(Button.Pressed, "#ai-ctrl-kill-btn")
+    def handle_kill_switch_button(self) -> None:
+        policy = self._policy_store.load()
+        if policy.ai_kill_switch_active:
+            resume_fn = getattr(self.app, "resume_ai_actions", None)
+            if callable(resume_fn):
+                resume_fn(source="control_panel", reason="Resumed from AI Control Panel")
+            else:
+                self._policy_store.update(ai_kill_switch_active=False)
+                self._audit_policy_change(
+                    "ai_kill_switch",
+                    "AI Kill Switch disengaged in control panel",
+                    {"ai_kill_switch_active": False},
+                )
+                self.sync_from_store()
+            self._update_status("AI Kill Switch disengaged — AI actions resumed.")
+        else:
+            halt_fn = getattr(self.app, "halt_all_ai_actions", None)
+            if callable(halt_fn):
+                halt_fn(source="control_panel", reason="Halted from AI Control Panel")
+            else:
+                self._policy_store.update(ai_kill_switch_active=True)
+                self._audit_policy_change(
+                    "ai_kill_switch",
+                    "AI Kill Switch engaged in control panel",
+                    {"ai_kill_switch_active": True},
+                )
+                self.sync_from_store()
+            self._update_status("AI KILL SWITCH ENGAGED — all AI actions halted.")
+
+    def _apply_limit_preset(self, steps: int) -> None:
+        updated = self._policy_store.update(max_tool_steps=steps)
+        self._audit_policy_change(
+            "max_tool_steps",
+            f"Control panel preset set max_tool_steps={updated.max_tool_steps}",
+            {"field": "max_tool_steps", "value": updated.max_tool_steps},
+        )
+        self.sync_from_store()
+        self._update_status(f"Updated max_tool_steps = {updated.max_tool_steps}")
+
+    @on(Button.Pressed, "#ai-ctrl-preset-steps-25")
+    def handle_preset_25(self) -> None:
+        self._apply_limit_preset(25)
+
+    @on(Button.Pressed, "#ai-ctrl-preset-steps-50")
+    def handle_preset_50(self) -> None:
+        self._apply_limit_preset(50)
+
+    @on(Button.Pressed, "#ai-ctrl-preset-steps-100")
+    def handle_preset_100(self) -> None:
+        self._apply_limit_preset(100)
+
+    @on(Button.Pressed, "#ai-ctrl-preset-steps-250")
+    def handle_preset_250(self) -> None:
+        self._apply_limit_preset(250)
+
+    @on(Button.Pressed, "#ai-ctrl-save-limits")
+    @on(Input.Submitted, "#ai-ctrl-max-tool-steps")
+    @on(Input.Submitted, "#ai-ctrl-max-identical-calls")
+    @on(Input.Submitted, "#ai-ctrl-max-tool-failures")
+    def handle_save_limits(self) -> None:
+        raw_steps = self.query_one("#ai-ctrl-max-tool-steps", Input).value.strip()
+        raw_ident = self.query_one("#ai-ctrl-max-identical-calls", Input).value.strip()
+        raw_fail = self.query_one("#ai-ctrl-max-tool-failures", Input).value.strip()
+        updates: dict[str, int] = {}
+        try:
+            if raw_steps:
+                updates["max_tool_steps"] = int(raw_steps)
+            if raw_ident:
+                updates["max_identical_tool_calls"] = int(raw_ident)
+            if raw_fail:
+                updates["max_same_tool_failures"] = int(raw_fail)
+        except ValueError:
+            self._update_status("Invalid integer in tool limits; enter whole numbers.")
+            return
+        if not updates:
+            return
+        updated = self._policy_store.update(**updates)
+        self._audit_policy_change(
+            "tool_limits",
+            (
+                f"Control panel updated limits: max_tool_steps={updated.max_tool_steps}, "
+                f"max_identical_tool_calls={updated.max_identical_tool_calls}, "
+                f"max_same_tool_failures={updated.max_same_tool_failures}"
+            ),
+            {
+                "max_tool_steps": updated.max_tool_steps,
+                "max_identical_tool_calls": updated.max_identical_tool_calls,
+                "max_same_tool_failures": updated.max_same_tool_failures,
+            },
+        )
+        self.sync_from_store()
+        self._update_status(
+            f"Saved tool limits: steps={updated.max_tool_steps}, "
+            f"identical={updated.max_identical_tool_calls}, failures={updated.max_same_tool_failures}"
+        )
+
+    @on(Select.Changed, "#ai-ctrl-kill-hotkey")
+    def handle_kill_hotkey_changed(self, event: Select.Changed) -> None:
+        if self._syncing or not self.is_mounted or not isinstance(event.value, str):
+            return
+        new_hotkey = event.value.strip().lower()
+        if not new_hotkey:
+            return
+        if self._policy_store.load().kill_switch_hotkey == new_hotkey:
+            return
+        updated = self._policy_store.update(kill_switch_hotkey=new_hotkey)
+        self._audit_policy_change(
+            "kill_switch_hotkey",
+            f"Control panel set kill_switch_hotkey={updated.kill_switch_hotkey}",
+            {"field": "kill_switch_hotkey", "value": updated.kill_switch_hotkey},
+        )
+        self._sync_app_kill_ui()
+        self._update_status(f"Updated global kill hotkey: {updated.kill_switch_hotkey}")
+
+    @on(Button.Pressed, "#ai-ctrl-save-kill-label")
+    @on(Input.Submitted, "#ai-ctrl-kill-label")
+    def handle_save_kill_label(self) -> None:
+        raw_label = self.query_one("#ai-ctrl-kill-label", Input).value
+        updated = self._policy_store.update(kill_switch_label=raw_label)
+        self._audit_policy_change(
+            "kill_switch_label",
+            f"Control panel set kill_switch_label={updated.kill_switch_label!r}",
+            {"field": "kill_switch_label", "value": updated.kill_switch_label},
+        )
+        self.sync_from_store()
+        self._sync_app_kill_ui()
+        self._update_status(f"Updated kill button label: {updated.kill_switch_label}")
+
+    @on(Switch.Changed)
+    def handle_switch_changed(self, event: Switch.Changed) -> None:
+        if self._syncing:
+            return
+        sw_id = str(event.switch.id or "")
+        field_name = _SWITCH_ID_TO_FIELD.get(sw_id)
+        if not field_name:
+            return
+        new_val = bool(event.value)
+        self._policy_store.update(**{field_name: new_val})
+        self._audit_policy_change(
+            field_name,
+            f"Control panel set {field_name}={new_val}",
+            {"field": field_name, "value": new_val},
+        )
+        if sw_id.startswith("ai-ctrl-kill-"):
+            self._sync_app_kill_ui()
         self._update_status(f"Updated policy: {field_name} = {new_val}")
 
     @on(Checkbox.Changed)

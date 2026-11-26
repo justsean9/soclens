@@ -66,8 +66,13 @@ def test_policy_defaults_and_atomic_persistence(tmp_path: Path, monkeypatch: pyt
     assert loaded_default.recorded_future_enabled is True
     assert loaded_default.watchlists_osint_enabled is True
     assert loaded_default.disabled_tools == []
-    assert loaded_default.max_tool_steps == 8
+    assert loaded_default.max_tool_steps == 50
     assert loaded_default.max_identical_tool_calls == 2
+    assert loaded_default.max_same_tool_failures == 10
+    assert loaded_default.ai_kill_switch_active is False
+    assert loaded_default.kill_switch_visible is True
+    assert loaded_default.kill_switch_label == "KILL AI"
+    assert loaded_default.kill_switch_hotkey == "f12"
 
     updated = default_store.update(
         background_triage_enabled=True,
@@ -116,7 +121,7 @@ def test_policy_resilience_clamping_and_unknown_field_rejection(tmp_path: Path) 
     loaded = store.load()
     assert loaded.background_triage_enabled is True
     assert loaded.cross_search_enabled is True
-    assert loaded.max_tool_steps == 50
+    assert loaded.max_tool_steps == 500
     assert loaded.max_identical_tool_calls == 1
 
     with pytest.raises(ValueError, match="Unknown AI policy field"):
@@ -3128,6 +3133,97 @@ def test_unified_research_target_enforces_recorded_future_disabled_policy(tmp_pa
         "include_osint": True,
     }
     assert audit.query(run_id="r-clamp", event_type="blocked_action")
+
+
+def test_policy_high_budget_bounds_kill_switch_fields_and_env_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.agent_policy import format_kill_switch_hotkey_badge
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.delenv("SOCLENS_AI_MAX_TOOL_STEPS", raising=False)
+
+    default_cfg = AIPolicyConfig()
+    assert default_cfg.max_tool_steps == 50
+    assert default_cfg.max_identical_tool_calls == 2
+    assert default_cfg.max_same_tool_failures == 10
+    assert default_cfg.ai_kill_switch_active is False
+    assert default_cfg.kill_switch_visible is True
+    assert default_cfg.kill_switch_confirm_engage is False
+    assert default_cfg.kill_switch_confirm_resume is False
+    assert default_cfg.kill_switch_persist_across_restarts is True
+    assert default_cfg.kill_switch_label == "KILL AI"
+    assert default_cfg.kill_switch_hotkey == "f12"
+
+    clamped_low = AIPolicyConfig(
+        max_tool_steps=0,
+        max_identical_tool_calls=-3,
+        max_same_tool_failures=0,
+        kill_switch_label="   ",
+        kill_switch_hotkey="bad-key",
+    )
+    assert clamped_low.max_tool_steps == 1
+    assert clamped_low.max_identical_tool_calls == 1
+    assert clamped_low.max_same_tool_failures == 1
+    assert clamped_low.kill_switch_label == "KILL AI"
+    assert clamped_low.kill_switch_hotkey == "f12"
+
+    clamped_high = AIPolicyConfig(
+        max_tool_steps=9999,
+        max_identical_tool_calls=999,
+        max_same_tool_failures=500,
+        kill_switch_label="  EMERGENCY   STOP   ALL   AI   AGENTS  ",
+        kill_switch_hotkey="CTRL+BACKSLASH",
+    )
+    assert clamped_high.max_tool_steps == 500
+    assert clamped_high.max_identical_tool_calls == 50
+    assert clamped_high.max_same_tool_failures == 100
+    assert len(clamped_high.kill_switch_label) <= 20
+    assert clamped_high.kill_switch_label == "EMERGENCY STOP ALL A"
+    assert clamped_high.kill_switch_hotkey == "ctrl+backslash"
+    assert format_kill_switch_hotkey_badge("f12") == "[F12]"
+    assert format_kill_switch_hotkey_badge("f11") == "[F11]"
+    assert format_kill_switch_hotkey_badge("ctrl+backslash") == "[Ctrl+\\]"
+    assert format_kill_switch_hotkey_badge("none") == ""
+
+    # SOCLENS_AI_MAX_TOOL_STEPS applies when policy file is absent or omits max_tool_steps
+    monkeypatch.setenv("SOCLENS_AI_MAX_TOOL_STEPS", "180")
+    store = AIPolicyStore(tmp_path / "ai_policy.json")
+    assert store.load().max_tool_steps == 180
+
+    store.path.write_text(json.dumps({"cross_search_enabled": True}), encoding="utf-8")
+    assert store.load().max_tool_steps == 180
+
+    # Explicit persisted max_tool_steps overrides SOCLENS_AI_MAX_TOOL_STEPS
+    store.update(max_tool_steps=75)
+    assert store.load().max_tool_steps == 75
+
+
+def test_evaluate_tool_permission_ai_kill_switch_fail_closed() -> None:
+    killed_policy = AIPolicyConfig(ai_kill_switch_active=True)
+    dec_allowed_tool = evaluate_tool_permission(
+        "splunk_search",
+        SOURCE_CATEGORY_SPLUNK,
+        True,
+        "full_investigation",
+        killed_policy,
+        arguments={"spl": "index=main | head 1"},
+    )
+    assert dec_allowed_tool.allowed is False
+    assert dec_allowed_tool.rule == "ai_kill_switch"
+
+    # Non-readonly / unregistered still fails closed on readonly_enforced first
+    dec_mut = evaluate_tool_permission(
+        "mitigate_threat",
+        SOURCE_CATEGORY_S1,
+        False,
+        "full_investigation",
+        killed_policy,
+    )
+    assert dec_mut.allowed is False
+    assert dec_mut.rule == "readonly_enforced"
+
 
 
 

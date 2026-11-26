@@ -741,10 +741,14 @@ class LocalLLMPane(BaseSocPane):
         eff_provider = provider if provider is not None else self._current_provider()
         eff_base_url = base_url if base_url is not None else self._current_base_url()
         eff_model = model if model is not None else self._resolve_model()
-        app_stop = getattr(self.app, "_stop_event", None)
-        eff_stop = stop_event
-        if eff_stop is None and isinstance(app_stop, threading.Event):
-            eff_stop = app_stop
+        app_make_stop = getattr(self.app, "_make_ai_stop_event", None)
+        if callable(app_make_stop):
+            eff_stop = app_make_stop(stop_event)
+        else:
+            app_stop = getattr(self.app, "_stop_event", None)
+            eff_stop = stop_event
+            if eff_stop is None and isinstance(app_stop, threading.Event):
+                eff_stop = app_stop
 
         verify_ssl: bool | str | None = None
         if not (os.environ.get("RF_LLM_VERIFY_SSL") or "").strip():
@@ -1049,6 +1053,15 @@ class LocalLLMPane(BaseSocPane):
         user_prompt = prompt_input.value.strip()
         sess = self._active_session
         session_id = sess.session_id
+
+        is_killed_fn = getattr(self.app, "is_ai_killed", None)
+        policy_store, _audit_store, _registry = self._resolve_ai_stores()
+        if (callable(is_killed_fn) and is_killed_fn()) or policy_store.load().ai_kill_switch_active:
+            msg = "AI Kill Switch is active — all AI actions are halted. Resume AI to send prompts."
+            self.set_status(msg)
+            self._write_transcript(Text(f"[Blocked: {msg}]", style="bold red"), session_id=session_id)
+            self.notify_user(msg, title="AI Halted", severity="warning")
+            return
         attached_ctx = sess.attached_context
         attached_title = sess.attached_title
         template_key = self._current_template()
@@ -1291,6 +1304,29 @@ class LocalLLMPane(BaseSocPane):
 
             self.run_on_ui(_clear_busy_exc)
             self.report_error("AI Chat", exc)
+
+    def halt_all_sessions(self) -> int:
+        """Immediately halt all active chat sessions across every open tab."""
+        stopped = 0
+        for sid, sess in self._sessions.items():
+            was_busy = sess.busy or (
+                sess.stop_event is not None and not sess.stop_event.is_set()
+            )
+            if sess.stop_event is not None and not sess.stop_event.is_set():
+                sess.stop_event.set()
+            if was_busy:
+                stopped += 1
+                self._write_transcript(
+                    Text("[HALTED BY AI KILL SWITCH]", style="bold red"),
+                    session_id=sid,
+                )
+            sess.busy = False
+        self._refresh_session_select()
+        if stopped:
+            self.set_status(f"Halted {stopped} active AI chat session(s) via Kill Switch.")
+        else:
+            self.set_status("AI Kill Switch active — all chat sessions halted.")
+        return stopped
 
     @on(Button.Pressed, "#llm-stop-btn")
     def handle_stop(self) -> None:

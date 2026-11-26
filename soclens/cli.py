@@ -3230,6 +3230,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable read-only SOC tools (Splunk, Splunk ES, SentinelOne, Recorded Future, OSINT) governed by AI Control Panel policy and audit log",
     )
     llm_chat.add_argument(
+        "--max-tool-steps",
+        type=int,
+        default=None,
+        help="Override maximum read-only tool steps for this chat run (1-500)",
+    )
+    llm_chat.add_argument(
         "--workspace",
         default=None,
         help="Workspace directory for AI policy and audit log storage",
@@ -3244,6 +3250,109 @@ def build_parser() -> argparse.ArgumentParser:
     llm_sigma.add_argument("--rule-id", default=None, help="Cached Sigma rule ID to look up and explain")
     llm_sigma.add_argument("--model", default=None, help="Model name (default: RF_LLM_MODEL)")
     llm_sigma.add_argument("--workspace", default=None, help="Workspace directory for cached Sigma rules")
+
+    llm_kill = llm_subparsers.add_parser(
+        "kill",
+        help="Engage, resume, or inspect the global AI Kill Switch",
+    )
+    kill_grp = llm_kill.add_mutually_exclusive_group()
+    kill_grp.add_argument(
+        "--on",
+        action="store_true",
+        help="Engage AI Kill Switch (halt all AI actions)",
+    )
+    kill_grp.add_argument(
+        "--off",
+        "--resume",
+        dest="off",
+        action="store_true",
+        help="Disengage AI Kill Switch (resume AI actions)",
+    )
+    kill_grp.add_argument(
+        "--status",
+        action="store_true",
+        help="Show current AI Kill Switch status",
+    )
+    llm_kill.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace directory for AI policy and audit log storage",
+    )
+    llm_kill.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="JSON output",
+    )
+
+    llm_policy = llm_subparsers.add_parser(
+        "policy",
+        help="View or configure AI tool limits and global kill button settings",
+    )
+    llm_policy.add_argument(
+        "--max-tool-steps",
+        type=int,
+        default=None,
+        help="Max read-only tool steps per run (1-500)",
+    )
+    llm_policy.add_argument(
+        "--max-identical-calls",
+        type=int,
+        default=None,
+        help="Max identical tool call retries (1-50)",
+    )
+    llm_policy.add_argument(
+        "--max-tool-failures",
+        type=int,
+        default=None,
+        help="Max failures per tool before halting (1-100)",
+    )
+    llm_policy.add_argument(
+        "--kill-visible",
+        choices=("true", "false"),
+        default=None,
+        help="Show global kill button in every dashboard",
+    )
+    llm_policy.add_argument(
+        "--kill-hotkey",
+        choices=("f12", "f11", "ctrl+backslash", "none"),
+        default=None,
+        help="Global kill switch hotkey",
+    )
+    llm_policy.add_argument(
+        "--kill-label",
+        default=None,
+        help="Global kill switch button label (max 20 chars)",
+    )
+    llm_policy.add_argument(
+        "--kill-confirm-engage",
+        choices=("true", "false"),
+        default=None,
+        help="Require confirmation before halting AI",
+    )
+    llm_policy.add_argument(
+        "--kill-confirm-resume",
+        choices=("true", "false"),
+        default=None,
+        help="Require confirmation before resuming AI",
+    )
+    llm_policy.add_argument(
+        "--kill-persist",
+        choices=("true", "false"),
+        default=None,
+        help="Keep AI halted across app restarts",
+    )
+    llm_policy.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace directory for AI policy and audit log storage",
+    )
+    llm_policy.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="JSON output",
+    )
 
     # 8. Per-user settings & profile management subcommands
     settings_parser = subparsers.add_parser(
@@ -5361,10 +5470,127 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
     subcmd = getattr(args, "llm_subcommand", None)
     if not subcmd:
         print(
-            "[-] Missing llm subcommand. Use: status, models, agents, chat, explain-sigma",
+            "[-] Missing llm subcommand. Use: status, models, agents, chat, explain-sigma, kill, policy",
             file=sys.stderr,
         )
         return 1
+
+    if subcmd == "kill":
+        from soclens.agent_audit import AuditEntry, AuditLogStore
+        from soclens.agent_policy import AIPolicyStore
+
+        cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
+        policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
+        audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl")
+
+        if getattr(args, "status", False):
+            policy = policy_store.load()
+            if use_json:
+                _emit_json(
+                    {
+                        "ai_kill_switch_active": policy.ai_kill_switch_active,
+                        "kill_switch_visible": policy.kill_switch_visible,
+                        "kill_switch_hotkey": policy.kill_switch_hotkey,
+                        "kill_switch_label": policy.kill_switch_label,
+                    }
+                )
+            else:
+                state = "HALTED (ACTIVE)" if policy.ai_kill_switch_active else "DISENGAGED (AI ACTIVE)"
+                print(f"AI Kill Switch: {state}")
+                print(
+                    f"Button Label: {policy.kill_switch_label} | Hotkey: {policy.kill_switch_hotkey} | "
+                    f"Visible: {policy.kill_switch_visible}"
+                )
+            return 0
+
+        engage = not bool(getattr(args, "off", False))
+        updated = policy_store.update(ai_kill_switch_active=engage)
+        audit_store.append(
+            AuditEntry(
+                entry_id="",
+                timestamp="",
+                run_id="cli-kill",
+                event_key="",
+                provider="cli",
+                mode="policy",
+                event_type="policy_change",
+                tool_name="ai_kill_switch",
+                allowed=not engage,
+                reason=(
+                    "CLI engaged AI Kill Switch"
+                    if engage
+                    else "CLI disengaged AI Kill Switch"
+                ),
+                payload={"ai_kill_switch_active": updated.ai_kill_switch_active},
+            )
+        )
+        if use_json:
+            _emit_json(
+                {
+                    "ai_kill_switch_active": updated.ai_kill_switch_active,
+                    "policy": updated.to_dict(),
+                }
+            )
+        else:
+            if updated.ai_kill_switch_active:
+                print("[!] AI Kill Switch ENGAGED — all AI actions are halted.")
+            else:
+                print("[+] AI Kill Switch DISENGAGED — AI actions resumed.")
+        return 0
+
+    if subcmd == "policy":
+        from soclens.agent_audit import AuditEntry, AuditLogStore
+        from soclens.agent_policy import AIPolicyStore
+
+        cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
+        policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
+        audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl")
+
+        updates: dict[str, Any] = {}
+        if getattr(args, "max_tool_steps", None) is not None:
+            updates["max_tool_steps"] = int(args.max_tool_steps)
+        if getattr(args, "max_identical_calls", None) is not None:
+            updates["max_identical_tool_calls"] = int(args.max_identical_calls)
+        if getattr(args, "max_tool_failures", None) is not None:
+            updates["max_same_tool_failures"] = int(args.max_tool_failures)
+        if getattr(args, "kill_visible", None) is not None:
+            updates["kill_switch_visible"] = args.kill_visible == "true"
+        if getattr(args, "kill_hotkey", None) is not None:
+            updates["kill_switch_hotkey"] = args.kill_hotkey
+        if getattr(args, "kill_label", None) is not None:
+            updates["kill_switch_label"] = args.kill_label
+        if getattr(args, "kill_confirm_engage", None) is not None:
+            updates["kill_switch_confirm_engage"] = args.kill_confirm_engage == "true"
+        if getattr(args, "kill_confirm_resume", None) is not None:
+            updates["kill_switch_confirm_resume"] = args.kill_confirm_resume == "true"
+        if getattr(args, "kill_persist", None) is not None:
+            updates["kill_switch_persist_across_restarts"] = args.kill_persist == "true"
+
+        if updates:
+            policy = policy_store.update(**updates)
+            audit_store.append(
+                AuditEntry(
+                    entry_id="",
+                    timestamp="",
+                    run_id="cli-policy",
+                    event_key="",
+                    provider="cli",
+                    mode="policy",
+                    event_type="policy_change",
+                    tool_name="ai_policy",
+                    allowed=None,
+                    reason=f"CLI updated AI policy fields: {', '.join(sorted(updates))}",
+                    payload=updates,
+                )
+            )
+        else:
+            policy = policy_store.load()
+
+        if use_json:
+            _emit_json(policy.to_dict())
+        else:
+            print(json.dumps(policy.to_dict(), indent=2, ensure_ascii=False))
+        return 0
 
     if subcmd == "agents":
         from soclens.config import get_local_llm_config
@@ -5428,6 +5654,17 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
             return 0
 
         if subcmd == "chat":
+            from soclens.agent_policy import AIPolicyStore
+
+            cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
+            policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
+            if policy_store.load().ai_kill_switch_active:
+                raise LocalLLMError(
+                    "AI Kill Switch is active; all AI actions are halted. "
+                    "Run 'soclens llm kill --off' to resume.",
+                    provider=llm.provider,
+                )
+
             prompt_text = (getattr(args, "prompt", None) or "").strip()
             file_arg = getattr(args, "file", None)
             file_content = ""
@@ -5524,6 +5761,7 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                     system_prompt_override=system_override,
                     enable_tools=True,
                     tool_event_callback=_cli_tool_cb,
+                    max_tool_steps_override=getattr(args, "max_tool_steps", None),
                 )
                 if chat_res.status == "error":
                     raise LocalLLMError(chat_res.error or "CLI agentic chat failed.", provider=llm.provider)
@@ -5587,6 +5825,16 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
             return 0
 
         if subcmd == "explain-sigma":
+            from soclens.agent_policy import AIPolicyStore
+
+            cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
+            if AIPolicyStore(path=cache_root / "ai_policy.json").load().ai_kill_switch_active:
+                raise LocalLLMError(
+                    "AI Kill Switch is active; all AI actions are halted. "
+                    "Run 'soclens llm kill --off' to resume.",
+                    provider=llm.provider,
+                )
+
             file_arg = getattr(args, "file", None)
             rule_id = getattr(args, "rule_id", None)
             if not file_arg and not rule_id:

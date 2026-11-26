@@ -45,7 +45,7 @@ Insikt Group & local Sigma rule browsing with live pySigma `savedsearches.conf` 
 ![Sigma Rules & Splunk Export](docs/screenshots/sigma-rules.svg)
 
 ### AI Analyst: Local LLM, Google Gemini API & Microsoft Copilot Multi-Agent (`F7`)
-Ollama, OpenAI-compatible, Google Gemini API (`GEMINI_API_KEY`), Enterprise M365 Copilot Chat, Copilot Studio (Direct Line / Token Endpoint), and Microsoft Security Copilot triage assistant with multiple concurrent chat windows, attached investigation context, and SPL generation (see [docs/MICROSOFT_COPILOT_GUIDE.md](docs/MICROSOFT_COPILOT_GUIDE.md)):
+Ollama, OpenAI-compatible, Google Gemini API (`GEMINI_API_KEY`, defaulting to `gemini-2.5-flash` when unset), Enterprise M365 Copilot Chat, Copilot Studio (Direct Line / Token Endpoint), and Microsoft Security Copilot triage assistant with multiple concurrent chat windows, attached investigation context, saved `Default AI Provider` / `Default AI / LLM Model` / `Custom LLM Base URL` settings in `[0] Settings` (`RF_LLM_PROVIDER`, `RF_LLM_MODEL`, `RF_LLM_BASE_URL`), configurable high-budget read-only tool navigation (default `50` steps, up to `500`), and a configurable global **AI Kill Switch (`KILL AI [F12]`)** visible across every dashboard to immediately halt all AI actions (see [docs/MICROSOFT_COPILOT_GUIDE.md](docs/MICROSOFT_COPILOT_GUIDE.md)):
 
 ![Local LLM SOC Copilot](docs/screenshots/local-llm.svg)
 
@@ -324,7 +324,7 @@ Available subcommands:
 - `validate`: Validate `savedsearches.conf` stanzas concurrently against Splunk REST API (with cross-platform `--background`)
 - `splunk`: Run ad-hoc Splunk SPL searches (`search`), list `indexes` / `saved-searches`, dispatch saved searches, and operate Splunk ES (`es notables`, `es update`, `es correlation-searches`, `es threat-intel`, `es enrich`, etc.)
 - `s1`: Query SentinelOne Management API v2.1 endpoints, threats, exclusions, and blocklist indicators
-- `llm`: Connect to Ollama or OpenAI-compatible local LLMs (`status`, `models`, `chat`, `explain-sigma`)
+- `llm`: Connect to Ollama, OpenAI-compatible, Gemini API, and Microsoft Copilot agents (`status`, `models`, `agents`, `chat` with `--tools` & `--max-tool-steps`, `explain-sigma`, `kill`, `policy`)
 - `settings`: Manage per-user saved credentials, tool settings, and named profiles (`path`, `show`, `set`, `unset`, `import-env`, `profiles`, `use`, `delete-profile`, `reset`)
 - `bundle`: Package the toolkit and runtime dependencies into an air-gapped ZIP bundle
 - `tui`: Launch the Textual TUI (`--admin` / `--view`, `--timezone`, `--image-viewer` / `--os-image-viewer`)

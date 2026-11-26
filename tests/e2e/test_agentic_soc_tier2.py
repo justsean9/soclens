@@ -341,7 +341,7 @@ def test_tier2_f3_policy_store_recovers_safely_from_missing_and_corrupt_json(
 
     corrupt_loaded = store.load()
     assert corrupt_loaded.background_triage_enabled is False
-    assert corrupt_loaded.max_tool_steps == 8
+    assert corrupt_loaded.max_tool_steps == 50
 
 
 # ==============================================================================

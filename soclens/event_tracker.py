@@ -1536,11 +1536,13 @@ class BackgroundTriageQueue:
             if self._stopped:
                 return []
 
-        if not self._policy_store.load().background_triage_enabled:
+        policy = self._policy_store.load()
+        if policy.ai_kill_switch_active or not policy.background_triage_enabled:
             return []
 
         with self._enqueue_lock:
-            if not self._policy_store.load().background_triage_enabled:
+            policy = self._policy_store.load()
+            if policy.ai_kill_switch_active or not policy.background_triage_enabled:
                 return []
             unseen = self._event_store.mark_seen_batch(events)
             if not unseen:
@@ -1629,6 +1631,12 @@ class BackgroundTriageQueue:
                     self._cond.wait()
             return True
 
+    def halt_and_drain(self, timeout: float = 0.2) -> int:
+        """Immediately halt active background triage and clear pending queued events."""
+        count = self.pending_count()
+        self.stop(timeout=timeout)
+        return count
+
     def stop(self, timeout: float = 5.0) -> None:
         """Signal shutdown, clear pending items, and wait up to ``timeout`` seconds."""
         with self._cond:
@@ -1691,7 +1699,8 @@ class BackgroundTriageQueue:
                     if stop_event.is_set() or stale_gen:
                         self._safe_unmark_seen(event.event_key)
                         return
-                    if not self._policy_store.load().background_triage_enabled:
+                    policy = self._policy_store.load()
+                    if policy.ai_kill_switch_active or not policy.background_triage_enabled:
                         self._safe_unmark_seen(event.event_key)
                         continue
 

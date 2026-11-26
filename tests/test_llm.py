@@ -1127,3 +1127,197 @@ def test_cli_llm_chat_with_tools_flag_json(
         assert out["run_id"]
         assert (tmp_path / ".soclens_cache" / "ai_audit.jsonl").is_file()
 
+
+def test_cli_llm_kill_policy_and_max_tool_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tests.e2e.agentic_mocks import MockAgenticLLMAndCopilotServer
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
+    # 1. Configure policy via `soclens llm policy`
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "soclens",
+            "llm",
+            "policy",
+            "--max-tool-steps",
+            "180",
+            "--max-identical-calls",
+            "4",
+            "--max-tool-failures",
+            "12",
+            "--kill-hotkey",
+            "f11",
+            "--kill-label",
+            "STOP AI",
+            "--workspace",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+    cli.main()
+    pol_out = json.loads(capsys.readouterr().out)
+    assert pol_out["max_tool_steps"] == 180
+    assert pol_out["max_identical_tool_calls"] == 4
+    assert pol_out["max_same_tool_failures"] == 12
+    assert pol_out["kill_switch_hotkey"] == "f11"
+    assert pol_out["kill_switch_label"] == "STOP AI"
+
+    # 2. Engage kill switch via `soclens llm kill --on`
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["soclens", "llm", "kill", "--on", "--workspace", str(tmp_path), "--json"],
+    )
+    cli.main()
+    kill_on_out = json.loads(capsys.readouterr().out)
+    assert kill_on_out["ai_kill_switch_active"] is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["soclens", "llm", "kill", "--status", "--workspace", str(tmp_path), "--json"],
+    )
+    cli.main()
+    status_out = json.loads(capsys.readouterr().out)
+    assert status_out["ai_kill_switch_active"] is True
+
+    # While killed, `llm chat` refuses cleanly with non-zero exit
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "soclens",
+                "llm",
+                "chat",
+                "--provider",
+                "openai",
+                "--prompt",
+                "Should fail when killed",
+                "--workspace",
+                str(tmp_path),
+            ],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+        assert exc_info.value.code != 0
+        capsys.readouterr()
+
+        # 3. Disengage kill switch -> `llm chat --tools --max-tool-steps 12` succeeds
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["soclens", "llm", "kill", "--off", "--workspace", str(tmp_path), "--json"],
+        )
+        cli.main()
+        kill_off_out = json.loads(capsys.readouterr().out)
+        assert kill_off_out["ai_kill_switch_active"] is False
+
+        server.queue_scripted_turn(provider="openai", content="Resumed CLI chat OK.")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "soclens",
+                "llm",
+                "chat",
+                "--provider",
+                "openai",
+                "--prompt",
+                "Resume check",
+                "--tools",
+                "--max-tool-steps",
+                "12",
+                "--workspace",
+                str(tmp_path),
+                "--json",
+            ],
+        )
+        cli.main()
+        resumed_out = json.loads(capsys.readouterr().out)
+        assert resumed_out["content"] == "Resumed CLI chat OK."
+
+
+def test_saved_llm_provider_model_base_url_and_gemini_default_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.config import DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL
+
+    for var in (
+        "RF_LLM_PROVIDER",
+        "RF_LLM_BASE_URL",
+        "RF_LLM_MODEL",
+        "GEMINI_MODEL",
+        "GEMINI_BASE_URL",
+        "SOCLENS_LLM_VISIBLE_PROVIDERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(settings_path))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
+    # 1. With llm_visible_providers="gemini" and NO model set, Gemini defaults to gemini-2.5-flash
+    save_profile_settings(
+        {"llm_visible_providers": "gemini", "gemini_api_key": "AIzaSySavedOnlyKey123456"},
+        settings_path=settings_path,
+    )
+    invalidate_settings_cache()
+    gemini_auto = get_local_llm_config()
+    assert gemini_auto.provider == "gemini"
+    assert gemini_auto.model == DEFAULT_GEMINI_MODEL
+    assert gemini_auto.base_url == DEFAULT_GEMINI_BASE_URL
+
+    # 2. Explicit saved rf_llm_provider, rf_llm_model, and rf_llm_base_url take effect cleanly
+    save_profile_settings(
+        {
+            "rf_llm_provider": "gemini",
+            "rf_llm_model": "gemini-2.5-pro",
+            "rf_llm_base_url": "https://gemini-proxy.corp.local/v1beta",
+        },
+        settings_path=settings_path,
+    )
+    invalidate_settings_cache()
+    gemini_saved = get_local_llm_config()
+    assert gemini_saved.provider == "gemini"
+    assert gemini_saved.model == "gemini-2.5-pro"
+    assert gemini_saved.base_url == "https://gemini-proxy.corp.local/v1beta"
+
+    # 3. An Ollama/OpenAI saved rf_llm_base_url must NOT override Gemini's default endpoint
+    save_profile_settings(
+        {
+            "rf_llm_provider": "ollama",
+            "rf_llm_model": "llama3.2:latest",
+            "rf_llm_base_url": "http://ollama.corp.local:11434",
+        },
+        settings_path=settings_path,
+    )
+    invalidate_settings_cache()
+    ollama_cfg = get_local_llm_config()
+    assert ollama_cfg.provider == "ollama"
+    assert ollama_cfg.model == "llama3.2:latest"
+    assert ollama_cfg.base_url == "http://ollama.corp.local:11434"
+
+    gemini_override = get_local_llm_config(provider="gemini")
+    assert gemini_override.provider == "gemini"
+    assert gemini_override.base_url == DEFAULT_GEMINI_BASE_URL
+
+    # 4. Explicit GEMINI_MODEL env var overrides DEFAULT_GEMINI_MODEL when rf_llm_model is cleared
+    save_profile_settings({"rf_llm_model": None}, settings_path=settings_path)
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.0-flash")
+    invalidate_settings_cache()
+    assert get_local_llm_config(provider="gemini").model == "gemini-2.0-flash"
+
+
+

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections.abc import Mapping, Sequence
@@ -22,10 +23,24 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from soclens.agent_audit import AuditEntry, AuditLogStore
+from soclens.agent_policy import (
+    DEFAULT_KILL_SWITCH_LABEL,
+    MAX_IDENTICAL_TOOL_CALLS,
+    MAX_SAME_TOOL_FAILURES,
+    MAX_TOOL_STEPS,
+    MIN_IDENTICAL_TOOL_CALLS,
+    MIN_SAME_TOOL_FAILURES,
+    MIN_TOOL_STEPS,
+    AIPolicyConfig,
+    AIPolicyStore,
+)
 from soclens.client import RecordedFutureClient
 from soclens.config import (
+    ConfigurationError,
     OSINTConfig,
     SecretStoreConfig,
+    _normalize_llm_provider,
     format_ssl_verify_status,
     get_osint_config,
     get_proxy_summary,
@@ -191,6 +206,9 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "rf_ignored_hashes": ("cat-workspace", "set-ignored-hashes"),
     "soclens_auto_approve": ("cat-workspace", "set-auto-approve"),
     "soclens_ascii_art_enabled": ("cat-workspace", "set-ascii-art-enabled"),
+    "rf_llm_provider": ("cat-workspace", "set-rf-llm-provider"),
+    "rf_llm_model": ("cat-workspace", "set-rf-llm-model"),
+    "rf_llm_base_url": ("cat-workspace", "set-rf-llm-base-url"),
     "rf_llm_api_key": ("cat-workspace", "set-rf-llm-api-key"),
     "gemini_api_key": ("cat-workspace", "set-gemini-api-key"),
     "llm_visible_providers": ("cat-workspace", "set-llm-visible-providers"),
@@ -315,6 +333,16 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
     ("rf_logo_overrides_file", "set-logo-overrides-file", "Optional JSON overrides path"),
     ("rf_ignored_hashes_file", "set-ignored-hashes-file", "Optional ignored_hashes.txt path"),
     ("rf_ignored_hashes", "set-ignored-hashes", "Comma-separated SHA-256 hashes"),
+    (
+        "rf_llm_model",
+        "set-rf-llm-model",
+        "e.g. gemini-2.5-flash, llama3.2, gpt-4o-mini (Gemini defaults to gemini-2.5-flash)",
+    ),
+    (
+        "rf_llm_base_url",
+        "set-rf-llm-base-url",
+        "Optional custom Ollama / OpenAI / Gemini base URL",
+    ),
     ("rf_llm_api_key", "set-rf-llm-api-key", "Optional API key for OpenAI-compatible local LLM"),
     ("gemini_api_key", "set-gemini-api-key", "Google AI Studio / Gemini API key (GEMINI_API_KEY)"),
     (
@@ -955,6 +983,44 @@ class SettingsPane(BaseSocPane):
                             id="set-ascii-art-enabled",
                             compact=True,
                         )
+                        yield Static(
+                            "AI Analyst & Investigation LLM Defaults",
+                            classes="section-label",
+                        )
+                        yield self._make_label("rf_llm_provider")
+                        yield Select(
+                            [
+                                ("Auto (First Visible Provider / Ollama)", ""),
+                                ("Google Gemini API", "gemini"),
+                                ("Ollama (Local)", "ollama"),
+                                ("OpenAI-Compatible (Local/Remote)", "openai"),
+                                ("Copilot Studio (Direct Line)", "copilot_directline"),
+                                ("Copilot Studio (Direct-to-Engine)", "copilot_studio"),
+                                ("M365 Copilot Chat", "m365_copilot"),
+                                ("Microsoft Security Copilot", "security_copilot"),
+                            ],
+                            allow_blank=False,
+                            value="",
+                            id="set-rf-llm-provider",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("rf_llm_model")
+                        yield Input(
+                            value="",
+                            placeholder="e.g. gemini-2.5-flash, llama3.2, gpt-4o-mini (Gemini defaults to gemini-2.5-flash)",
+                            id="set-rf-llm-model",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("rf_llm_base_url")
+                        yield Input(
+                            value="",
+                            placeholder="Optional custom Ollama / OpenAI / Gemini base URL",
+                            id="set-rf-llm-base-url",
+                            classes="setting-field",
+                            compact=True,
+                        )
                         yield self._make_label("rf_llm_api_key")
                         yield Input(
                             value="",
@@ -1096,6 +1162,100 @@ class SettingsPane(BaseSocPane):
                             placeholder='Optional JSON array: [{"name":"SOC Agent","provider":"copilot_directline","token_endpoint":"https://..."}]',
                             id="set-ms-copilot-agents-json",
                             classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            "AI Agent Tool Limits & Global Kill Switch",
+                            classes="section-label",
+                        )
+                        yield Static(
+                            f"Max Tool Steps per Run ({MIN_TOOL_STEPS}-{MAX_TOOL_STEPS}, default 50)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value="50",
+                            placeholder="50",
+                            id="set-ai-max-tool-steps",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            f"Max Identical Tool Calls ({MIN_IDENTICAL_TOOL_CALLS}-{MAX_IDENTICAL_TOOL_CALLS}, default 2)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value="2",
+                            placeholder="2",
+                            id="set-ai-max-identical-calls",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            f"Max Same-Tool Failures ({MIN_SAME_TOOL_FAILURES}-{MAX_SAME_TOOL_FAILURES}, default 10)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value="10",
+                            placeholder="10",
+                            id="set-ai-max-tool-failures",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            "Global Kill Switch Button Label (max 20 chars)",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Input(
+                            value=DEFAULT_KILL_SWITCH_LABEL,
+                            placeholder=DEFAULT_KILL_SWITCH_LABEL,
+                            id="set-ai-kill-label",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Static(
+                            "Global Kill Switch Hotkey",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Select(
+                            [
+                                ("F12 (Default)", "f12"),
+                                ("F11", "f11"),
+                                ("Ctrl+\\", "ctrl+backslash"),
+                                ("Disabled (Button Only)", "none"),
+                            ],
+                            allow_blank=False,
+                            value="f12",
+                            id="set-ai-kill-hotkey",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Show Global AI Kill Button in Every Dashboard",
+                            value=True,
+                            id="set-ai-kill-visible",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Require Confirmation Before Halting AI",
+                            value=False,
+                            id="set-ai-kill-confirm-engage",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Require Confirmation Before Resuming AI",
+                            value=False,
+                            id="set-ai-kill-confirm-resume",
+                            compact=True,
+                        )
+                        yield Checkbox(
+                            "Keep AI Halted Across App Restarts",
+                            value=True,
+                            id="set-ai-kill-persist",
                             compact=True,
                         )
 
@@ -1686,9 +1846,85 @@ class SettingsPane(BaseSocPane):
     def on_resize(self) -> None:
         self._update_responsive_layout()
 
+    def _resolve_ai_stores(self) -> tuple[AIPolicyStore, AuditLogStore]:
+        policy_store = getattr(self.app, "ai_policy_store", None)
+        audit_store = getattr(self.app, "ai_audit_store", None)
+        cache_dir = self.workspace_dir / ".soclens_cache"
+        if not isinstance(policy_store, AIPolicyStore):
+            policy_store = AIPolicyStore(path=cache_dir / "ai_policy.json")
+        if not isinstance(audit_store, AuditLogStore):
+            audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl")
+        return policy_store, audit_store
+
+    def _populate_ai_policy_controls(self) -> None:
+        policy_store, _audit = self._resolve_ai_stores()
+        policy = policy_store.load()
+        for wid, val_str in (
+            ("#set-ai-max-tool-steps", str(policy.max_tool_steps)),
+            ("#set-ai-max-identical-calls", str(policy.max_identical_tool_calls)),
+            ("#set-ai-max-tool-failures", str(policy.max_same_tool_failures)),
+            ("#set-ai-kill-label", policy.kill_switch_label),
+        ):
+            with contextlib.suppress(Exception):
+                inp = self.query_one(wid, Input)
+                with inp.prevent(Input.Changed):
+                    inp.value = val_str
+        with contextlib.suppress(Exception):
+            sel = self.query_one("#set-ai-kill-hotkey", Select)
+            with sel.prevent(Select.Changed):
+                sel.value = policy.kill_switch_hotkey
+        for wid, checked in (
+            ("#set-ai-kill-visible", policy.kill_switch_visible),
+            ("#set-ai-kill-confirm-engage", policy.kill_switch_confirm_engage),
+            ("#set-ai-kill-confirm-resume", policy.kill_switch_confirm_resume),
+            ("#set-ai-kill-persist", policy.kill_switch_persist_across_restarts),
+        ):
+            with contextlib.suppress(Exception):
+                cb = self.query_one(wid, Checkbox)
+                with cb.prevent(Checkbox.Changed):
+                    cb.value = bool(checked)
+
+    def _collect_ai_policy_updates(
+        self,
+    ) -> tuple[dict[str, Any], tuple[str, str, str] | None]:
+        updates: dict[str, Any] = {}
+        int_fields = (
+            ("max_tool_steps", "#set-ai-max-tool-steps", "AI Max Tool Steps"),
+            ("max_identical_tool_calls", "#set-ai-max-identical-calls", "AI Max Identical Calls"),
+            ("max_same_tool_failures", "#set-ai-max-tool-failures", "AI Max Same-Tool Failures"),
+        )
+        for field_name, wid, label in int_fields:
+            raw = self.query_one(wid, Input).value.strip()
+            if not raw:
+                return updates, ("llm_visible_providers", wid.lstrip("#"), f"{label}: enter a whole number.")
+            try:
+                updates[field_name] = int(raw)
+            except ValueError:
+                return updates, ("llm_visible_providers", wid.lstrip("#"), f"{label}: must be an integer.")
+        updates["kill_switch_label"] = self.query_one("#set-ai-kill-label", Input).value
+        updates["kill_switch_hotkey"] = str(self.query_one("#set-ai-kill-hotkey", Select).value or "f12")
+        updates["kill_switch_visible"] = bool(self.query_one("#set-ai-kill-visible", Checkbox).value)
+        updates["kill_switch_confirm_engage"] = bool(
+            self.query_one("#set-ai-kill-confirm-engage", Checkbox).value
+        )
+        updates["kill_switch_confirm_resume"] = bool(
+            self.query_one("#set-ai-kill-confirm-resume", Checkbox).value
+        )
+        updates["kill_switch_persist_across_restarts"] = bool(
+            self.query_one("#set-ai-kill-persist", Checkbox).value
+        )
+        return updates, None
+
     def on_tab_activated(self) -> None:
         self._update_responsive_layout()
         self._sync_secret_manager_field_modes()
+        if not self._dirty:
+            self._populating_form = True
+            try:
+                self._populate_ai_policy_controls()
+                self._baseline_values = self._snapshot_control_values()
+            finally:
+                self._populating_form = False
         self._refresh_storage_banners()
         self._refresh_secrets_summary()
         self._refresh_field_badges()
@@ -2095,7 +2331,20 @@ class SettingsPane(BaseSocPane):
             with ascii_cb.prevent(Checkbox.Changed):
                 ascii_cb.value = (ascii_val or "").strip().lower() in _SSL_VERIFY_TRUE
 
-            # Microsoft Copilot visible providers, auth mode & web grounding
+            # Default AI provider + Microsoft Copilot visible providers, auth mode & web grounding
+            raw_rf_llm_prov = (
+                self._form_value_for_display("rf_llm_provider", saved_map) or ""
+            ).strip()
+            norm_rf_llm_prov = ""
+            if raw_rf_llm_prov:
+                try:
+                    norm_rf_llm_prov = _normalize_llm_provider(raw_rf_llm_prov)
+                except ConfigurationError:
+                    norm_rf_llm_prov = ""
+            rf_llm_prov_sel = self.query_one("#set-rf-llm-provider", Select)
+            with rf_llm_prov_sel.prevent(Select.Changed):
+                rf_llm_prov_sel.value = norm_rf_llm_prov
+
             vis_prov = (
                 self._form_value_for_display("llm_visible_providers", saved_map) or ""
             ).strip()
@@ -2153,6 +2402,9 @@ class SettingsPane(BaseSocPane):
                     if osint_en_val is None
                     else osint_en_val.strip().lower() not in _SSL_VERIFY_FALSE
                 )
+
+            # AI Agent Tool Limits & Global Kill Switch
+            self._populate_ai_policy_controls()
 
             # Profiles dropdown & vault controls
             self._refresh_profile_selector(active_profile)
@@ -2574,7 +2826,15 @@ class SettingsPane(BaseSocPane):
             env_ascii = get_env_override_for_setting("soclens_ascii_art_enabled")
             values["soclens_ascii_art_enabled"] = "false" if env_ascii is not None else None
 
-        # Microsoft Copilot visible providers, auth mode & web grounding
+        # Default AI provider + Microsoft Copilot visible providers, auth mode & web grounding
+        rf_llm_prov_val = str(self.query_one("#set-rf-llm-provider", Select).value or "").strip().lower()
+        env_rf_llm_prov = get_env_override_for_setting("rf_llm_provider")
+        values["rf_llm_provider"] = (
+            rf_llm_prov_val
+            if (rf_llm_prov_val or "rf_llm_provider" in existing_saved or env_rf_llm_prov is not None)
+            else None
+        )
+
         vis_prov_val = str(self.query_one("#set-llm-visible-providers", Select).value or "").strip()
         env_vis_prov = get_env_override_for_setting("llm_visible_providers")
         values["llm_visible_providers"] = (
@@ -2694,6 +2954,14 @@ class SettingsPane(BaseSocPane):
             self.notify_user(err_msg, title="Invalid Setting", severity="error")
             return False
 
+        ai_updates, ai_err = self._collect_ai_policy_updates()
+        if ai_err is not None:
+            key, widget_id, message = ai_err
+            self._switch_to_widget("cat-workspace", widget_id, key=key)
+            self.set_status(f"Validation error: {message}")
+            self.notify_user(message, title="Invalid AI Setting", severity="error")
+            return False
+
         try:
             target_path = save_profile_settings(values, profile=active_profile, replace=False)
         except SettingsLockedError as exc:
@@ -2716,9 +2984,39 @@ class SettingsPane(BaseSocPane):
                     except Exception:
                         pass
 
+        policy_store, audit_store = self._resolve_ai_stores()
+        prev_policy = policy_store.load()
+        candidate_policy = AIPolicyConfig.from_dict({**prev_policy.to_dict(), **ai_updates})
+        if candidate_policy != prev_policy:
+            policy_store.update(**ai_updates)
+            audit_store.append(
+                AuditEntry(
+                    entry_id="",
+                    timestamp="",
+                    run_id="settings",
+                    event_key="",
+                    provider="tui",
+                    mode="policy",
+                    event_type="policy_change",
+                    tool_name="ai_policy",
+                    allowed=None,
+                    reason="Settings saved AI tool limits / kill switch configuration",
+                    payload=ai_updates,
+                )
+            )
+            self._populating_form = True
+            try:
+                self._populate_ai_policy_controls()
+            finally:
+                self._populating_form = False
+
         self._baseline_values = self._snapshot_control_values()
         self._dirty = False
         self._reload_app_after_session_update()
+        sync_kill_fn = getattr(self.app, "sync_ai_kill_switch_ui", None)
+        if callable(sync_kill_fn):
+            with contextlib.suppress(Exception):
+                sync_kill_fn()
         self._refresh_field_badges()
         self._refresh_secrets_summary(get_profile_settings(profile=active_profile))
         self._refresh_storage_banners()
@@ -2891,6 +3189,18 @@ class SettingsPane(BaseSocPane):
                 self.query_one("#set-osint-enabled", Checkbox).value = (
                     imported["osint_enabled"].strip().lower() not in _SSL_VERIFY_FALSE
                 )
+
+            if "rf_llm_provider" in imported:
+                raw_imp_prov = imported["rf_llm_provider"].strip()
+                norm_imp_prov = ""
+                if raw_imp_prov:
+                    try:
+                        norm_imp_prov = _normalize_llm_provider(raw_imp_prov)
+                    except ConfigurationError:
+                        norm_imp_prov = ""
+                rf_prov_sel = self.query_one("#set-rf-llm-provider", Select)
+                with rf_prov_sel.prevent(Select.Changed):
+                    rf_prov_sel.value = norm_imp_prov
 
             if "vault_secret_map" in imported:
                 self._populate_vault_dropdowns(

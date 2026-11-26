@@ -15,6 +15,9 @@ from typing import Any, Literal
 
 from soclens.agent_audit import AuditEntry, AuditLogStore, redact_sensitive_data
 from soclens.agent_policy import (
+    DEFAULT_MAX_SAME_TOOL_FAILURES,
+    MAX_TOOL_STEPS,
+    MIN_TOOL_STEPS,
     VALID_INVESTIGATION_MODES,
     AIPolicyConfig,
     AIPolicyStore,
@@ -43,7 +46,7 @@ _MAX_EVENT_CONTEXT_CHARS: int = 32_000
 _MAX_TOOL_RESULT_LLM_CHARS: int = 12_000
 _IDENTICAL_RESULT_STUB_MIN_CHARS: int = 512
 _MAX_MALFORMED_JSON_RETRIES: int = 2
-_MAX_SAME_TOOL_FAILURES: int = 4
+_MAX_SAME_TOOL_FAILURES: int = DEFAULT_MAX_SAME_TOOL_FAILURES
 
 _OPEN_TOOL_CALL_RE = re.compile(r"<tool_call\b[^>]*>", re.IGNORECASE)
 _CLOSE_TOOL_CALL_RE = re.compile(r"</tool_call\b[^>]*>", re.IGNORECASE)
@@ -479,6 +482,16 @@ class SocAgentOrchestrator:
         self._llm_client_factory = llm_client_factory
         self._active_clients_lock = threading.Lock()
         self._active_client_ids: dict[int, int] = {}
+        self._active_runs_lock = threading.Lock()
+        self._active_run_stops: dict[str, threading.Event] = {}
+
+    def halt_all_active_runs(self) -> int:
+        """Signal all currently active orchestrator runs to stop immediately."""
+        with self._active_runs_lock:
+            stops = list(self._active_run_stops.values())
+        for ev in stops:
+            ev.set()
+        return len(stops)
 
     def _audit(
         self,
@@ -725,7 +738,7 @@ class SocAgentOrchestrator:
     ) -> str:
         sections = [f"Investigation stopped safely by guardrail ({halt_reason})."]
         if observations:
-            sections.append("### Collected Read-Only Observations\n" + "\n".join(observations[-12:]))
+            sections.append("### Collected Read-Only Observations\n" + "\n".join(observations[-20:]))
         if blocked_actions:
             blocked_lines = [
                 f"- `{b.get('tool_name', '')}` ({b.get('rule', 'blocked')}): {b.get('reason', '')}"
@@ -990,6 +1003,38 @@ class SocAgentOrchestrator:
         )
         return prov_label
 
+    def _audit_kill_switch_cancelled(
+        self,
+        *,
+        run_id: str,
+        event_key: str,
+        mode: str,
+        target_provider: str | None,
+        auto_triggered: bool,
+        reason: str = "Halted by AI Kill Switch.",
+    ) -> str:
+        prov_label = target_provider or ""
+        if not prov_label:
+            try:
+                prov_label = get_local_llm_config().provider
+            except Exception:
+                prov_label = "unknown"
+        self._audit(
+            run_id=run_id,
+            event_key=event_key,
+            provider=prov_label,
+            mode=mode,
+            event_type="decision",
+            allowed=False,
+            reason=reason,
+            payload={
+                "status": "cancelled",
+                "rule": "ai_kill_switch",
+                "auto_triggered": auto_triggered,
+            },
+        )
+        return prov_label
+
     def investigate(
         self,
         *,
@@ -1002,6 +1047,7 @@ class SocAgentOrchestrator:
         auto_triggered: bool = False,
         model: str | None = None,
         stream_callback: Callable[[str], None] | None = None,
+        max_tool_steps_override: int | None = None,
     ) -> InvestigationResult:
         """Run a bounded, policy-gated read-only SOC investigation."""
         run_id = uuid.uuid4().hex
@@ -1054,6 +1100,28 @@ class SocAgentOrchestrator:
                 blocked_actions=[],
                 status="error",
                 error=err_msg,
+                timestamp=ts,
+            )
+
+        if self._policy_store.load().ai_kill_switch_active:
+            prov_label = self._audit_kill_switch_cancelled(
+                run_id=run_id,
+                event_key=event_key,
+                mode=mode,
+                target_provider=target_provider,
+                auto_triggered=auto_triggered,
+            )
+            return InvestigationResult(
+                run_id=run_id,
+                event_key=event_key,
+                mode=mode,
+                provider=prov_label,
+                model=model or "",
+                question=question,
+                answer_markdown="Halted by AI Kill Switch.",
+                tool_calls=[],
+                blocked_actions=[],
+                status="cancelled",
                 timestamp=ts,
             )
 
@@ -1122,6 +1190,7 @@ class SocAgentOrchestrator:
             prompt_builder=_build_prompts,
             pass_initial_conversation_id=False,
             tool_event_callback=None,
+            max_tool_steps_override=max_tool_steps_override,
         )
         return InvestigationResult(
             run_id=outcome.run_id,
@@ -1154,6 +1223,7 @@ class SocAgentOrchestrator:
         stop_event: threading.Event | None = None,
         stream_callback: Callable[[str], None] | None = None,
         tool_event_callback: Callable[[dict[str, Any]], None] | None = None,
+        max_tool_steps_override: int | None = None,
     ) -> ChatTurnResult:
         """Run a freeform chat turn with optional read-only SOC tool orchestration."""
         run_id = uuid.uuid4().hex
@@ -1205,6 +1275,26 @@ class SocAgentOrchestrator:
                 blocked_actions=[],
                 status="error",
                 error=err_msg,
+                timestamp=ts,
+            )
+
+        if self._policy_store.load().ai_kill_switch_active:
+            prov_label = self._audit_kill_switch_cancelled(
+                run_id=run_id,
+                event_key=event_key,
+                mode=mode,
+                target_provider=target_provider or _str_or_none(getattr(client, "provider", None)),
+                auto_triggered=False,
+            )
+            return ChatTurnResult(
+                run_id=run_id,
+                session_id=clean_session,
+                provider=prov_label,
+                model=model or "",
+                content="Halted by AI Kill Switch.",
+                tool_calls=[],
+                blocked_actions=[],
+                status="cancelled",
                 timestamp=ts,
             )
 
@@ -1267,6 +1357,7 @@ class SocAgentOrchestrator:
             prompt_builder=_build_prompts,
             pass_initial_conversation_id=True,
             tool_event_callback=tool_event_callback,
+            max_tool_steps_override=max_tool_steps_override,
         )
         return ChatTurnResult(
             run_id=outcome.run_id,
@@ -1304,6 +1395,7 @@ class SocAgentOrchestrator:
         ],
         pass_initial_conversation_id: bool = False,
         tool_event_callback: Callable[[dict[str, Any]], None] | None = None,
+        max_tool_steps_override: int | None = None,
     ) -> _AgentLoopOutcome:
         """Execute a bounded, policy-gated read-only LLM + tool loop."""
         def _emit_tool_event(ev: dict[str, Any]) -> None:
@@ -1316,6 +1408,16 @@ class SocAgentOrchestrator:
             except Exception:
                 pass
 
+        clamped_override: int | None = (
+            max(MIN_TOOL_STEPS, min(int(max_tool_steps_override), MAX_TOOL_STEPS))
+            if max_tool_steps_override is not None
+            else None
+        )
+        run_kill_stop = threading.Event()
+        with self._active_runs_lock:
+            self._active_run_stops[run_id] = run_kill_stop
+        eff_stop = self._combine_stop_events(stop_event, run_kill_stop)
+
         client: LocalLLMClient | None = None
         owns_client = False
         stop_restore: tuple[Any, Any] | None = None
@@ -1323,12 +1425,39 @@ class SocAgentOrchestrator:
         try:
             if supplied_client is not None:
                 client = supplied_client
+                is_real_or_stop = isinstance(
+                    getattr(client, "config", None), LocalLLMConfig
+                ) or isinstance(getattr(client, "_stop_event", None), threading.Event)
+                if is_real_or_stop and eff_stop is not None:
+                    owns_stop_event = bool(getattr(client, "_owns_stop_event", False))
+                    base_stop = (
+                        None
+                        if owns_stop_event
+                        else self._unwrap_base_stop_event(getattr(client, "_stop_event", None))
+                    )
+                    combined_client_stop = self._combine_stop_events(base_stop, eff_stop)
+                    transport = getattr(client, "_copilot_transport", None)
+                    prev_client_stop = (
+                        getattr(client, "_stop_event", None) if owns_stop_event else base_stop
+                    )
+                    prev_transport_stop = (
+                        getattr(transport, "_stop_event", None)
+                        if transport is not None
+                        else None
+                    )
+                    if not owns_stop_event and isinstance(prev_transport_stop, _CombinedStopEvent):
+                        prev_transport_stop = self._unwrap_base_stop_event(prev_transport_stop)
+                    stop_restore = (prev_client_stop, prev_transport_stop)
+                    if combined_client_stop is not None:
+                        client._stop_event = combined_client_stop
+                        if transport is not None:
+                            transport._stop_event = combined_client_stop
             else:
                 try:
                     client, owns_client, stop_restore, active_client_id = self._resolve_client(
                         target_provider=target_provider,
                         model=model,
-                        stop_event=stop_event,
+                        stop_event=eff_stop,
                     )
                 except Exception as exc:
                     prov_label = target_provider or "unknown"
@@ -1432,12 +1561,15 @@ class SocAgentOrchestrator:
             synthesis_requested = False
             ask_only_followup_done = False
 
-            max_turns = 2 if mode == "ask_only" else max(policy.max_tool_steps + 4, 6)
+            initial_max_steps = (
+                clamped_override if clamped_override is not None else policy.max_tool_steps
+            )
+            max_turns = 2 if mode == "ask_only" else max(initial_max_steps + 4, 6)
             turn_idx = 0
 
             while turn_idx < max_turns:
                 turn_idx += 1
-                if self._is_cancelled(stop_event, client):
+                if self._is_cancelled(eff_stop, client):
                     self._audit(
                         run_id=run_id,
                         event_key=event_key,
@@ -1451,15 +1583,28 @@ class SocAgentOrchestrator:
                     return _outcome(status="cancelled", answer_markdown="Investigation cancelled.")
 
                 policy = self._policy_store.load()
+                if policy.ai_kill_switch_active:
+                    self._audit_kill_switch_cancelled(
+                        run_id=run_id,
+                        event_key=event_key,
+                        mode=mode,
+                        target_provider=provider_name,
+                        auto_triggered=auto_triggered,
+                    )
+                    return _outcome(status="cancelled", answer_markdown="Halted by AI Kill Switch.")
+
+                effective_max_steps = (
+                    clamped_override if clamped_override is not None else policy.max_tool_steps
+                )
                 if mode == "full_investigation":
-                    max_turns = max(max_turns, policy.max_tool_steps + 4)
+                    max_turns = max(max_turns, effective_max_steps + 4)
 
                 tools_param: list[dict[str, Any]] | None = None
                 if (
                     mode == "full_investigation"
                     and not is_copilot
                     and not synthesis_requested
-                    and executed_steps < policy.max_tool_steps
+                    and executed_steps < effective_max_steps
                 ):
                     permitted_now = self._permitted_tools(policy)
                     schemas = self._registry.openai_schemas(
@@ -1492,7 +1637,7 @@ class SocAgentOrchestrator:
                 try:
                     resp = client.chat(send_messages, **chat_kwargs)
                 except Exception as exc:
-                    if self._is_cancelled(stop_event, client, exc):
+                    if self._is_cancelled(eff_stop, client, exc):
                         self._audit(
                             run_id=run_id,
                             event_key=event_key,
@@ -1521,7 +1666,7 @@ class SocAgentOrchestrator:
                     )
                     return _outcome(status="error", error=err_msg)
 
-                if self._is_cancelled(stop_event, client):
+                if self._is_cancelled(eff_stop, client):
                     self._audit(
                         run_id=run_id,
                         event_key=event_key,
@@ -1533,6 +1678,17 @@ class SocAgentOrchestrator:
                         payload={"status": "cancelled", "auto_triggered": auto_triggered},
                     )
                     return _outcome(status="cancelled", answer_markdown="Investigation cancelled.")
+
+                if self._policy_store.load().ai_kill_switch_active:
+                    self._audit_kill_switch_cancelled(
+                        run_id=run_id,
+                        event_key=event_key,
+                        mode=mode,
+                        target_provider=provider_name,
+                        auto_triggered=auto_triggered,
+                        reason="Halted by AI Kill Switch during LLM call.",
+                    )
+                    return _outcome(status="cancelled", answer_markdown="Halted by AI Kill Switch.")
 
                 resp_model_str = _str_or_none(resp.get("model"))
                 if resp_model_str is not None:
@@ -1646,7 +1802,7 @@ class SocAgentOrchestrator:
                         copilot_turn_messages = [followup_msg]
                         continue
 
-                    if self._is_cancelled(stop_event, client):
+                    if self._is_cancelled(eff_stop, client):
                         self._audit(
                             run_id=run_id,
                             event_key=event_key,
@@ -1681,7 +1837,7 @@ class SocAgentOrchestrator:
 
                 # --- Mode: full_investigation ---
                 if synthesis_requested:
-                    if self._is_cancelled(stop_event, client):
+                    if self._is_cancelled(eff_stop, client):
                         self._audit(
                             run_id=run_id,
                             event_key=event_key,
@@ -1746,7 +1902,7 @@ class SocAgentOrchestrator:
                         copilot_turn_messages = [parser_feedback]
                         continue
 
-                    if self._is_cancelled(stop_event, client):
+                    if self._is_cancelled(eff_stop, client):
                         self._audit(
                             run_id=run_id,
                             event_key=event_key,
@@ -1779,7 +1935,7 @@ class SocAgentOrchestrator:
                     return _outcome(status="completed", answer_markdown=fallback_answer)
 
                 if not parsed_calls:
-                    if self._is_cancelled(stop_event, client):
+                    if self._is_cancelled(eff_stop, client):
                         self._audit(
                             run_id=run_id,
                             event_key=event_key,
@@ -1830,7 +1986,7 @@ class SocAgentOrchestrator:
                 guardrail_halt_reason: str | None = None
 
                 for call in parsed_calls:
-                    if self._is_cancelled(stop_event, client):
+                    if self._is_cancelled(eff_stop, client):
                         self._audit(
                             run_id=run_id,
                             event_key=event_key,
@@ -1849,9 +2005,32 @@ class SocAgentOrchestrator:
                     call_source = str(call.get("source") or "native")
                     sig = _hash_signature(tool_name, tool_args)
 
-                    if executed_steps >= policy.max_tool_steps:
+                    if policy.ai_kill_switch_active:
+                        kill_reason = "AI Kill Switch is active; halted tool execution."
+                        _emit_tool_event(
+                            {
+                                "kind": "tool_blocked",
+                                "tool_name": tool_name,
+                                "rule": "ai_kill_switch",
+                                "reason": kill_reason,
+                            }
+                        )
+                        self._audit_kill_switch_cancelled(
+                            run_id=run_id,
+                            event_key=event_key,
+                            mode=mode,
+                            target_provider=provider_name,
+                            auto_triggered=auto_triggered,
+                            reason=kill_reason,
+                        )
+                        return _outcome(status="cancelled", answer_markdown="Halted by AI Kill Switch.")
+
+                    effective_max_steps = (
+                        clamped_override if clamped_override is not None else policy.max_tool_steps
+                    )
+                    if executed_steps >= effective_max_steps:
                         reason = (
-                            f"Maximum tool steps ({policy.max_tool_steps}) reached; "
+                            f"Maximum tool steps ({effective_max_steps}) reached; "
                             f"blocked '{tool_name}'."
                         )
                         self._audit(
@@ -1863,7 +2042,7 @@ class SocAgentOrchestrator:
                             tool_name=tool_name,
                             allowed=False,
                             reason=reason,
-                            payload={"rule": "max_tool_steps", "max_tool_steps": policy.max_tool_steps},
+                            payload={"rule": "max_tool_steps", "max_tool_steps": effective_max_steps},
                         )
                         blocked_actions.append(
                             {
@@ -1881,7 +2060,7 @@ class SocAgentOrchestrator:
                                 "reason": reason,
                             }
                         )
-                        guardrail_halt_reason = f"max_tool_steps ({policy.max_tool_steps}) reached"
+                        guardrail_halt_reason = f"max_tool_steps ({effective_max_steps}) reached"
                         err_json = json.dumps(
                             {"ok": False, "blocked": True, "rule": "max_tool_steps", "reason": reason},
                             ensure_ascii=False,
@@ -1962,8 +2141,8 @@ class SocAgentOrchestrator:
 
                     if (
                         exact_failure_counts.get(sig, 0) >= policy.max_identical_tool_calls
-                        or same_tool_failure_counts.get(tool_name, 0) >= _MAX_SAME_TOOL_FAILURES
-                        or same_tool_blocked_counts.get(tool_name, 0) >= _MAX_SAME_TOOL_FAILURES
+                        or same_tool_failure_counts.get(tool_name, 0) >= policy.max_same_tool_failures
+                        or same_tool_blocked_counts.get(tool_name, 0) >= policy.max_same_tool_failures
                     ):
                         reason = f"Per-tool failure cap reached for '{tool_name}'."
                         self._audit(
@@ -2273,7 +2452,7 @@ class SocAgentOrchestrator:
                         )
 
             # Fallback if loop reached max_turns without a final non-tool answer
-            if self._is_cancelled(stop_event, client):
+            if self._is_cancelled(eff_stop, client):
                 self._audit(
                     run_id=run_id,
                     event_key=event_key,
@@ -2307,6 +2486,8 @@ class SocAgentOrchestrator:
             )
             return _outcome(status="completed", answer_markdown=summary)
         finally:
+            with self._active_runs_lock:
+                self._active_run_stops.pop(run_id, None)
             if stop_restore is not None and client is not None:
                 prev_client_stop, prev_transport_stop = stop_restore
                 if getattr(client, "_owns_stop_event", False):

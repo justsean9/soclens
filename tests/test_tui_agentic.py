@@ -1084,3 +1084,430 @@ def test_freeform_chat_tools_toggle_fits_80x24_layout(tmp_path: Path) -> None:
     asyncio.run(_run())
 
 
+def test_kill_switch_visible_and_within_bounds_across_all_13_dashboards(
+    tmp_path: Path,
+) -> None:
+    from soclens.tui.app import ALL_TABS, USER_VIEW_TABS
+
+    app = create_app(
+        client=MagicMock(),
+        s1_client=MagicMock(),
+        dry_run=True,
+        view_mode="user",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await pilot.pause()
+            for tab_id in USER_VIEW_TABS:
+                app.activate_tab(tab_id)
+                await pilot.pause()
+                btn = app.query_one("#ai-kill-switch-btn", Button)
+                assert btn.display is True
+                assert btn.region.height == 1
+                assert btn.region.width > 0
+                assert btn.region.right <= 150
+                assert "KILL AI" in str(btn.label)
+
+            app.set_view_mode("admin")
+            await pilot.pause()
+            for width, height in ((80, 24), (150, 42)):
+                await pilot.resize_terminal(width, height)
+                await pilot.pause()
+                for tab_id in ALL_TABS:
+                    app.activate_tab(tab_id)
+                    await pilot.pause()
+                    btn = app.query_one("#ai-kill-switch-btn", Button)
+                    assert btn.display is True
+                    assert btn.region.height == 1
+                    assert btn.region.width > 0
+                    assert btn.region.right <= width
+
+    asyncio.run(_run())
+
+
+def test_kill_switch_one_click_and_f12_hotkey_halts_all_ai_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from soclens.agent_orchestrator import SocAgentOrchestrator
+    from soclens.agent_policy import SOURCE_CATEGORY_RF
+    from soclens.agent_tools import ReadOnlyToolRegistry, ReadOnlyToolSpec
+    from tests.e2e.agentic_mocks import MockAgenticLLMAndCopilotServer
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+
+    tool_entered = threading.Event()
+    tool_release = threading.Event()
+    reg = ReadOnlyToolRegistry()
+    reg.register(
+        ReadOnlyToolSpec(
+            name="rf_lookup_ioc",
+            source_category=SOURCE_CATEGORY_RF,
+            description="Read-only IOC lookup",
+            parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+            handler=lambda args: (
+                tool_entered.set(),
+                tool_release.wait(timeout=3.0),
+                {"val": args.get("value")},
+            )[-1],
+            readonly=True,
+        )
+    )
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+        app = create_app(
+            client=MagicMock(),
+            dry_run=True,
+            initial_tab="tab-llm",
+            workspace_dir=tmp_path,
+            no_secret_store=True,
+            preload_alerts=False,
+        )
+        app.ai_tool_registry = reg
+        app.ai_orchestrator = SocAgentOrchestrator(
+            registry=reg,
+            policy_store=app.ai_policy_store,
+            audit_store=app.ai_audit_store,
+        )
+
+        async def _run() -> None:
+            async with app.run_test(size=(150, 42)) as pilot:
+                await pilot.pause()
+                llm_pane = app.query_one(LocalLLMPane)
+
+                # Start an active freeform tool-using chat that blocks inside rf_lookup_ioc
+                server.queue_scripted_turn(
+                    provider="openai",
+                    tool_calls=[{"name": "rf_lookup_ioc", "arguments": {"value": "198.51.100.7"}}],
+                )
+                llm_pane.query_one("#llm-prompt", Input).value = "Check 198.51.100.7"
+                llm_pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                assert await asyncio.to_thread(tool_entered.wait, 3.0)
+
+                # 1-click global kill button halts everything immediately
+                await pilot.click("#ai-kill-switch-btn")
+                tool_release.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert app.is_ai_killed() is True
+                assert app.ai_policy_store.load().ai_kill_switch_active is True
+                assert "AI HALTED" in str(app.query_one("#ai-kill-switch-btn", Button).label)
+                assert "AI HALTED" in app.sub_title
+                assert "HALTED BY AI KILL SWITCH" in _richlog_text(
+                    llm_pane.query_one("#llm-transcript", RichLog)
+                )
+                assert any(
+                    e.event_type == "policy_change" and e.tool_name == "ai_kill_switch"
+                    for e in app.ai_audit_store.query(event_type="policy_change")
+                )
+
+                # While halted, freeform send, template send, and event AI buttons perform 0 LLM calls
+                reqs_before = len(server.chat_requests(provider="openai"))
+                llm_pane.query_one("#llm-prompt", Input).value = "Blocked prompt"
+                llm_pane.query_one("#llm-send-btn", Button).press()
+                await pilot.pause()
+                assert len(server.chat_requests(provider="openai")) == reqs_before
+
+                # Switch to RF Intel tab -> Ask AI & Full Investigate blocked cleanly
+                app.activate_tab("tab-rf-intel")
+                await pilot.pause()
+                await app.ensure_tab_mounted("tab-rf-intel")
+                await pilot.pause()
+                rf_pane = app.query_one(RFIntelPane)
+                rf_pane._datasets["alerts_v3"] = [_make_rf_alert("rf-ks-1")]
+                rf_pane._active_mode = "alerts_v3"
+                rf_pane._render_view(schedule_auto_enrich=False)
+                await pilot.pause()
+                await pilot.click("#rf-ai-panel #btn-ai-ask-event")
+                await pilot.pause()
+                assert not isinstance(app.screen, AskEventAIModal)
+                await pilot.click("#rf-ai-panel #btn-ai-full-investigate")
+                await pilot.pause()
+                assert len(server.chat_requests(provider="openai")) == reqs_before
+
+                # Click kill button again -> resumes AI actions
+                await pilot.click("#ai-kill-switch-btn")
+                await pilot.pause()
+                assert app.is_ai_killed() is False
+                assert "KILL AI" in str(app.query_one("#ai-kill-switch-btn", Button).label)
+
+                # Priority hotkey F12 works even while focused inside an Input widget
+                app.activate_tab("tab-llm")
+                await pilot.pause()
+                llm_pane.query_one("#llm-prompt", Input).focus()
+                await pilot.pause()
+                await pilot.press("f12")
+                await pilot.pause()
+                assert app.is_ai_killed() is True
+                await pilot.press("f12")
+                await pilot.pause()
+                assert app.is_ai_killed() is False
+
+        asyncio.run(_run())
+
+
+def test_kill_switch_configurability_confirm_modals_visibility_hotkey_and_restart(
+    tmp_path: Path,
+) -> None:
+    from soclens.tui.modals import ConfirmActionModal
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+    app.ai_policy_store.update(
+        kill_switch_label="STOP AI",
+        kill_switch_hotkey="f11",
+        kill_switch_visible=False,
+        kill_switch_confirm_engage=True,
+        kill_switch_confirm_resume=True,
+        kill_switch_persist_across_restarts=True,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await pilot.pause()
+            btn = app.query_one("#ai-kill-switch-btn", Button)
+            # Hidden when kill_switch_visible=False and not halted
+            assert btn.display is False
+            assert "STOP AI [F11]" in str(btn.label)
+
+            # Old F12 hotkey is ignored; configured F11 triggers ConfirmActionModal
+            await pilot.press("f12")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionModal)
+            assert app.is_ai_killed() is False
+
+            await pilot.press("f11")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            # Cancel keeps AI active
+            await pilot.click("#confirm-cancel-btn")
+            await pilot.pause()
+            assert app.is_ai_killed() is False
+
+            # Approve engages kill switch and forces button visible
+            await pilot.press("f11")
+            await pilot.pause()
+            await pilot.click("#confirm-approve-btn")
+            await pilot.pause()
+            assert app.is_ai_killed() is True
+            assert btn.display is True
+            assert "AI HALTED [F11]" in str(btn.label)
+
+            # Resume confirmation modal: cancel keeps halted, approve resumes
+            await pilot.click("#ai-kill-switch-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionModal)
+            await pilot.click("#confirm-cancel-btn")
+            await pilot.pause()
+            assert app.is_ai_killed() is True
+
+    asyncio.run(_run())
+
+    # Restart with persist=True -> still halted on startup
+    app_persist = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+    assert app_persist.is_ai_killed() is True
+
+    # Restart with persist=False -> auto-clears halted state on startup
+    app_persist.ai_policy_store.update(kill_switch_persist_across_restarts=False)
+    app_clear = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+    assert app_clear.is_ai_killed() is False
+
+
+def test_control_panel_tool_limits_presets_and_settings_sync(tmp_path: Path) -> None:
+    from soclens.tui.screens.settings import SettingsPane
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await pilot.pause()
+            llm_pane = app.query_one(LocalLLMPane)
+            llm_pane.query_one("#llm-subtabs", TabbedContent).active = "llm-tab-control-panel"
+            await pilot.pause()
+            ctrl = llm_pane.query_one(AIControlPanelWidget)
+
+            # Click 250 preset button
+            await pilot.click("#ai-ctrl-preset-steps-250")
+            await pilot.pause()
+            assert app.ai_policy_store.load().max_tool_steps == 250
+
+            # Enter custom limits and Save Limits
+            ctrl.query_one("#ai-ctrl-max-tool-steps", Input).value = "300"
+            ctrl.query_one("#ai-ctrl-max-identical-calls", Input).value = "6"
+            ctrl.query_one("#ai-ctrl-max-tool-failures", Input).value = "25"
+            await pilot.click("#ai-ctrl-save-limits")
+            await pilot.pause()
+
+            pol = app.ai_policy_store.load()
+            assert pol.max_tool_steps == 300
+            assert pol.max_identical_tool_calls == 6
+            assert pol.max_same_tool_failures == 25
+
+            # Switch to Settings -> Workspace & Defaults reflects 300/6/25
+            app.activate_tab("tab-settings")
+            await pilot.pause()
+            await app.ensure_tab_mounted("tab-settings")
+            await pilot.pause()
+            settings_pane = app.query_one(SettingsPane)
+            settings_pane.select_category("cat-workspace")
+            await pilot.pause()
+            assert settings_pane.query_one("#set-ai-max-tool-steps", Input).value == "300"
+            assert settings_pane.query_one("#set-ai-max-identical-calls", Input).value == "6"
+            assert settings_pane.query_one("#set-ai-max-tool-failures", Input).value == "25"
+
+            # Edit label and max steps in Settings and save -> syncs live to global bar
+            settings_pane.query_one("#set-ai-max-tool-steps", Input).value = "120"
+            settings_pane.query_one("#set-ai-kill-label", Input).value = "ABORT AI"
+            await pilot.click("#settings-save-btn")
+            await pilot.pause()
+            assert app.ai_policy_store.load().max_tool_steps == 120
+            assert "ABORT AI" in str(app.query_one("#ai-kill-switch-btn", Button).label)
+
+    asyncio.run(_run())
+
+
+def test_settings_llm_defaults_gemini_autofallback_and_active_session_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.config import DEFAULT_GEMINI_MODEL, get_local_llm_config
+    from soclens.settings import (
+        clear_session_overrides,
+        invalidate_settings_cache,
+        save_profile_settings,
+    )
+    from soclens.tui.screens.settings import SettingsPane
+
+    for var in (
+        "RF_LLM_PROVIDER",
+        "RF_LLM_BASE_URL",
+        "RF_LLM_MODEL",
+        "GEMINI_MODEL",
+        "GEMINI_BASE_URL",
+        "SOCLENS_LLM_VISIBLE_PROVIDERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(settings_path))
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    clear_session_overrides()
+    invalidate_settings_cache()
+
+    # Scenario A: User only selected "Google Gemini API Only" and saved API key (no RF_LLM_MODEL)
+    save_profile_settings(
+        {"llm_visible_providers": "gemini", "gemini_api_key": "AIzaSyTestKeyForTui123456"},
+        settings_path=settings_path,
+    )
+    invalidate_settings_cache()
+
+    app_gemini = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-settings",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+
+    async def _run_gemini_and_settings() -> None:
+        async with app_gemini.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            # Full Investigate / Ask AI client must auto-resolve Gemini default model instead of failing
+            llm_client = app_gemini._get_ai_llm_client()
+            assert llm_client.config.provider == "gemini"
+            assert llm_client.config.model == DEFAULT_GEMINI_MODEL
+
+            # Configure Default AI Provider + Model in Settings -> Save -> verifies persistence
+            settings_pane = app_gemini.query_one(SettingsPane)
+            settings_pane.select_category("cat-workspace")
+            await pilot.pause()
+            settings_pane.query_one("#set-rf-llm-provider", Select).value = "gemini"
+            settings_pane.query_one("#set-rf-llm-model", Input).value = "gemini-2.5-pro"
+            settings_pane.query_one("#set-rf-llm-base-url", Input).value = "https://proxy.example/v1beta"
+            await pilot.click("#settings-save-btn")
+            await pilot.pause()
+
+            invalidate_settings_cache()
+            cfg = get_local_llm_config()
+            assert cfg.provider == "gemini"
+            assert cfg.model == "gemini-2.5-pro"
+            assert cfg.base_url == "https://proxy.example/v1beta"
+
+    asyncio.run(_run_gemini_and_settings())
+
+    # Scenario B: Active session model in AI Analyst tab acts as fallback when no default model saved
+    clear_session_overrides()
+    save_profile_settings(
+        {
+            "llm_visible_providers": None,
+            "rf_llm_provider": None,
+            "rf_llm_model": None,
+            "rf_llm_base_url": None,
+        },
+        settings_path=settings_path,
+    )
+    invalidate_settings_cache()
+
+    app_ollama = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+
+    async def _run_session_fallback() -> None:
+        async with app_ollama.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            llm_pane = app_ollama.query_one(LocalLLMPane)
+            sess = llm_pane._active_session
+            sess.provider = "ollama"
+            sess.model = "qwen2.5-coder:7b"
+            client = app_ollama._get_ai_llm_client()
+            assert client.config.provider == "ollama"
+            assert client.config.model == "qwen2.5-coder:7b"
+
+    asyncio.run(_run_session_fallback())
+
+
+
+

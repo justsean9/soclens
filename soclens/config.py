@@ -101,6 +101,7 @@ class SentinelOneConfig:
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_M365_COPILOT_GRAPH_URL = "https://graph.microsoft.com/beta"
 DEFAULT_COPILOT_DIRECTLINE_URL = "https://directline.botframework.com/v3/directline"
 COPILOT_LLM_PROVIDERS: frozenset[str] = frozenset(
@@ -1326,7 +1327,8 @@ def get_local_llm_config(
     ``copilot_studio``, ``copilot_directline``, and ``security_copilot``.
     """
     resolved_visible = parse_visible_llm_providers(get_effective_setting("llm_visible_providers"))
-    raw_provider = provider if provider is not None else os.environ.get("RF_LLM_PROVIDER")
+    effective_provider_setting = get_effective_setting("rf_llm_provider")
+    raw_provider = provider if provider is not None else effective_provider_setting
     if not _clean_optional_str(raw_provider) and resolved_visible:
         resolved_provider = resolved_visible[0]
     else:
@@ -1356,13 +1358,14 @@ def get_local_llm_config(
     else:
         default_url = DEFAULT_OLLAMA_BASE_URL
 
+    effective_base_url = _clean_optional_str(get_effective_setting("rf_llm_base_url"))
     if resolved_provider in ("ollama", "openai"):
-        env_base_url = _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
+        env_base_url = effective_base_url
     elif resolved_provider == "gemini":
         env_base_url = _clean_optional_str(os.environ.get("GEMINI_BASE_URL")) or (
-            _clean_optional_str(os.environ.get("RF_LLM_BASE_URL"))
-            if _clean_optional_str(os.environ.get("RF_LLM_PROVIDER"))
-            and _normalize_llm_provider(os.environ.get("RF_LLM_PROVIDER")) == "gemini"
+            effective_base_url
+            if _clean_optional_str(effective_provider_setting)
+            and _normalize_llm_provider(effective_provider_setting) == "gemini"
             else None
         )
     else:
@@ -1381,8 +1384,9 @@ def get_local_llm_config(
         model
         if model is not None
         else (
-            os.environ.get("RF_LLM_MODEL")
+            get_effective_setting("rf_llm_model")
             or (os.environ.get("GEMINI_MODEL") if resolved_provider == "gemini" else None)
+            or (DEFAULT_GEMINI_MODEL if resolved_provider == "gemini" else None)
         )
     )
     if api_key is not None:

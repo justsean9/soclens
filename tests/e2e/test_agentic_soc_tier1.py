@@ -294,8 +294,12 @@ def test_tier1_f3_policy_config_safe_defaults() -> None:
     assert cfg.recorded_future_enabled is True
     assert cfg.watchlists_osint_enabled is True
     assert cfg.disabled_tools == []
-    assert cfg.max_tool_steps == 8
+    assert cfg.max_tool_steps == 50
     assert cfg.max_identical_tool_calls == 2
+    assert cfg.max_same_tool_failures == 10
+    assert cfg.ai_kill_switch_active is False
+    assert cfg.kill_switch_visible is True
+    assert cfg.kill_switch_hotkey == "f12"
 
 
 @pytest.mark.feature("F3")

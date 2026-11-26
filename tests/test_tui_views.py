@@ -334,6 +334,7 @@ def test_tui_view_mode_bar_layout_bounds_user_and_admin(tmp_path: Path) -> None:
                     assert bar.region.right <= w
                     for wid, wtype in (
                         ("#view-mode-label", Static),
+                        ("#ai-kill-switch-btn", Button),
                         ("#view-mode-select", Select),
                         ("#view-mode-toggle-btn", Button),
                     ):

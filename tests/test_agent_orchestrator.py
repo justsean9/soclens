@@ -2272,3 +2272,208 @@ def test_freeform_chat_attached_context_escaping_and_callback_redaction(
         assert "RF Alert #42" in first_user_msg
 
 
+def test_orchestrator_high_budget_full_navigation_and_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_workspace(tmp_path, monkeypatch)
+    reg = _build_test_registry()
+    policy_store = AIPolicyStore()
+    audit_store = AuditLogStore()
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+        # 1. Default max_tool_steps=50 permits 30 distinct navigation tool calls without hitting cap
+        for batch_start in (1, 11, 21):
+            server.queue_scripted_turn(
+                provider="openai",
+                tool_calls=[
+                    {
+                        "name": "rf_lookup_ioc",
+                        "arguments": {"entity_type": "ip", "value": f"10.0.1.{idx}"},
+                    }
+                    for idx in range(batch_start, batch_start + 10)
+                ],
+            )
+        server.queue_scripted_turn(
+            provider="openai",
+            content="Completed 30-step full navigation.",
+        )
+        orch = SocAgentOrchestrator(registry=reg, policy_store=policy_store, audit_store=audit_store)
+        res30 = orch.investigate(
+            event_key="rf_alert::nav-30",
+            event_context="Deep navigation event",
+            mode="full_investigation",
+        )
+        assert res30.status == "completed"
+        assert len(res30.tool_calls) == 30
+        assert res30.blocked_actions == []
+
+        # 2. >50 steps (e.g. 60 calls) works via max_tool_steps_override=65
+        for batch_start in range(1, 61, 15):
+            server.queue_scripted_turn(
+                provider="openai",
+                tool_calls=[
+                    {
+                        "name": "rf_lookup_ioc",
+                        "arguments": {"entity_type": "ip", "value": f"10.0.2.{idx}"},
+                    }
+                    for idx in range(batch_start, batch_start + 15)
+                ],
+            )
+        server.queue_scripted_turn(
+            provider="openai",
+            content="Completed 60-step chat navigation.",
+        )
+        res60 = orch.chat(
+            user_prompt="Navigate 60 IOCs",
+            session_id="nav-60",
+            enable_tools=True,
+            max_tool_steps_override=65,
+        )
+        assert res60.status == "completed"
+        assert len(res60.tool_calls) == 60
+        assert res60.blocked_actions == []
+
+
+def test_orchestrator_configurable_max_same_tool_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_workspace(tmp_path, monkeypatch)
+
+    def _always_fail(_args: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("Transient backend error")
+
+    reg = _build_test_registry(rf_handler=_always_fail)
+    policy_store = AIPolicyStore()
+    policy_store.update(
+        max_tool_steps=30,
+        max_identical_tool_calls=5,
+        max_same_tool_failures=6,
+    )
+    audit_store = AuditLogStore()
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+        # 7 distinct failing calls in 1 batch: first 6 execute and fail, 7th hits configurable cap 6
+        server.queue_scripted_turn(
+            provider="openai",
+            tool_calls=[
+                {"name": "rf_lookup_ioc", "arguments": {"entity_type": "ip", "value": f"192.0.2.{i}"}}
+                for i in range(1, 8)
+            ],
+        )
+        server.queue_scripted_turn(provider="openai", content="Synthesized after failure cap 6.")
+        orch = SocAgentOrchestrator(registry=reg, policy_store=policy_store, audit_store=audit_store)
+        res = orch.investigate(
+            event_key="rf_alert::fail-cap-6",
+            event_context="Failure cap configurability",
+            mode="full_investigation",
+        )
+        assert res.status == "completed"
+        assert len(res.tool_calls) == 6
+        assert any(b["rule"] == "per_tool_failure_cap" for b in res.blocked_actions)
+
+
+def test_orchestrator_kill_switch_prestart_and_midflight_halt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_workspace(tmp_path, monkeypatch)
+    reg = _build_test_registry()
+    policy_store = AIPolicyStore()
+    audit_store = AuditLogStore()
+    orch = SocAgentOrchestrator(registry=reg, policy_store=policy_store, audit_store=audit_store)
+
+    with MockAgenticLLMAndCopilotServer() as server:
+        server.configure_provider(monkeypatch, "openai")
+
+        # 1. Pre-start kill switch blocks both investigate() and chat() with 0 LLM requests
+        policy_store.update(ai_kill_switch_active=True)
+        res_inv = orch.investigate(
+            event_key="rf_alert::killed-pre",
+            event_context="Should not start",
+            mode="full_investigation",
+        )
+        res_chat = orch.chat(user_prompt="Should not start", session_id="killed-chat")
+        assert res_inv.status == "cancelled"
+        assert "Kill Switch" in res_inv.answer_markdown
+        assert res_chat.status == "cancelled"
+        assert "Kill Switch" in res_chat.content
+        assert len(server.chat_requests(provider="openai")) == 0
+        assert any(
+            e.event_type == "decision" and e.payload.get("rule") == "ai_kill_switch"
+            for e in audit_store.query(event_key="rf_alert::killed-pre")
+        )
+
+        # 2. Mid-flight policy flip during a 3-tool batch stops calls #2 and #3 immediately
+        policy_store.update(ai_kill_switch_active=False)
+        executed_vals: list[str] = []
+
+        def _kill_after_first(args: dict[str, Any]) -> dict[str, Any]:
+            executed_vals.append(str(args.get("value") or ""))
+            policy_store.update(ai_kill_switch_active=True)
+            return {"ok": True, "val": args.get("value")}
+
+        reg_mid = _build_test_registry(rf_handler=_kill_after_first)
+        orch_mid = SocAgentOrchestrator(
+            registry=reg_mid,
+            policy_store=policy_store,
+            audit_store=audit_store,
+        )
+        server.queue_scripted_turn(
+            provider="openai",
+            tool_calls=[
+                {"name": "rf_lookup_ioc", "arguments": {"entity_type": "ip", "value": f"198.51.100.{i}"}}
+                for i in (1, 2, 3)
+            ],
+        )
+        res_mid = orch_mid.investigate(
+            event_key="rf_alert::killed-mid",
+            event_context="Mid-batch kill",
+            mode="full_investigation",
+        )
+        assert res_mid.status == "cancelled"
+        assert executed_vals == ["198.51.100.1"]
+
+        # 3. halt_all_active_runs() aborts an in-flight threaded run cleanly
+        policy_store.update(ai_kill_switch_active=False)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _slow_tool(args: dict[str, Any]) -> dict[str, Any]:
+            entered.set()
+            release.wait(timeout=3.0)
+            return {"ok": True, "val": args.get("value")}
+
+        reg_halt = _build_test_registry(rf_handler=_slow_tool)
+        orch_halt = SocAgentOrchestrator(
+            registry=reg_halt,
+            policy_store=policy_store,
+            audit_store=audit_store,
+        )
+        server.queue_scripted_turn(
+            provider="openai",
+            tool_calls=[
+                {"name": "rf_lookup_ioc", "arguments": {"entity_type": "ip", "value": "203.0.113.1"}},
+                {"name": "rf_lookup_ioc", "arguments": {"entity_type": "ip", "value": "203.0.113.2"}},
+            ],
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(
+                orch_halt.investigate,
+                event_key="rf_alert::halt-active",
+                event_context="Active halt",
+                mode="full_investigation",
+            )
+            assert entered.wait(timeout=3.0)
+            signaled = orch_halt.halt_all_active_runs()
+            assert signaled == 1
+            release.set()
+            res_halt = fut.result(timeout=5.0)
+        assert res_halt.status == "cancelled"
+        assert len(res_halt.tool_calls) <= 1
+
+
+

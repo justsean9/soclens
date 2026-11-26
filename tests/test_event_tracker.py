@@ -1556,3 +1556,70 @@ def test_event_ai_store_relative_path_does_not_drift_on_chdir(
     assert (dir_a / "panels.json").is_file() is True
     assert (dir_b / "panels.json").exists() is False
     assert EventAIStore(dir_a / "panels.json").has_investigation(ev.event_key) is True
+
+
+def test_background_triage_kill_switch_refuses_enqueue_and_halt_and_drain(
+    tmp_path: Path,
+) -> None:
+    policy_store = AIPolicyStore(tmp_path / "ai_policy.json")
+    policy_store.update(background_triage_enabled=True, ai_kill_switch_active=True)
+    event_store = EventAIStore(tmp_path / "event_ai_panels.json")
+
+    ev1_started = threading.Event()
+
+    class _SlowOrch(_FakeOrchestrator):
+        def investigate(self, **kwargs: Any) -> InvestigationResult:
+            if kwargs["event_key"] == "rf_alert::ks-1":
+                ev1_started.set()
+                stop_ev = kwargs.get("stop_event")
+                if isinstance(stop_ev, threading.Event):
+                    stop_ev.wait(timeout=3.0)
+                    if stop_ev.is_set():
+                        return InvestigationResult(
+                            run_id="r-ks-cancel",
+                            event_key=kwargs["event_key"],
+                            mode=kwargs["mode"],
+                            provider="fake",
+                            model="fake",
+                            question=kwargs.get("question", ""),
+                            answer_markdown="Cancelled",
+                            tool_calls=[],
+                            blocked_actions=[],
+                            status="cancelled",
+                        )
+            return super().investigate(**kwargs)
+
+    orch = _SlowOrch()
+    queue = BackgroundTriageQueue(orch, policy_store, event_store)
+    queue.start()
+    try:
+        ev1 = normalize_unique_event("rf_alert", {"id": "ks-1", "title": "First"})
+        ev2 = normalize_unique_event("rf_alert", {"id": "ks-2", "title": "Second"})
+
+        # 1. Enqueue refused while ai_kill_switch_active=True
+        assert queue.enqueue_batch([ev1, ev2]) == []
+        assert event_store.is_seen(ev1.event_key) is False
+
+        # 2. Disengage kill switch -> enqueue runs ev1, halt_and_drain aborts ev1 and drains ev2
+        policy_store.update(ai_kill_switch_active=False)
+        assert len(queue.enqueue_batch([ev1, ev2])) == 2
+        assert ev1_started.wait(timeout=3.0)
+
+        policy_store.update(ai_kill_switch_active=True)
+        drained = queue.halt_and_drain(timeout=3.0)
+        assert drained >= 1
+        assert event_store.has_investigation(ev1.event_key) is False
+        assert event_store.has_investigation(ev2.event_key) is False
+        assert event_store.is_seen(ev1.event_key) is False
+        assert event_store.is_seen(ev2.event_key) is False
+
+        # 3. Resume + restart queue -> re-enqueuing processes cleanly
+        policy_store.update(ai_kill_switch_active=False)
+        queue.start()
+        requeued = queue.enqueue_batch([ev2])
+        assert [e.event_key for e in requeued] == [ev2.event_key]
+        assert queue.wait_idle(timeout=3.0) is True
+        assert event_store.has_investigation(ev2.event_key) is True
+    finally:
+        queue.stop()
+

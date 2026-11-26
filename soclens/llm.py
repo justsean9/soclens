@@ -1327,7 +1327,8 @@ class LocalLLMClient:
         selected_model = (model if model is not None else self.config.model or "").strip()
         if not selected_model:
             raise LocalLLMConfigError(
-                "No local LLM model specified. Set RF_LLM_MODEL or pass model explicitly."
+                "No local LLM model specified. Set 'Default AI / LLM Model' in Settings (0), "
+                "set RF_LLM_MODEL, or pass model explicitly."
             )
 
         eff_temp = self.config.temperature if temperature is None else float(temperature)

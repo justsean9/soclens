@@ -21,13 +21,22 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.content import Content
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Select, Static, TabbedContent, TabPane
 
-from soclens.agent_audit import AuditLogStore
-from soclens.agent_orchestrator import InvestigationResult, SocAgentOrchestrator
-from soclens.agent_policy import AIPolicyStore, InvestigationMode
+from soclens.agent_audit import AuditEntry, AuditLogStore
+from soclens.agent_orchestrator import (
+    InvestigationResult,
+    SocAgentOrchestrator,
+    _CombinedStopEvent,
+)
+from soclens.agent_policy import (
+    AIPolicyStore,
+    InvestigationMode,
+    format_kill_switch_hotkey_badge,
+)
 from soclens.agent_tools import ReadOnlyToolRegistry, build_default_readonly_registry
 from soclens.alert_cache import (
     CACHE_SOURCE_ES,
@@ -272,11 +281,27 @@ class SocLensApp(App[None]):
         background: #141b2a;
         border-bottom: none;
     }
+    #view-mode-bar.ai-halted {
+        background: #3b1219;
+    }
     #view-mode-label {
         width: 1fr;
         height: 1;
         color: #c5d4f0;
         text-style: bold;
+    }
+    #ai-kill-switch-btn {
+        min-width: 12;
+        max-width: 28;
+        width: auto;
+        height: 1;
+        margin-left: 1;
+    }
+    #ai-kill-switch-btn.ai-killed {
+        background: #d29922;
+        color: #0b0f17;
+        border-left: outer #f2cc60 !important;
+        border-right: outer #f2cc60 !important;
     }
     #view-mode-select {
         width: 18;
@@ -515,6 +540,19 @@ class SocLensApp(App[None]):
     .-compact-narrow .toolbar-row,
     .-compact-narrow .filter-bar {
         padding: 0;
+    }
+    .-compact-narrow #view-mode-bar {
+        padding: 0;
+    }
+    .-compact-narrow #view-mode-select {
+        width: 14;
+    }
+    .-compact-narrow #ai-kill-switch-btn {
+        min-width: 10;
+        max-width: 20;
+    }
+    .-compact-narrow #view-mode-toggle-btn {
+        min-width: 15;
     }
     .-compact-narrow #dash-toolbar,
     .-compact-narrow #sigma-toolbar,
@@ -1178,6 +1216,9 @@ class SocLensApp(App[None]):
         Binding("f8", "switch_tab('tab-splunk-search')", "Splunk Search"),
         Binding("f9", "switch_tab('tab-splunk-es')", "Splunk ES"),
         Binding("f10", "open_settings", "Settings", show=False),
+        Binding("f12", "ai_kill_hotkey('f12')", "Kill AI", priority=True),
+        Binding("f11", "ai_kill_hotkey('f11')", "Kill AI", priority=True),
+        Binding("ctrl+backslash", "ai_kill_hotkey('ctrl+backslash')", "Kill AI", priority=True),
         Binding("slash", "toggle_watchlist_filter", "Search/Filter", show=False),
         Binding("escape", "collapse_watchlist_filter", "Close Filter", show=False),
         Binding("q", "quit", "Quit"),
@@ -1293,6 +1334,14 @@ class SocLensApp(App[None]):
         self.ai_policy_store = AIPolicyStore(path=ai_cache_root / "ai_policy.json")
         self.ai_audit_store = AuditLogStore(path=ai_cache_root / "ai_audit.jsonl")
         self.event_ai_store = EventAIStore(path=ai_cache_root / "event_ai_panels.json")
+        self._ai_kill_event = threading.Event()
+        initial_ai_policy = self.ai_policy_store.load()
+        self._kill_switch_hotkey: str = initial_ai_policy.kill_switch_hotkey
+        if initial_ai_policy.ai_kill_switch_active:
+            if initial_ai_policy.kill_switch_persist_across_restarts:
+                self._ai_kill_event.set()
+            else:
+                self.ai_policy_store.update(ai_kill_switch_active=False)
         self._default_alert_cache = self.alert_cache
         self._default_api_access = self.api_access
         self._default_ai_policy_store = self.ai_policy_store
@@ -1355,6 +1404,8 @@ class SocLensApp(App[None]):
             parts.append("DRY-RUN MODE (Read-Only)")
         if self.get_effective_verify_ssl() is False:
             parts.append("INSECURE SSL (Proxy Mode)")
+        if hasattr(self, "_ai_kill_event") and self.is_ai_killed():
+            parts.append("AI HALTED")
         self.sub_title = " | ".join(parts)
 
     def _refresh_subtitle(self) -> None:
@@ -2039,6 +2090,7 @@ class SocLensApp(App[None]):
                 setattr(self, attr, None)
         self._update_subtitle()
         if self._ui_mounted:
+            self.sync_ai_kill_switch_ui()
             for pane in self.query(BaseSocPane):
                 try:
                     pane.on_settings_updated()
@@ -2072,6 +2124,7 @@ class SocLensApp(App[None]):
                     self.query_one(RFIntelPane).on_image_viewer_mode_changed()
         with self.batch_update():
             self._apply_view_mode_to_ui()
+            self.sync_ai_kill_switch_ui()
             self._sync_responsive_chrome()
             self._focus_main_tabs()
         self.background_triage_queue.start()
@@ -3099,11 +3152,43 @@ class SocLensApp(App[None]):
             return self.osint_client  # type: ignore[no-any-return]
         return OSINTClient()
 
+    def _make_ai_stop_event(
+        self, extra_stop: threading.Event | None = None
+    ) -> threading.Event:
+        """Return a stop event active when the app exits OR the AI kill switch is engaged."""
+        base = _CombinedStopEvent(self._stop_event, self._ai_kill_event)
+        if extra_stop is None:
+            return base
+        return _CombinedStopEvent(base, extra_stop)
+
+    def is_ai_killed(self) -> bool:
+        """Return True when the global AI Kill Switch is active."""
+        if self._ai_kill_event.is_set():
+            return True
+        return bool(self.ai_policy_store.load().ai_kill_switch_active)
+
     def _get_ai_llm_client(self) -> LocalLLMClient:
         if self.llm_client is not None:
             return self.llm_client  # type: ignore[no-any-return]
         cfg = get_local_llm_config()
-        client = LocalLLMClient(cfg, stop_event=self._stop_event)
+        if not cfg.model:
+            llm_pane = self._get_mounted_pane("tab-llm")
+            if llm_pane is not None:
+                session = getattr(llm_pane, "_active_session", None)
+                if callable(session):
+                    session = session()
+                sess_model = (
+                    (getattr(session, "model", None) or "").strip()
+                    if session is not None
+                    else ""
+                )
+                if (
+                    session is not None
+                    and getattr(session, "provider", None) == cfg.provider
+                    and sess_model
+                ):
+                    cfg = get_local_llm_config(provider=cfg.provider, model=sess_model)
+        client = LocalLLMClient(cfg, stop_event=self._make_ai_stop_event())
         client._ephemeral_for_orchestrator = True
         return client
 
@@ -3145,17 +3230,51 @@ class SocLensApp(App[None]):
         """Run an agentic SOC investigation in a background worker and update event panels."""
         if self._shutting_down or self._stop_event.is_set():
             return
+        if self.is_ai_killed():
+            cancelled_res = InvestigationResult(
+                run_id=uuid.uuid4().hex,
+                event_key=event.event_key,
+                mode=mode,
+                provider="policy",
+                model="",
+                question=question,
+                answer_markdown="Halted by AI Kill Switch.",
+                tool_calls=[],
+                blocked_actions=[],
+                status="cancelled",
+            )
+
+            def _notify_killed() -> None:
+                if self._shutting_down or not self._ui_mounted:
+                    return
+                self._refresh_mounted_event_ai_panels(event)
+                with contextlib.suppress(Exception):
+                    self.notify(
+                        "AI Kill Switch is active — investigation blocked.",
+                        title="AI Halted",
+                        severity="warning",
+                    )
+                if on_complete is not None:
+                    with contextlib.suppress(Exception):
+                        on_complete(cancelled_res)
+
+            if not self._shutting_down and self._ui_mounted:
+                with contextlib.suppress(Exception):
+                    self.call_from_thread(_notify_killed)
+            return
+
+        ai_stop = self._make_ai_stop_event()
         try:
             result = self.ai_orchestrator.investigate(
                 event_key=event.event_key,
                 event_context=event.to_llm_context(),
                 mode=mode,
                 question=question,
-                stop_event=self._stop_event,
+                stop_event=ai_stop,
                 auto_triggered=False,
             )
         except Exception as exc:
-            if self._shutting_down or self._stop_event.is_set():
+            if self._shutting_down or ai_stop.is_set():
                 return
             result = InvestigationResult(
                 run_id=uuid.uuid4().hex,
@@ -3220,6 +3339,12 @@ class SocLensApp(App[None]):
         yield Header(show_clock=True)
         with Horizontal(id="view-mode-bar"):
             yield Static("", id="view-mode-label", markup=False)
+            yield Button(
+                Content("KILL AI [F12]"),
+                id="ai-kill-switch-btn",
+                variant="error",
+                compact=True,
+            )
             yield Select(
                 list(_VIEW_MODE_OPTIONS),
                 allow_blank=False,
@@ -3236,10 +3361,221 @@ class SocLensApp(App[None]):
         yield _SocFooter()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide and disable Admin-only tab keybindings while in User View."""
+        """Hide and disable Admin-only tab keybindings while in User View, and inactive kill hotkeys."""
         if action == "switch_tab" and parameters:
             return self.is_tab_visible(str(parameters[0]))
+        if action == "ai_kill_hotkey" and parameters:
+            return True if str(parameters[0]) == self._kill_switch_hotkey else None
         return True
+
+    def sync_ai_kill_switch_ui(self) -> None:
+        """Sync the global AI Kill Switch bar button, event, subtitle, and control panel."""
+        policy = self.ai_policy_store.load()
+        self._kill_switch_hotkey = policy.kill_switch_hotkey
+        if policy.ai_kill_switch_active:
+            self._ai_kill_event.set()
+        else:
+            self._ai_kill_event.clear()
+
+        if self._ui_mounted and not self._shutting_down:
+            badge = format_kill_switch_hotkey_badge(policy.kill_switch_hotkey)
+            badge_suffix = f" {badge}" if badge else ""
+            with contextlib.suppress(Exception):
+                bar = self.query_one("#view-mode-bar", Horizontal)
+                bar.set_class(policy.ai_kill_switch_active, "ai-halted")
+            with contextlib.suppress(Exception):
+                btn = self.query_one("#ai-kill-switch-btn", Button)
+                btn.display = bool(policy.kill_switch_visible or policy.ai_kill_switch_active)
+                btn.set_class(policy.ai_kill_switch_active, "ai-killed")
+                if policy.ai_kill_switch_active:
+                    btn.label = Content(f"AI HALTED{badge_suffix}")
+                    btn.variant = "warning"
+                    btn.tooltip = "AI Kill Switch is ACTIVE — click or press hotkey to resume AI actions."
+                else:
+                    btn.label = Content(f"{policy.kill_switch_label}{badge_suffix}")
+                    btn.variant = "error"
+                    btn.tooltip = "Emergency AI Kill Switch — click or press hotkey to halt ALL AI actions immediately."
+            with contextlib.suppress(Exception):
+                from soclens.tui.ai_widgets import AIControlPanelWidget, AuditLogViewWidget
+
+                for ctrl in self.query(AIControlPanelWidget):
+                    ctrl.sync_from_store()
+                for audit_view in self.query(AuditLogViewWidget):
+                    audit_view.refresh_entries()
+            self.refresh_bindings()
+        self._update_subtitle()
+
+    def halt_all_ai_actions(
+        self,
+        *,
+        source: str = "tui",
+        reason: str = "Global AI Kill Switch activated",
+    ) -> dict[str, int]:
+        """Immediately halt all active and future AI actions across every dashboard."""
+        self._ai_kill_event.set()
+        self.ai_policy_store.update(ai_kill_switch_active=True)
+        orch_stopped = self.ai_orchestrator.halt_all_active_runs()
+        bg_stopped = self.background_triage_queue.halt_and_drain(timeout=0.1)
+        chat_stopped = 0
+        llm_pane = self._get_mounted_pane("tab-llm")
+        if isinstance(llm_pane, LocalLLMPane):
+            with contextlib.suppress(Exception):
+                chat_stopped = llm_pane.halt_all_sessions()
+        with contextlib.suppress(Exception):
+            self.ai_audit_store.append(
+                AuditEntry(
+                    entry_id="",
+                    timestamp="",
+                    run_id="kill-switch",
+                    event_key="",
+                    provider=source,
+                    mode="policy",
+                    event_type="policy_change",
+                    tool_name="ai_kill_switch",
+                    allowed=False,
+                    reason=reason,
+                    payload={
+                        "ai_kill_switch_active": True,
+                        "orchestrator_stopped": orch_stopped,
+                        "background_stopped": bg_stopped,
+                        "chat_stopped": chat_stopped,
+                    },
+                )
+            )
+        if self._ui_mounted and not self._shutting_down:
+            self.sync_ai_kill_switch_ui()
+            from soclens.tui.ai_widgets import EventAIPanelWidget
+
+            for pane in self.query(BaseSocPane):
+                with contextlib.suppress(Exception):
+                    for panel in pane.query(EventAIPanelWidget):
+                        if panel.current_event is not None:
+                            panel.set_event(
+                                panel.current_event,
+                                self.event_ai_store.get_panels(panel.current_event.event_key),
+                            )
+            with contextlib.suppress(Exception):
+                self.notify(
+                    "All AI actions, background triage, and chats halted.",
+                    title="AI KILL SWITCH ENGAGED",
+                    severity="error",
+                )
+        with contextlib.suppress(Exception):
+            self.record_log(
+                f"AI KILL SWITCH ENGAGED ({reason}): stopped {orch_stopped} orchestrator run(s), "
+                f"{bg_stopped} background triage item(s), {chat_stopped} chat session(s).",
+                level="WARNING",
+                source="ai",
+                logger_name="SocLensApp",
+            )
+        return {
+            "orchestrator": orch_stopped,
+            "background": bg_stopped,
+            "chat": chat_stopped,
+        }
+
+    def resume_ai_actions(
+        self,
+        *,
+        source: str = "tui",
+        reason: str = "Global AI Kill Switch resumed",
+    ) -> None:
+        """Disengage the global AI Kill Switch and re-enable AI actions."""
+        self._ai_kill_event.clear()
+        self.ai_policy_store.update(ai_kill_switch_active=False)
+        if not self._shutting_down:
+            with contextlib.suppress(Exception):
+                self.background_triage_queue.start()
+        with contextlib.suppress(Exception):
+            self.ai_audit_store.append(
+                AuditEntry(
+                    entry_id="",
+                    timestamp="",
+                    run_id="kill-switch",
+                    event_key="",
+                    provider=source,
+                    mode="policy",
+                    event_type="policy_change",
+                    tool_name="ai_kill_switch",
+                    allowed=True,
+                    reason=reason,
+                    payload={"ai_kill_switch_active": False},
+                )
+            )
+        if self._ui_mounted and not self._shutting_down:
+            self.sync_ai_kill_switch_ui()
+            with contextlib.suppress(Exception):
+                self.notify(
+                    "AI actions resumed (subject to AI Control Panel policy).",
+                    title="AI Kill Switch Disengaged",
+                    severity="information",
+                )
+        with contextlib.suppress(Exception):
+            self.record_log(
+                f"AI Kill Switch disengaged ({reason}).",
+                level="INFO",
+                source="ai",
+                logger_name="SocLensApp",
+            )
+
+    def action_ai_kill_hotkey(self, hotkey: str) -> None:
+        """Handle the configured global AI Kill Switch hotkey."""
+        policy = self.ai_policy_store.load()
+        if hotkey != policy.kill_switch_hotkey:
+            return
+        self.action_toggle_ai_kill_switch()
+
+    def action_toggle_ai_kill_switch(self) -> None:
+        """Engage or disengage the global AI Kill Switch (respecting confirmation settings)."""
+        policy = self.ai_policy_store.load()
+        if self.is_ai_killed():
+            if policy.kill_switch_confirm_resume:
+                from soclens.tui.modals import ConfirmActionModal
+
+                def _on_resume_confirm(approved: bool | None) -> None:
+                    if approved:
+                        self.resume_ai_actions()
+
+                self.push_screen(
+                    ConfirmActionModal(
+                        title="Resume AI Actions",
+                        message="Disengage the Global AI Kill Switch and re-enable AI actions?",
+                        details="AI investigations, chats, and background triage (if enabled) will become active again.",
+                        confirm_label="Resume AI",
+                        cancel_label="Keep Halted",
+                        warning_text="Verify you are ready for AI agents to run read-only queries again.",
+                    ),
+                    callback=_on_resume_confirm,
+                )
+            else:
+                self.resume_ai_actions()
+            return
+
+        if policy.kill_switch_confirm_engage:
+            from soclens.tui.modals import ConfirmActionModal
+
+            def _on_halt_confirm(approved: bool | None) -> None:
+                if approved:
+                    self.halt_all_ai_actions()
+
+            self.push_screen(
+                ConfirmActionModal(
+                    title="Engage Global AI Kill Switch",
+                    message="Halt ALL active AI investigations, background triage, and chats immediately?",
+                    details="All running AI tool calls and LLM streams will stop and new AI requests will be blocked until resumed.",
+                    confirm_label="HALT ALL AI",
+                    cancel_label="Cancel",
+                    warning_text="Emergency halt stops all AI agent activity across every dashboard.",
+                ),
+                callback=_on_halt_confirm,
+            )
+        else:
+            self.halt_all_ai_actions()
+
+    @on(Button.Pressed, "#ai-kill-switch-btn")
+    def handle_ai_kill_switch_pressed(self) -> None:
+        self.action_toggle_ai_kill_switch()
+        self._focus_main_tabs()
 
     def _apply_view_mode_to_ui(self) -> None:
         tabs = self.query_one("#main-tabs", TabbedContent)

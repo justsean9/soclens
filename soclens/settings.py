@@ -89,6 +89,15 @@ TSS_AUTH_MODES: tuple[str, ...] = ("password", "platform", "token")
 VAULT_AUTH_MODES: tuple[str, ...] = ("token", "approle")
 AKEYLESS_AUTH_MODES: tuple[str, ...] = ("access_key", "token")
 MS_COPILOT_AUTH_MODES: tuple[str, ...] = ("token", "az_cli")
+LLM_PROVIDER_CHOICES: tuple[str, ...] = (
+    "ollama",
+    "openai",
+    "gemini",
+    "m365_copilot",
+    "copilot_studio",
+    "copilot_directline",
+    "security_copilot",
+)
 SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
     "rf_api_token",
     "rf_sandbox_token",
@@ -466,6 +475,32 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         value_type="bool",
         default="false",
         description="Show animated ASCII art in Research (auto-hides after 10 seconds).",
+    ),
+    SettingSpec(
+        key="rf_llm_provider",
+        category="workspace",
+        label="Default AI Provider",
+        env_vars=("RF_LLM_PROVIDER",),
+        default="",
+        choices=LLM_PROVIDER_CHOICES,
+        description="Default AI provider for Ask AI, Full Investigate, Background Triage, and CLI (blank = auto from visible providers / ollama).",
+    ),
+    SettingSpec(
+        key="rf_llm_model",
+        category="workspace",
+        label="Default AI / LLM Model",
+        env_vars=("RF_LLM_MODEL",),
+        default="",
+        description="Default model for Ask AI, Full Investigate, Background Triage, and AI Analyst (e.g. gemini-2.5-flash, llama3.2, gpt-4o-mini). Gemini defaults to gemini-2.5-flash when blank.",
+    ),
+    SettingSpec(
+        key="rf_llm_base_url",
+        category="workspace",
+        label="Custom LLM Base URL",
+        env_vars=("RF_LLM_BASE_URL",),
+        value_type="url",
+        default="",
+        description="Optional custom base URL for Ollama, OpenAI-compatible, or Gemini API endpoints.",
     ),
     SettingSpec(
         key="rf_llm_api_key",
