@@ -65,6 +65,7 @@ from soclens.config import (
     classify_site_tier,
     ensure_utf8_console,
     format_image_viewer_status,
+    get_database_config,
     get_image_viewer_mode,
     get_local_llm_config,
     get_rf_sandbox_token,
@@ -92,6 +93,7 @@ from soclens.settings import (
 )
 from soclens.splunk import SplunkClient
 from soclens.splunk_es import SPLUNK_ES_APP, SplunkESClient
+from soclens.storage import StorageManager
 from soclens.tui.image_render import (
     get_recommended_image_viewer_mode,
     get_terminal_probe_result,
@@ -1320,20 +1322,39 @@ class SocLensApp(App[None]):
         self._initial_preload_started: bool = False
         self._image_prep_lock = threading.Lock()
         self._alert_refresh_timer: Any = None
+        ai_cache_root = self.workspace_dir / ".soclens_cache"
+        db_cfg = get_database_config(workspace_dir=self.workspace_dir)
+        self.storage = StorageManager(db_cfg)
+        try:
+            self.storage.ensure_schema()
+            self.storage.migrate_legacy_files(ai_cache_root)
+            self.storage.prune_expired(retention_days=db_cfg.retention_days)
+        except Exception:
+            pass
+        self._default_storage = self.storage
         self.alert_cache = AlertCacheStore(
-            cache_dir=self.workspace_dir / ".soclens_cache" / "alerts",
+            cache_dir=ai_cache_root / "alerts",
             load_on_init=False,
+            storage=self.storage,
         )
         self.api_access = ApiAccessRegistry(
-            state_path=self.workspace_dir / ".soclens_cache" / "api_access.json"
+            state_path=ai_cache_root / "api_access.json"
         )
         self.splunk_client: Any = getattr(self, "splunk_client", None)
         self.splunk_es_client: Any = getattr(self, "splunk_es_client", None)
         self.llm_client: Any = getattr(self, "llm_client", None)
-        ai_cache_root = self.workspace_dir / ".soclens_cache"
-        self.ai_policy_store = AIPolicyStore(path=ai_cache_root / "ai_policy.json")
-        self.ai_audit_store = AuditLogStore(path=ai_cache_root / "ai_audit.jsonl")
-        self.event_ai_store = EventAIStore(path=ai_cache_root / "event_ai_panels.json")
+        self.ai_policy_store = AIPolicyStore(
+            path=ai_cache_root / "ai_policy.json",
+            storage=self.storage,
+        )
+        self.ai_audit_store = AuditLogStore(
+            path=ai_cache_root / "ai_audit.jsonl",
+            storage=self.storage,
+        )
+        self.event_ai_store = EventAIStore(
+            path=ai_cache_root / "event_ai_panels.json",
+            storage=self.storage,
+        )
         self._ai_kill_event = threading.Event()
         initial_ai_policy = self.ai_policy_store.load()
         self._kill_switch_hotkey: str = initial_ai_policy.kill_switch_hotkey
@@ -1353,12 +1374,14 @@ class SocLensApp(App[None]):
             splunk_client=self._get_ai_splunk_client,
             splunk_es_client=self._get_ai_splunk_es_client,
             osint_client=self._get_ai_osint_client,
+            storage=lambda: self.storage,
         )
         self.ai_orchestrator = SocAgentOrchestrator(
             registry=self.ai_tool_registry,
             policy_store=self.ai_policy_store,
             audit_store=self.ai_audit_store,
             llm_client_factory=self._get_ai_llm_client,
+            storage=lambda: self.storage,
         )
         self.background_triage_queue = BackgroundTriageQueue(
             orchestrator=self.ai_orchestrator,
@@ -2073,8 +2096,24 @@ class SocLensApp(App[None]):
             old_workspace = self.workspace_dir
             new_workspace = get_workspace_dir()
             self.workspace_dir = new_workspace
+            new_cache_root = new_workspace / ".soclens_cache"
+            if self.storage is self._default_storage:
+                new_db_cfg = get_database_config(workspace_dir=new_workspace)
+                cur_cfg = self.storage.config
+                if (
+                    new_workspace != old_workspace
+                    or new_db_cfg.dsn != cur_cfg.dsn
+                    or new_db_cfg.backend != cur_cfg.backend
+                    or new_db_cfg.workstation_id != cur_cfg.workstation_id
+                    or new_db_cfg.profile_name != cur_cfg.profile_name
+                ):
+                    self.storage.rebind_config(new_db_cfg)
+                    try:
+                        self.storage.ensure_schema()
+                        self.storage.migrate_legacy_files(new_cache_root)
+                    except Exception:
+                        pass
             if new_workspace != old_workspace:
-                new_cache_root = new_workspace / ".soclens_cache"
                 if self.alert_cache is self._default_alert_cache:
                     self.alert_cache.rebind_cache_dir(new_cache_root / "alerts")
                 if self.api_access is self._default_api_access:

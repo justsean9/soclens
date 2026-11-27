@@ -107,6 +107,11 @@ _CONTROL_SWITCH_SPECS: tuple[tuple[str, str, str], ...] = (
         "watchlists_osint_enabled",
         "Watchlists & OSINT (Lookup & entity research)",
     ),
+    (
+        "ai-ctrl-local-db",
+        "local_db_enabled",
+        "Local DB History & Knowledge (Zero-API local search)",
+    ),
 )
 
 _SWITCH_ID_TO_FIELD: dict[str, str] = {

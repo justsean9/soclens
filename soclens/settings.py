@@ -114,6 +114,24 @@ SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
     "ms_copilot_token_endpoint",
     "ms_copilot_directline_secret",
 )
+DB_SECRET_MANAGED_SETTING_KEYS: tuple[str, ...] = (
+    "db_password",
+    "db_dsn",
+)
+DB_BACKEND_CHOICES: tuple[str, ...] = (
+    "sqlite",
+    "postgres",
+    "mysql",
+    "custom",
+)
+DB_SSL_MODE_CHOICES: tuple[str, ...] = (
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+)
 
 
 SETTING_CATEGORIES: tuple[tuple[str, str], ...] = (
@@ -125,6 +143,7 @@ SETTING_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("secret_manager", "Secret Manager (PAM / Vault)"),
     ("osint", "OSINT Enrichment APIs"),
     ("ai", "AI & LLM Settings"),
+    ("database", "Database & Storage"),
 )
 
 SETTING_SPECS: tuple[SettingSpec, ...] = (
@@ -968,6 +987,139 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         secret=True,
         description="Optional free GreyNoise Community API key (viz.greynoise.io).",
     ),
+    # Database & Storage
+    SettingSpec(
+        key="db_backend",
+        category="database",
+        label="Database Backend",
+        env_vars=("SOCLENS_DB_BACKEND",),
+        default="sqlite",
+        choices=DB_BACKEND_CHOICES,
+        description="Storage backend: sqlite (local default), postgres (pg8000), mysql (PyMySQL), or custom DSN.",
+    ),
+    SettingSpec(
+        key="db_sqlite_path",
+        category="database",
+        label="SQLite Database Path",
+        env_vars=("SOCLENS_DB_SQLITE_PATH",),
+        description="Optional override path for local SQLite DB (default <workspace>/.soclens_cache/soclens.db).",
+    ),
+    SettingSpec(
+        key="db_dsn",
+        category="database",
+        label="Database DSN / Connection URL",
+        env_vars=("SOCLENS_DB_DSN", "DATABASE_URL"),
+        secret=True,
+        mask_url_credentials=True,
+        description="Full SQLAlchemy DSN (optional for sqlite/postgres/mysql, required for custom).",
+    ),
+    SettingSpec(
+        key="db_host",
+        category="database",
+        label="Database Host",
+        env_vars=("SOCLENS_DB_HOST", "PGHOST", "MYSQL_HOST"),
+        description="Hostname or IP of external PostgreSQL/MySQL server.",
+    ),
+    SettingSpec(
+        key="db_port",
+        category="database",
+        label="Database Port",
+        env_vars=("SOCLENS_DB_PORT", "PGPORT", "MYSQL_PORT"),
+        value_type="int",
+        description="TCP port for external database (5432 for Postgres, 3306 for MySQL).",
+    ),
+    SettingSpec(
+        key="db_name",
+        category="database",
+        label="Database Name",
+        env_vars=("SOCLENS_DB_NAME", "PGDATABASE", "MYSQL_DATABASE"),
+        description="Target database/schema name on external server.",
+    ),
+    SettingSpec(
+        key="db_user",
+        category="database",
+        label="Database Username",
+        env_vars=("SOCLENS_DB_USER", "PGUSER", "MYSQL_USER"),
+        description="Database authentication username.",
+    ),
+    SettingSpec(
+        key="db_password",
+        category="database",
+        label="Database Password",
+        env_vars=("SOCLENS_DB_PASSWORD", "PGPASSWORD", "MYSQL_PASSWORD"),
+        secret=True,
+        description="Database password (never written to DB tables; Vault/env preferred).",
+    ),
+    SettingSpec(
+        key="db_ssl_mode",
+        category="database",
+        label="Database TLS/SSL Mode",
+        env_vars=("SOCLENS_DB_SSL_MODE",),
+        choices=DB_SSL_MODE_CHOICES,
+        description="TLS verification mode: disable, allow, prefer, require, verify-ca, or verify-full.",
+    ),
+    SettingSpec(
+        key="db_ssl_ca",
+        category="database",
+        label="Database TLS CA Bundle (PEM)",
+        env_vars=("SOCLENS_DB_SSL_CA", "PGSSLROOTCERT"),
+        description="Optional path to CA certificate PEM bundle for external DB TLS.",
+    ),
+    SettingSpec(
+        key="db_ssl_cert",
+        category="database",
+        label="Database TLS Client Cert (PEM)",
+        env_vars=("SOCLENS_DB_SSL_CERT", "PGSSLCERT"),
+        description="Optional path to client TLS certificate PEM for mutual TLS.",
+    ),
+    SettingSpec(
+        key="db_ssl_key",
+        category="database",
+        label="Database TLS Client Key (PEM)",
+        env_vars=("SOCLENS_DB_SSL_KEY", "PGSSLKEY"),
+        description="Optional path to client TLS private key PEM for mutual TLS.",
+    ),
+    SettingSpec(
+        key="db_pool_size",
+        category="database",
+        label="DB Connection Pool Size",
+        env_vars=("SOCLENS_DB_POOL_SIZE",),
+        value_type="int",
+        default="5",
+        description="SQLAlchemy base connection pool size (default 5).",
+    ),
+    SettingSpec(
+        key="db_max_overflow",
+        category="database",
+        label="DB Pool Max Overflow",
+        env_vars=("SOCLENS_DB_MAX_OVERFLOW",),
+        value_type="int",
+        default="10",
+        description="SQLAlchemy max overflow connections above pool size (default 10).",
+    ),
+    SettingSpec(
+        key="db_retention_days",
+        category="database",
+        label="History Retention Window (Days)",
+        env_vars=("SOCLENS_DB_RETENTION_DAYS",),
+        value_type="int",
+        default="90",
+        description="Rolling retention days for historical alerts, IOCs, panels & audit logs (default 90; 0 disables).",
+    ),
+    SettingSpec(
+        key="workstation_id",
+        category="database",
+        label="Workstation ID",
+        env_vars=("SOCLENS_WORKSTATION_ID",),
+        description="Optional workstation identifier scoping AI policy and workspace layouts.",
+    ),
+    SettingSpec(
+        key="analyst_id",
+        category="database",
+        label="Analyst ID",
+        env_vars=("SOCLENS_ANALYST_ID",),
+        description="Optional analyst identifier recorded on shared DB audit entries and learnings.",
+    ),
 )
 
 SETTING_SPECS_BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in SETTING_SPECS}
@@ -1489,7 +1641,10 @@ def save_profile_settings(
             else:
                 with _SESSION_LOCK:
                     skip_vault = (
-                        canon in SECRET_MANAGED_SETTING_KEYS
+                        (
+                            canon in SECRET_MANAGED_SETTING_KEYS
+                            or canon in DB_SECRET_MANAGED_SETTING_KEYS
+                        )
                         and canon in _VAULT_HYDRATED_KEYS
                         and cleaned == _SESSION_OVERRIDES.get(canon)
                     )
@@ -1649,7 +1804,7 @@ def parse_vault_secret_map(
         if not isinstance(raw_k, str) or not raw_k.strip():
             raise ValueError("vault_secret_map keys must be non-empty strings.")
         canon = resolve_setting_key(raw_k) or raw_k.strip()
-        if canon not in SECRET_MANAGED_SETTING_KEYS:
+        if canon not in SECRET_MANAGED_SETTING_KEYS and canon not in DB_SECRET_MANAGED_SETTING_KEYS:
             raise ValueError(f"Unsupported secret-managed setting key: {raw_k!r}.")
         if raw_v is None:
             if strict:
@@ -1675,7 +1830,7 @@ def serialize_vault_secret_map(mapping: Mapping[str, str | None]) -> str:
         if not isinstance(raw_k, str) or not raw_k.strip():
             raise ValueError("vault_secret_map keys must be non-empty strings.")
         canon = resolve_setting_key(raw_k) or raw_k.strip()
-        if canon not in SECRET_MANAGED_SETTING_KEYS:
+        if canon not in SECRET_MANAGED_SETTING_KEYS and canon not in DB_SECRET_MANAGED_SETTING_KEYS:
             raise ValueError(f"Unsupported secret-managed setting key: {raw_k!r}.")
         if raw_v is None:
             continue
@@ -1858,6 +2013,21 @@ def validate_settings_values(values: Mapping[str, str | None]) -> list[tuple[str
         elif spec.value_type == "bool":
             if cleaned.lower() not in (_TRUTHY_VALUES | _FALSY_VALUES):
                 errors.append((canon, f"{label}: must be true or false."))
+        elif spec.value_type == "int":
+            try:
+                int_val = int(cleaned)
+            except ValueError:
+                errors.append((canon, f"{label}: must be a whole integer."))
+                continue
+            if canon == "db_port" and not (1 <= int_val <= 65535):
+                errors.append((canon, f"{label}: must be between 1 and 65535."))
+            elif canon == "db_pool_size" and int_val < 1:
+                errors.append((canon, f"{label}: must be at least 1."))
+            elif canon in {"db_max_overflow", "db_retention_days"} and int_val < 0:
+                errors.append((canon, f"{label}: must be 0 or greater."))
+        elif canon == "db_dsn":
+            if "://" not in cleaned:
+                errors.append((canon, f"{label}: must be a valid SQLAlchemy DSN URL."))
         elif canon == "rf_tui_image_protocol":
             if cleaned.lower() not in {"auto", "kitty", "iterm2", "sixel", "halfblock"}:
                 errors.append(
@@ -2141,6 +2311,9 @@ def describe_all_settings(
 
 __all__ = [
     "APP_CONFIG_DIR_NAME",
+    "DB_BACKEND_CHOICES",
+    "DB_SECRET_MANAGED_SETTING_KEYS",
+    "DB_SSL_MODE_CHOICES",
     "DEFAULT_PROFILE",
     "ENCRYPTED_SETTINGS_CIPHER",
     "ENCRYPTED_SETTINGS_SCHEMA_VERSION",

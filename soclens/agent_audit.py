@@ -13,9 +13,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from soclens.config import get_workspace_dir
+
+if TYPE_CHECKING:
+    from soclens.storage import StorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -2622,6 +2625,8 @@ class AuditEntry:
     allowed: bool | None = None
     reason: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
+    analyst_id: str = ""
+    workstation_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert entry into a JSON-serializable dictionary."""
@@ -2637,6 +2642,8 @@ class AuditEntry:
             "allowed": self.allowed,
             "reason": self.reason,
             "payload": dict(self.payload),
+            "analyst_id": self.analyst_id,
+            "workstation_id": self.workstation_id,
         }
 
     @classmethod
@@ -2672,6 +2679,8 @@ class AuditEntry:
             allowed=allowed,
             reason=str(raw.get("reason") or ""),
             payload=payload,
+            analyst_id=str(raw.get("analyst_id") or ""),
+            workstation_id=str(raw.get("workstation_id") or ""),
         )
 
 
@@ -2680,27 +2689,44 @@ def _utc_now_iso() -> str:
 
 
 class AuditLogStore:
-    """Thread-safe, secret-redacting JSONL audit log store surviving restarts."""
+    """Thread-safe, secret-redacting audit log store (DB-backed or JSONL)."""
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | str | None = None,
+        *,
+        storage: StorageManager | None = None,
+    ) -> None:
+        self._has_explicit_path = path is not None
         if path is not None:
             self._path = Path(path).expanduser()
         else:
             self._path = get_workspace_dir() / ".soclens_cache" / "ai_audit.jsonl"
+        self._storage: StorageManager | None = storage
         self._lock = threading.RLock()
 
     @property
     def path(self) -> Path:
         return self._path
 
+    @property
+    def storage(self) -> StorageManager | None:
+        return self._storage
+
+    def rebind_storage(self, storage: StorageManager | None) -> None:
+        """Thread-safely rebind the backing ``StorageManager``."""
+        with self._lock:
+            self._storage = storage
+
     def rebind_path(self, path: Path | str) -> None:
         """Thread-safely rebind this audit store to a new JSONL file path."""
         new_path = Path(path).expanduser()
         with self._lock:
             self._path = new_path
+            self._has_explicit_path = True
 
     def append(self, entry: AuditEntry) -> AuditEntry:
-        """Redact sensitive values in ``entry`` and append it atomically to JSONL."""
+        """Redact sensitive values in ``entry`` and persist to storage and/or JSONL."""
         entry_id = entry.entry_id.strip() if isinstance(entry.entry_id, str) else ""
         if not entry_id:
             entry_id = uuid.uuid4().hex[:16]
@@ -2720,6 +2746,12 @@ class AuditLogStore:
         redacted_provider = str(redact_sensitive_data(entry.provider or ""))
         redacted_tool_name = str(redact_sensitive_data(entry.tool_name or ""))
 
+        stor = self._storage
+        raw_analyst = entry.analyst_id or (stor.config.analyst_id if stor is not None else "")
+        raw_ws = entry.workstation_id or (stor.config.workstation_id if stor is not None else "")
+        redacted_analyst = str(redact_sensitive_data(raw_analyst or ""))
+        redacted_ws = str(redact_sensitive_data(raw_ws or ""))
+
         sanitized = AuditEntry(
             entry_id=entry_id,
             timestamp=timestamp,
@@ -2732,7 +2764,14 @@ class AuditLogStore:
             allowed=entry.allowed,
             reason=redacted_reason,
             payload=redacted_payload,
+            analyst_id=redacted_analyst,
+            workstation_id=redacted_ws,
         )
+
+        if stor is not None:
+            sanitized = stor.append_audit_entry(sanitized)
+            if not self._has_explicit_path:
+                return sanitized
 
         line = json.dumps(sanitized.to_dict(), ensure_ascii=False, default=str) + "\n"
         with self._lock:
@@ -2754,6 +2793,15 @@ class AuditLogStore:
         """Query persisted audit log entries with optional filters."""
         if limit <= 0:
             return []
+        stor = self._storage
+        if stor is not None:
+            return stor.query_audit_entries(
+                event_key=event_key,
+                run_id=run_id,
+                event_type=event_type,
+                blocked_only=blocked_only,
+                limit=limit,
+            )
 
         with self._lock:
             if not self._path.is_file():

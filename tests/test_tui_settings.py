@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from textual.widgets import (
+    Button,
     Checkbox,
     Collapsible,
     ContentSwitcher,
@@ -331,3 +332,35 @@ def test_tui_settings_connection_tests_and_responsive_layout(tmp_path: Path) -> 
             assert isinstance(pane, SettingsPane)
 
     asyncio.run(_run_all())
+
+
+def test_tui_settings_database_category_and_test_db_connection(tmp_path: Path) -> None:
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-settings",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(SettingsPane)
+            pane.select_category("cat-database")
+            await pilot.pause()
+            assert (
+                pane.query_one("#settings-category-switcher", ContentSwitcher).current
+                == "cat-database"
+            )
+            pane.query_one("#set-db-sqlite-path", Input).value = str(tmp_path / "ui_test.db")
+            test_btn = pane.query_one("#settings-test-db-btn", Button)
+            test_btn.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.click("#settings-test-db-btn")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            db_status = str(pane.query_one("#settings-db-test-status", Static).content)
+            assert "DB OK (sqlite)" in db_status
+
+    asyncio.run(_run())

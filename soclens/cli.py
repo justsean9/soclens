@@ -5478,10 +5478,20 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
     if subcmd == "kill":
         from soclens.agent_audit import AuditEntry, AuditLogStore
         from soclens.agent_policy import AIPolicyStore
+        from soclens.config import get_database_config
+        from soclens.storage import StorageManager
 
-        cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
-        policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
-        audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl")
+        ws_dir = get_workspace_dir(getattr(args, "workspace", None))
+        cache_root = ws_dir / ".soclens_cache"
+        storage: StorageManager | None = None
+        try:
+            storage = StorageManager(get_database_config(workspace_dir=ws_dir))
+            storage.ensure_schema()
+            storage.migrate_legacy_files(cache_root)
+        except Exception:
+            storage = None
+        policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=storage)
+        audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=storage)
 
         if getattr(args, "status", False):
             policy = policy_store.load()
@@ -5541,10 +5551,20 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
     if subcmd == "policy":
         from soclens.agent_audit import AuditEntry, AuditLogStore
         from soclens.agent_policy import AIPolicyStore
+        from soclens.config import get_database_config
+        from soclens.storage import StorageManager
 
-        cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
-        policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
-        audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl")
+        ws_dir = get_workspace_dir(getattr(args, "workspace", None))
+        cache_root = ws_dir / ".soclens_cache"
+        storage_pol: StorageManager | None = None
+        try:
+            storage_pol = StorageManager(get_database_config(workspace_dir=ws_dir))
+            storage_pol.ensure_schema()
+            storage_pol.migrate_legacy_files(cache_root)
+        except Exception:
+            storage_pol = None
+        policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=storage_pol)
+        audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=storage_pol)
 
         updates: dict[str, Any] = {}
         if getattr(args, "max_tool_steps", None) is not None:
@@ -5686,12 +5706,22 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                 from soclens.agent_orchestrator import SocAgentOrchestrator
                 from soclens.agent_policy import AIPolicyStore
                 from soclens.agent_tools import build_default_readonly_registry
+                from soclens.config import get_database_config
                 from soclens.splunk import SplunkClient
                 from soclens.splunk_es import SPLUNK_ES_APP, SplunkESClient
+                from soclens.storage import StorageManager
 
-                cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
-                policy_store = AIPolicyStore(path=cache_root / "ai_policy.json")
-                audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl")
+                ws_dir = get_workspace_dir(getattr(args, "workspace", None))
+                cache_root = ws_dir / ".soclens_cache"
+                cli_storage: StorageManager | None = None
+                try:
+                    cli_storage = StorageManager(get_database_config(workspace_dir=ws_dir))
+                    cli_storage.ensure_schema()
+                    cli_storage.migrate_legacy_files(cache_root)
+                except Exception:
+                    cli_storage = None
+                policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=cli_storage)
+                audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=cli_storage)
 
                 def _cli_rf() -> RecordedFutureClient | None:
                     try:
@@ -5726,11 +5756,13 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                     splunk_client=_cli_splunk,
                     splunk_es_client=_cli_splunk_es,
                     osint_client=lambda: OSINTClient(),
+                    storage=cli_storage,
                 )
                 orchestrator = SocAgentOrchestrator(
                     registry=registry,
                     policy_store=policy_store,
                     audit_store=audit_store,
+                    storage=cli_storage,
                 )
 
                 def _cli_tool_cb(ev: dict[str, Any]) -> None:
@@ -5826,9 +5858,27 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
 
         if subcmd == "explain-sigma":
             from soclens.agent_policy import AIPolicyStore
+            from soclens.config import get_database_config
+            from soclens.storage import StorageManager
 
-            cache_root = get_workspace_dir(getattr(args, "workspace", None)) / ".soclens_cache"
-            if AIPolicyStore(path=cache_root / "ai_policy.json").load().ai_kill_switch_active:
+            ws_dir = get_workspace_dir(getattr(args, "workspace", None))
+            cache_root = ws_dir / ".soclens_cache"
+            explain_storage: StorageManager | None = None
+            try:
+                explain_storage = StorageManager(get_database_config(workspace_dir=ws_dir))
+                explain_storage.ensure_schema()
+                explain_storage.migrate_legacy_files(cache_root)
+            except Exception:
+                explain_storage = None
+            try:
+                kill_active = AIPolicyStore(
+                    path=cache_root / "ai_policy.json",
+                    storage=explain_storage,
+                ).load().ai_kill_switch_active
+            finally:
+                if explain_storage is not None:
+                    explain_storage.dispose()
+            if kill_active:
                 raise LocalLLMError(
                     "AI Kill Switch is active; all AI actions are halted. "
                     "Run 'soclens llm kill --off' to resume.",

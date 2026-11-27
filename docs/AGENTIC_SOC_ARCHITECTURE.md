@@ -8,7 +8,7 @@
 
 SOCLens (`v2.3.2`, Python 3.12+, Textual TUI) integrates Recorded Future, Splunk Core, Splunk Enterprise Security (ES), SentinelOne, and 16+ passive OSINT sources. Adding an LLM-controlled investigation layer introduces prompt-injection and runaway-automation risks if the agent can ever mutate security state, mint credentials, or execute arbitrary SPL side-effect commands. Accordingly, the architecture enforces five hard invariants:
 
-1. **Zero Write / Mutation / Token-Minting Surface:** Only explicitly allowlisted read-only wrappers (29 tools across 5 source categories) exist in `ReadOnlyToolRegistry`. All 81 verified mutating, remediation, exclusion, adaptive-response, user/RBAC, job-control, and token/secret-retrieving methods are excluded and rejected at registration.
+1. **Zero Write / Mutation / Token-Minting Surface:** Only explicitly allowlisted read-only wrappers (32 tools across 6 source categories, including 3 DB-first `local_db` tools) exist in `ReadOnlyToolRegistry`. All 81 verified mutating, remediation, exclusion, adaptive-response, user/RBAC, job-control, and token/secret-retrieving methods are excluded and rejected at registration.
 2. **Fail-Closed Policy Gating:** `evaluate_tool_permission()` denies by default on unknown tools, non-read-only specs, unknown modes, unknown source categories, `ask_only` mode, disabled `cross_search_enabled`, disabled per-source toggles, per-tool opt-outs (`disabled_tools`), and unsafe SPL queries.
 3. **Mode Separation (`ask_only` vs `full_investigation`):**
    - `ask_only`: Answers strictly from the attached event context; 0 external tools advertised or callable.
@@ -113,10 +113,11 @@ Inspection of `/home/ubuntu/.hermes/hermes-agent` yielded four battle-tested gov
   - Attaches `EventAIPanelWidget` to `RFIntelPane`, `SentinelOnePane`, and `SplunkESPane` detail views with right-click & toolbar triggers for `ask_only` (`AskEventAIModal`) and `full_investigation`, plus `AIControlPanelWidget` (tool limits, presets, kill switch configuration, toggles) and `AuditLogViewWidget` sub-tabs in `LocalLLMPane` (`tab-llm`), mirrored in Settings (`0`/`F10`).
   - Freeform Chat in `LocalLLMPane` (`template="freeform"`) routes through `SocAgentOrchestrator.chat()` with a per-session `Tools: ON / OFF` toggle (`#llm-tools-toggle-btn`), live transcript tool execution/block traces, AI Control Panel enforcement, and full JSONL audit logging. CLI `soclens llm chat --tools --max-tool-steps <N>`, `soclens llm kill`, and `soclens llm policy` expose the same read-only orchestration, limits, and kill switch in headless/terminal workflows.
 
-### 4.2 Read-Only Tool Surface (29 Tools)
+### 4.2 Read-Only Tool Surface (32 Tools)
 
 | Source Category (`AIPolicyConfig` Toggle) | Registered Tools |
 |---|---|
+| `local_db` (`local_db_enabled`) | `local_search_alerts_history`, `local_lookup_ioc_sightings`, `local_search_soc_knowledge` |
 | `splunk_search` (`splunk_search_enabled`) | `splunk_search` (SPL lexer-gated), `splunk_list_indexes`, `splunk_list_saved_searches` |
 | `splunk_es` (`splunk_es_enabled`) | `splunk_es_list_notables`, `splunk_es_get_finding`, `splunk_es_list_investigations`, `splunk_es_list_risk_events`, `splunk_es_lookup_asset`, `splunk_es_lookup_identity`, `splunk_es_query_threat_intel` |
 | `sentinelone` (`sentinelone_enabled`) | `s1_list_threats`, `s1_get_threat_timeline`, `s1_list_cloud_alerts`, `s1_list_agents`, `s1_get_agent`, `s1_list_activities`, `s1_dv_query` |

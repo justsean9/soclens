@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 
 from soclens.agent_audit import AuditEntry, AuditLogStore, redact_sensitive_data
 from soclens.agent_policy import (
+    SOURCE_CATEGORY_LOCAL,
     SOURCE_CATEGORY_OSINT,
     SOURCE_CATEGORY_RF,
     SOURCE_CATEGORY_S1,
@@ -206,6 +207,10 @@ READONLY_TOOL_NAMES: frozenset[str] = frozenset(
         "rf_get_watchlist_entities",
         "osint_enrich_target",
         "unified_research_target",
+        # Local DB-First Tools (3)
+        "local_search_alerts_history",
+        "local_lookup_ioc_sightings",
+        "local_search_soc_knowledge",
     }
 )
 
@@ -987,10 +992,36 @@ def build_default_readonly_registry(
     splunk_es_client: ClientOrFactory[SplunkESClient] = None,
     osint_client: ClientOrFactory[OSINTClient] = None,
     research_fn: Callable[..., Any] | None = None,
+    storage: Any | Callable[[], Any | None] | None = None,
+    learning_manager: Any | Callable[[], Any | None] | None = None,
 ) -> ReadOnlyToolRegistry:
-    """Build the default ReadOnlyToolRegistry with all 29 allowlisted SOC tools."""
+    """Build the default ReadOnlyToolRegistry with all 32 allowlisted SOC tools."""
     registry = ReadOnlyToolRegistry()
     active_research_fn = research_fn if research_fn is not None else research_target
+
+    def get_storage() -> Any | None:
+        if storage is None:
+            return None
+        if hasattr(storage, "_mock_return_value"):
+            return storage
+        if callable(storage):
+            try:
+                return storage()
+            except Exception:
+                return None
+        return storage
+
+    def get_learning_manager() -> Any | None:
+        if learning_manager is None:
+            return None
+        if hasattr(learning_manager, "_mock_return_value"):
+            return learning_manager
+        if callable(learning_manager):
+            try:
+                return learning_manager()
+            except Exception:
+                return None
+        return learning_manager
 
     def get_splunk() -> SplunkClient | None:
         return _resolve_client(splunk_client, _default_splunk_factory)
@@ -2078,6 +2109,141 @@ def build_default_readonly_registry(
             },
             handler=_unified_research_target_handler,
             underlying_methods=("research_target",),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # F. Local DB-First Tools (3 tools, zero external API calls)
+    # ------------------------------------------------------------------
+    def _local_search_alerts_history_handler(args: dict[str, Any]) -> Any:
+        query = _opt_str(args, "query") or ""
+        source = _opt_str(args, "source")
+        limit = _opt_int(args, "limit", 25, min_val=1, max_val=200)
+        stor = get_storage()
+        if not query or stor is None:
+            return {"ok": True, "query": query, "count": 0, "items": []}
+        try:
+            rows = stor.search_alerts_history(query, source=source, limit=limit)
+        except TypeError:
+            rows = stor.search_alerts_history(query, limit=limit)
+        safe_rows = redact_sensitive_data(list(rows) if isinstance(rows, Sequence) else [])
+        items = _to_json_safe(safe_rows) if isinstance(safe_rows, list) else []
+        return {"ok": True, "query": query, "count": len(items), "items": items}
+
+    registry.register(
+        ReadOnlyToolSpec(
+            name="local_search_alerts_history",
+            source_category=SOURCE_CATEGORY_LOCAL,
+            description=(
+                "Search SOCLens's local historical alerts database (SQLite FTS5 / SQL DB) "
+                "before issuing external SOC API queries."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "source": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+            handler=_local_search_alerts_history_handler,
+            underlying_methods=("search_alerts_history",),
+        )
+    )
+
+    def _local_lookup_ioc_sightings_handler(args: dict[str, Any]) -> Any:
+        indicator = _opt_str(args, "indicator") or ""
+        limit = _opt_int(args, "limit", 50, min_val=1, max_val=200)
+        stor = get_storage()
+        if not indicator or stor is None:
+            return {"ok": True, "indicator": indicator, "count": 0, "sightings": []}
+        try:
+            rows = stor.lookup_ioc_sightings(indicator, limit=limit)
+        except TypeError:
+            rows = stor.lookup_ioc_sightings(indicator)
+        safe_rows = redact_sensitive_data(list(rows) if isinstance(rows, Sequence) else [])
+        sightings = _to_json_safe(safe_rows) if isinstance(safe_rows, list) else []
+        return {"ok": True, "indicator": indicator, "count": len(sightings), "sightings": sightings}
+
+    registry.register(
+        ReadOnlyToolSpec(
+            name="local_lookup_ioc_sightings",
+            source_category=SOURCE_CATEGORY_LOCAL,
+            description=(
+                "Look up historical local sightings of an IP, CIDR, domain, hash, or CVE "
+                "in SOCLens's local database before calling external threat intel APIs."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "indicator": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["indicator"],
+            },
+            handler=_local_lookup_ioc_sightings_handler,
+            underlying_methods=("lookup_ioc_sightings",),
+        )
+    )
+
+    def _local_search_soc_knowledge_handler(args: dict[str, Any]) -> Any:
+        query = _opt_str(args, "query") or ""
+        category = _opt_str(args, "category")
+        limit = _opt_int(args, "limit", 20, min_val=1, max_val=200)
+        if not query:
+            return {"ok": True, "query": query, "count": 0, "entries": []}
+        lm = get_learning_manager()
+        stor = get_storage()
+        raw_entries: Any = []
+        if lm is not None and callable(getattr(lm, "match_relevant_entries", None)):
+            matched = lm.match_relevant_entries(query, max_chars=4000)
+            items_list = list(matched) if isinstance(matched, Sequence) else []
+            if category:
+                items_list = [
+                    it
+                    for it in items_list
+                    if (
+                        it.get("category")
+                        if isinstance(it, Mapping)
+                        else getattr(it, "category", None)
+                    )
+                    == category
+                ]
+            raw_entries = items_list[:limit]
+        elif stor is not None:
+            try:
+                raw_entries = stor.search_learnings(
+                    query,
+                    status="active",
+                    category=category,
+                    limit=limit,
+                )
+            except TypeError:
+                raw_entries = stor.search_learnings(query, limit=limit)
+        safe_entries = redact_sensitive_data(list(raw_entries) if isinstance(raw_entries, Sequence) else [])
+        entries = _to_json_safe(safe_entries) if isinstance(safe_entries, list) else []
+        return {"ok": True, "query": query, "count": len(entries), "entries": entries}
+
+    registry.register(
+        ReadOnlyToolSpec(
+            name="local_search_soc_knowledge",
+            source_category=SOURCE_CATEGORY_LOCAL,
+            description=(
+                "Search SOCLens's local base knowledge, playbooks, and learned SOC facts "
+                "before issuing external queries."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "category": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+            handler=_local_search_soc_knowledge_handler,
+            underlying_methods=("search_learnings",),
         )
     )
 

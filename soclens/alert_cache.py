@@ -12,9 +12,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from soclens.agent_audit import redact_sensitive_data
 from soclens.settings import get_setting_with_source
+
+if TYPE_CHECKING:
+    from soclens.storage import StorageManager
 
 logger = logging.getLogger("soclens.alert_cache")
 
@@ -163,6 +167,7 @@ class AlertCacheStore:
         cache_dir: Path | str | None = None,
         *,
         load_on_init: bool = True,
+        storage: StorageManager | None = None,
     ) -> None:
         # _lock protects only fast O(1) in-memory map/set accesses so UI reads never block on disk I/O.
         self._lock = threading.RLock()
@@ -172,12 +177,51 @@ class AlertCacheStore:
         self._prepared_images: dict[str, dict[str, Any]] = {}
         self._unavailable_images: set[str] = set()
         self._cache_dir: Path | None = Path(cache_dir) if cache_dir is not None else None
-        if self._cache_dir is not None and load_on_init:
-            self.load_from_disk()
+        self._storage: StorageManager | None = storage
+        if load_on_init:
+            if self._cache_dir is not None:
+                self.load_from_disk()
+            if self._storage is not None:
+                self._load_from_storage_sources()
 
     @property
     def cache_dir(self) -> Path | None:
         return self._cache_dir
+
+    @property
+    def storage(self) -> StorageManager | None:
+        return self._storage
+
+    def rebind_storage(self, storage: StorageManager | None) -> None:
+        """Thread-safely rebind the backing ``StorageManager`` and warm missing snapshots."""
+        with self._io_lock:
+            with self._lock:
+                self._storage = storage
+        if storage is not None:
+            self._load_from_storage_sources()
+
+    def _load_from_storage_sources(self) -> list[str]:
+        stor = self._storage
+        if stor is None:
+            return []
+        loaded: list[str] = []
+        for source in ALL_CACHE_SOURCES:
+            try:
+                snap = stor.get_alerts_snapshot(source)
+            except Exception as exc:
+                logger.debug("Skipping unreadable storage alert snapshot %s: %s", source, exc)
+                continue
+            if not isinstance(snap, Mapping):
+                continue
+            entry = AlertCacheEntry.from_payload(snap, fallback_source=source)
+            if entry is None:
+                continue
+            with self._lock:
+                existing = self._entries.get(source)
+                if existing is None or entry.fetched_at > existing.fetched_at:
+                    self._entries[source] = entry
+                    loaded.append(source)
+        return loaded
 
     def rebind_cache_dir(self, cache_dir: Path | str | None) -> None:
         """Thread-safely rebind cache directory and reset stale in-memory entries."""
@@ -191,6 +235,8 @@ class AlertCacheStore:
                 self._unavailable_images.clear()
         if new_dir is not None and new_dir.is_dir():
             self.load_from_disk_sources()
+        if self._storage is not None:
+            self._load_from_storage_sources()
 
     def _entry_path(self, source: str) -> Path | None:
         if self._cache_dir is None:
@@ -343,18 +389,42 @@ class AlertCacheStore:
                     _atomic_write_text(path, serialized, prefix=f".{source}.")
             except Exception as exc:
                 logger.debug("Failed to persist alert cache %s: %s", source, exc)
+        stor = self._storage
+        if stor is not None:
+            try:
+                stor.upsert_alerts_snapshot(
+                    updated_entry.source,
+                    updated_entry.items,
+                    timeframe=updated_entry.timeframe,
+                    meta=updated_entry.meta,
+                    fetched_at=updated_entry.fetched_at,
+                )
+            except Exception as exc:
+                logger.debug("Failed to persist alert cache %s to storage: %s", source, exc)
         return True
 
     def _persist_entry(self, entry: AlertCacheEntry) -> None:
         path = self._entry_path(entry.source)
-        if path is None:
-            return
-        try:
-            serialized = json.dumps(entry.to_payload(), ensure_ascii=False, default=str)
-            with self._io_lock:
-                _atomic_write_text(path, serialized, prefix=f".{entry.source}.")
-        except Exception as exc:
-            logger.debug("Failed to persist alert cache %s: %s", entry.source, exc)
+        if path is not None:
+            try:
+                safe_payload = redact_sensitive_data(entry.to_payload())
+                serialized = json.dumps(safe_payload, ensure_ascii=False, default=str)
+                with self._io_lock:
+                    _atomic_write_text(path, serialized, prefix=f".{entry.source}.")
+            except Exception as exc:
+                logger.debug("Failed to persist alert cache %s: %s", entry.source, exc)
+        stor = self._storage
+        if stor is not None:
+            try:
+                stor.upsert_alerts_snapshot(
+                    entry.source,
+                    entry.items,
+                    timeframe=entry.timeframe,
+                    meta=entry.meta,
+                    fetched_at=entry.fetched_at,
+                )
+            except Exception as exc:
+                logger.debug("Failed to persist alert cache %s to storage: %s", entry.source, exc)
 
     def is_stale(self, source: str, max_age_seconds: float) -> bool:
         """Return True if ``source`` is absent or older than ``max_age_seconds``."""
@@ -484,3 +554,9 @@ class AlertCacheStore:
                         unavail_path.unlink()
                     except OSError:
                         pass
+        stor = self._storage
+        if stor is not None:
+            try:
+                stor.delete_alerts_snapshot(source)
+            except Exception as exc:
+                logger.debug("Failed to clear alert snapshot %s from storage: %s", source, exc)

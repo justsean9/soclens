@@ -16,13 +16,16 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from soclens.agent_audit import redact_sensitive_data
 from soclens.agent_orchestrator import InvestigationResult
 from soclens.agent_policy import VALID_INVESTIGATION_MODES, AIPolicyStore, InvestigationMode
 from soclens.config import get_workspace_dir
 from soclens.splunk_es import extract_finding_tenant
+
+if TYPE_CHECKING:
+    from soclens.storage import StorageManager
 
 logger = logging.getLogger("soclens.event_tracker")
 
@@ -1156,23 +1159,40 @@ def _atomic_write_text(path: Path, text: str, *, prefix: str) -> None:
 class EventAIStore:
     """Thread-safe, atomically persisted store for unique events and attached AI panels."""
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | str | None = None,
+        *,
+        storage: StorageManager | None = None,
+    ) -> None:
+        self._has_explicit_path = path is not None
         if path is not None:
             self._path = _resolve_store_path(Path(path))
         else:
             self._path = _resolve_store_path(
                 get_workspace_dir() / ".soclens_cache" / "event_ai_panels.json"
             )
+        self._storage: StorageManager | None = storage
         self._lock = _get_store_lock(self._path)
         self._events: dict[str, UniqueEvent] = {}
         self._panels: dict[str, list[EventAIPanelEntry]] = {}
         self._last_digest: bytes | None = None
-        with self._lock:
-            self._reload_if_needed_locked(force=True)
+        if self._storage is None or self._has_explicit_path:
+            with self._lock:
+                self._reload_if_needed_locked(force=True)
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def storage(self) -> StorageManager | None:
+        return self._storage
+
+    def rebind_storage(self, storage: StorageManager | None) -> None:
+        """Thread-safely rebind the backing ``StorageManager``."""
+        with self._lock:
+            self._storage = storage
 
     def rebind_path(self, path: Path | str) -> None:
         """Thread-safely rebind this event store to a new JSON file path and reload."""
@@ -1182,6 +1202,7 @@ class EventAIStore:
         if old_lock is new_lock:
             with old_lock:
                 self._path = new_path
+                self._has_explicit_path = True
                 self._last_digest = None
                 self._reload_if_needed_locked(force=True)
             return
@@ -1191,6 +1212,7 @@ class EventAIStore:
         with first_lock:
             with second_lock:
                 self._path = new_path
+                self._has_explicit_path = True
                 self._lock = new_lock
                 self._events = {}
                 self._panels = {}
@@ -1302,6 +1324,15 @@ class EventAIStore:
     def upsert_event(self, event: UniqueEvent) -> bool:
         """Record a unique event if unseen. Returns ``True`` if newly seen, else ``False``."""
         sanitized = self._sanitize_event(event)
+        stor = self._storage
+        if stor is not None:
+            is_new = stor.upsert_unique_event(sanitized.to_dict())
+            with self._lock:
+                self._events[sanitized.event_key] = sanitized
+                self._panels.setdefault(sanitized.event_key, [])
+                if is_new and self._has_explicit_path:
+                    self._save_locked()
+            return is_new
         with self._lock:
             self._reload_if_needed_locked()
             is_new = sanitized.event_key not in self._events
@@ -1315,9 +1346,25 @@ class EventAIStore:
         """Deduplicate ``events`` in-batch and against persisted state; return newly seen only."""
         if not events:
             return []
+        stor = self._storage
+        if stor is not None:
+            sanitized_batch = [self._sanitize_event(ev) for ev in events]
+            inserted_dicts = stor.mark_events_seen_batch([ev.to_dict() for ev in sanitized_batch])
+            newly_seen: list[UniqueEvent] = []
+            for raw_ev_dict in inserted_dicts:
+                ev = UniqueEvent.from_dict(raw_ev_dict)
+                if ev is not None:
+                    newly_seen.append(ev)
+            with self._lock:
+                for ev in newly_seen:
+                    self._events[ev.event_key] = ev
+                    self._panels.setdefault(ev.event_key, [])
+                if newly_seen and self._has_explicit_path:
+                    self._save_locked()
+            return newly_seen
         with self._lock:
             self._reload_if_needed_locked()
-            newly_seen: list[UniqueEvent] = []
+            newly_seen = []
             seen_in_batch: set[str] = set()
             for raw_ev in events:
                 ev = self._sanitize_event(raw_ev)
@@ -1357,6 +1404,20 @@ class EventAIStore:
             auto_triggered=bool(auto_triggered),
             error=_redact_text(str(result.error or "")),
         )
+        stor = self._storage
+        if stor is not None:
+            stor.add_event_panel(
+                sanitized_event.event_key,
+                entry.to_dict(),
+                event_dict=sanitized_event.to_dict(),
+            )
+            with self._lock:
+                self._events[sanitized_event.event_key] = sanitized_event
+                panel_list = self._panels.setdefault(sanitized_event.event_key, [])
+                panel_list.append(entry)
+                if self._has_explicit_path:
+                    self._save_locked()
+            return entry
         with self._lock:
             self._reload_if_needed_locked()
             self._events[sanitized_event.event_key] = sanitized_event
@@ -1367,36 +1428,68 @@ class EventAIStore:
 
     def get_panels(self, event_key: str) -> list[EventAIPanelEntry]:
         """Return all persisted AI panels for ``event_key`` in chronological order."""
+        stor = self._storage
+        if stor is not None:
+            raw_panels = stor.get_event_panels(event_key)
+            out: list[EventAIPanelEntry] = []
+            for p_raw in raw_panels:
+                if isinstance(p_raw, Mapping):
+                    parsed = EventAIPanelEntry.from_dict(p_raw)
+                    if parsed is not None:
+                        out.append(parsed)
+            return out
         with self._lock:
             self._reload_if_needed_locked()
             return list(self._panels.get(event_key, []))
 
     def has_investigation(self, event_key: str) -> bool:
         """Return ``True`` if at least one AI panel is attached to ``event_key``."""
+        stor = self._storage
+        if stor is not None:
+            return bool(stor.has_investigation(event_key))
         with self._lock:
             self._reload_if_needed_locked()
             return bool(self._panels.get(event_key))
 
     def query_investigated_keys(self) -> list[str]:
         """Return all event keys that currently have one or more attached AI panels."""
+        stor = self._storage
+        if stor is not None:
+            return list(stor.query_investigated_keys())
         with self._lock:
             self._reload_if_needed_locked()
             return [key for key, panels in self._panels.items() if panels]
 
     def is_seen(self, event_key: str) -> bool:
         """Return ``True`` if ``event_key`` has already been tracked/seen."""
+        stor = self._storage
+        if stor is not None:
+            return stor.get_unique_event(event_key) is not None
         with self._lock:
             self._reload_if_needed_locked()
             return event_key in self._events
 
     def get_event(self, event_key: str) -> UniqueEvent | None:
         """Return the stored ``UniqueEvent`` for ``event_key``, or ``None``."""
+        stor = self._storage
+        if stor is not None:
+            raw = stor.get_unique_event(event_key)
+            return UniqueEvent.from_dict(raw) if isinstance(raw, Mapping) else None
         with self._lock:
             self._reload_if_needed_locked()
             return self._events.get(event_key)
 
     def list_events(self, *, investigated_only: bool = False) -> list[UniqueEvent]:
         """List stored unique events, optionally filtered to those with AI panels."""
+        stor = self._storage
+        if stor is not None:
+            raw_events = stor.list_unique_events(investigated_only=investigated_only)
+            out: list[UniqueEvent] = []
+            for raw in raw_events:
+                ev = UniqueEvent.from_dict(raw) if isinstance(raw, Mapping) else None
+                if ev is not None:
+                    out.append(ev)
+            return out
         with self._lock:
             self._reload_if_needed_locked()
             if not investigated_only:
@@ -1411,6 +1504,16 @@ class EventAIStore:
         """Remove ``event_key`` from seen tracking only if it has no attached AI panels."""
         if not event_key:
             return False
+        stor = self._storage
+        if stor is not None:
+            removed = stor.unmark_unique_event(event_key)
+            if removed:
+                with self._lock:
+                    self._events.pop(event_key, None)
+                    self._panels.pop(event_key, None)
+                    if self._has_explicit_path:
+                        self._save_locked()
+            return removed
         with self._lock:
             self._reload_if_needed_locked()
             if event_key not in self._events:
@@ -1424,6 +1527,19 @@ class EventAIStore:
 
     def clear(self, event_key: str | None = None) -> None:
         """Clear a single event or the entire store and persist atomically."""
+        stor = self._storage
+        if stor is not None:
+            stor.clear_events_and_panels(event_key)
+            with self._lock:
+                if event_key is None:
+                    self._events.clear()
+                    self._panels.clear()
+                else:
+                    self._events.pop(event_key, None)
+                    self._panels.pop(event_key, None)
+                if self._has_explicit_path:
+                    self._save_locked()
+            return
         with self._lock:
             self._reload_if_needed_locked()
             if event_key is None:

@@ -43,6 +43,7 @@ from soclens.config import (
     SecretStoreConfig,
     _normalize_llm_provider,
     format_ssl_verify_status,
+    get_database_config,
     get_local_llm_config,
     get_osint_config,
     get_proxy_summary,
@@ -66,6 +67,8 @@ from soclens.secret_stores.base import SECRET_PROVIDER_LABELS, SecretCatalogEntr
 from soclens.sentinelone import SentinelOneClient
 from soclens.settings import (
     AKEYLESS_AUTH_MODES,
+    DB_BACKEND_CHOICES,
+    DB_SSL_MODE_CHOICES,
     DEFAULT_PROFILE,
     ENCRYPTION_MODE_OS_KEYSTORE,
     ENCRYPTION_MODE_PASSPHRASE,
@@ -120,6 +123,7 @@ _CATEGORIES: tuple[tuple[str, str], ...] = (
     ("cat-secrets", "Secret Manager (PAM / Vault)"),
     ("cat-osint", "OSINT Free API Keys"),
     ("cat-ai", "AI & LLM Settings"),
+    ("cat-database", "Database & Storage"),
 )
 
 _SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
@@ -273,6 +277,23 @@ _KEY_TO_WIDGET: dict[str, tuple[str, str]] = {
     "osint_otx_api_key": ("cat-osint", "set-osint-otx-key"),
     "osint_urlscan_api_key": ("cat-osint", "set-osint-urlscan-key"),
     "osint_greynoise_api_key": ("cat-osint", "set-osint-greynoise-key"),
+    "db_backend": ("cat-database", "set-db-backend"),
+    "db_sqlite_path": ("cat-database", "set-db-sqlite-path"),
+    "db_dsn": ("cat-database", "set-db-dsn"),
+    "db_host": ("cat-database", "set-db-host"),
+    "db_port": ("cat-database", "set-db-port"),
+    "db_name": ("cat-database", "set-db-name"),
+    "db_user": ("cat-database", "set-db-user"),
+    "db_password": ("cat-database", "set-db-password"),
+    "db_ssl_mode": ("cat-database", "set-db-ssl-mode"),
+    "db_ssl_ca": ("cat-database", "set-db-ssl-ca"),
+    "db_ssl_cert": ("cat-database", "set-db-ssl-cert"),
+    "db_ssl_key": ("cat-database", "set-db-ssl-key"),
+    "db_pool_size": ("cat-database", "set-db-pool-size"),
+    "db_max_overflow": ("cat-database", "set-db-max-overflow"),
+    "db_retention_days": ("cat-database", "set-db-retention-days"),
+    "workstation_id": ("cat-database", "set-workstation-id"),
+    "analyst_id": ("cat-database", "set-analyst-id"),
 }
 
 _SECRET_INPUT_IDS: tuple[str, ...] = (
@@ -306,6 +327,11 @@ _OSINT_SECRET_INPUT_IDS: tuple[str, ...] = (
     "set-osint-otx-key",
     "set-osint-urlscan-key",
     "set-osint-greynoise-key",
+)
+
+_DB_SECRET_INPUT_IDS: tuple[str, ...] = (
+    "set-db-dsn",
+    "set-db-password",
 )
 
 _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
@@ -433,6 +459,21 @@ _INPUT_SPECS_SIMPLE: tuple[tuple[str, str, str], ...] = (
     ("osint_otx_api_key", "set-osint-otx-key", "Optional free key for higher limits (otx.alienvault.com)"),
     ("osint_urlscan_api_key", "set-osint-urlscan-key", "Optional free key for higher search quotas (urlscan.io)"),
     ("osint_greynoise_api_key", "set-osint-greynoise-key", "Optional free Community key (viz.greynoise.io/signup)"),
+    ("db_sqlite_path", "set-db-sqlite-path", "Default: <workspace>/.soclens_cache/soclens.db"),
+    ("db_dsn", "set-db-dsn", "Optional full SQLAlchemy DSN (e.g. postgresql+pg8000://...)"),
+    ("db_host", "set-db-host", "e.g. db.soc.internal"),
+    ("db_port", "set-db-port", "5432 (Postgres) or 3306 (MySQL)"),
+    ("db_name", "set-db-name", "e.g. soclens"),
+    ("db_user", "set-db-user", "Database username"),
+    ("db_password", "set-db-password", "Database password (env/Vault preferred)"),
+    ("db_ssl_ca", "set-db-ssl-ca", "Optional path to TLS CA PEM bundle"),
+    ("db_ssl_cert", "set-db-ssl-cert", "Optional path to TLS client cert PEM"),
+    ("db_ssl_key", "set-db-ssl-key", "Optional path to TLS client key PEM"),
+    ("db_pool_size", "set-db-pool-size", "Default: 5"),
+    ("db_max_overflow", "set-db-max-overflow", "Default: 10"),
+    ("db_retention_days", "set-db-retention-days", "Default: 90 (0 disables pruning)"),
+    ("workstation_id", "set-workstation-id", "Default: machine hostname"),
+    ("analyst_id", "set-analyst-id", "Default: current OS username"),
 )
 
 _SSL_VERIFY_TRUE = frozenset({"1", "true", "yes", "on"})
@@ -1885,6 +1926,188 @@ class SettingsPane(BaseSocPane):
                             compact=True,
                         )
 
+                    with VerticalScroll(id="cat-database", classes="settings-cat-scroll"):
+                        yield Static(
+                            "Unified Database & Storage Backend (SQLite WAL / External DB)",
+                            classes="section-label",
+                            markup=False,
+                        )
+                        yield Static(
+                            "Default uses embedded local SQLite (WAL + FTS5) at "
+                            "<workspace>/.soclens_cache/soclens.db. Optionally configure shared "
+                            "PostgreSQL (pg8000), MySQL (PyMySQL), or custom SQLAlchemy DSN. "
+                            "Credentials remain local and are never persisted to DB tables.",
+                            id="settings-db-info",
+                            classes="info-box",
+                            markup=False,
+                        )
+                        yield self._make_label("db_backend")
+                        yield Select(
+                            [
+                                ("SQLite (Local Embedded WAL + FTS5)", "sqlite"),
+                                ("PostgreSQL (Pure-Python pg8000)", "postgres"),
+                                ("MySQL / MariaDB (Pure-Python PyMySQL)", "mysql"),
+                                ("Custom SQLAlchemy DSN", "custom"),
+                            ],
+                            allow_blank=False,
+                            value="sqlite",
+                            id="set-db-backend",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_sqlite_path")
+                        yield Input(
+                            value="",
+                            placeholder="Default: <workspace>/.soclens_cache/soclens.db",
+                            id="set-db-sqlite-path",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_dsn")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Optional full SQLAlchemy DSN (e.g. postgresql+pg8000://...)",
+                            id="set-db-dsn",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_host")
+                        yield Input(
+                            value="",
+                            placeholder="e.g. db.soc.internal",
+                            id="set-db-host",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_port")
+                        yield Input(
+                            value="",
+                            placeholder="5432 (Postgres) or 3306 (MySQL)",
+                            id="set-db-port",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_name")
+                        yield Input(
+                            value="",
+                            placeholder="e.g. soclens",
+                            id="set-db-name",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_user")
+                        yield Input(
+                            value="",
+                            placeholder="Database username",
+                            id="set-db-user",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_password")
+                        yield Input(
+                            value="",
+                            password=True,
+                            placeholder="Database password (env/Vault preferred)",
+                            id="set-db-password",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_ssl_mode")
+                        yield Select(
+                            [
+                                ("Default / Unset", ""),
+                                ("Disable", "disable"),
+                                ("Allow", "allow"),
+                                ("Prefer", "prefer"),
+                                ("Require TLS", "require"),
+                                ("Verify CA", "verify-ca"),
+                                ("Verify Full (CA + Hostname)", "verify-full"),
+                            ],
+                            allow_blank=False,
+                            value="",
+                            id="set-db-ssl-mode",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_ssl_ca")
+                        yield Input(
+                            value="",
+                            placeholder="Optional path to TLS CA PEM bundle",
+                            id="set-db-ssl-ca",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_ssl_cert")
+                        yield Input(
+                            value="",
+                            placeholder="Optional path to TLS client cert PEM",
+                            id="set-db-ssl-cert",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_ssl_key")
+                        yield Input(
+                            value="",
+                            placeholder="Optional path to TLS client key PEM",
+                            id="set-db-ssl-key",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_pool_size")
+                        yield Input(
+                            value="",
+                            placeholder="Default: 5",
+                            id="set-db-pool-size",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_max_overflow")
+                        yield Input(
+                            value="",
+                            placeholder="Default: 10",
+                            id="set-db-max-overflow",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("db_retention_days")
+                        yield Input(
+                            value="",
+                            placeholder="Default: 90 (0 disables pruning)",
+                            id="set-db-retention-days",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("workstation_id")
+                        yield Input(
+                            value="",
+                            placeholder="Default: machine hostname",
+                            id="set-workstation-id",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        yield self._make_label("analyst_id")
+                        yield Input(
+                            value="",
+                            placeholder="Default: current OS username",
+                            id="set-analyst-id",
+                            classes="setting-field",
+                            compact=True,
+                        )
+                        with Horizontal(classes="action-row toolbar-row"):
+                            yield Button(
+                                "Test DB Connection",
+                                id="settings-test-db-btn",
+                                variant="primary",
+                                compact=True,
+                            )
+                        yield Static(
+                            "Click 'Test DB Connection' to verify database connectivity and dialect.",
+                            id="settings-db-test-status",
+                            classes="info-box",
+                            markup=False,
+                        )
+
     def _make_label(self, key: str) -> Static:
         spec = SETTING_SPECS_BY_KEY[key]
         return Static(
@@ -1909,11 +2132,12 @@ class SettingsPane(BaseSocPane):
     def _resolve_ai_stores(self) -> tuple[AIPolicyStore, AuditLogStore]:
         policy_store = getattr(self.app, "ai_policy_store", None)
         audit_store = getattr(self.app, "ai_audit_store", None)
+        storage = getattr(self.app, "storage", None)
         cache_dir = self.workspace_dir / ".soclens_cache"
         if not isinstance(policy_store, AIPolicyStore):
-            policy_store = AIPolicyStore(path=cache_dir / "ai_policy.json")
+            policy_store = AIPolicyStore(path=cache_dir / "ai_policy.json", storage=storage)
         if not isinstance(audit_store, AuditLogStore):
-            audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl")
+            audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl", storage=storage)
         return policy_store, audit_store
 
     def _populate_ai_policy_controls(self) -> None:
@@ -2463,6 +2687,25 @@ class SettingsPane(BaseSocPane):
                     else osint_en_val.strip().lower() not in _SSL_VERIFY_FALSE
                 )
 
+            # Database & Storage selects
+            db_backend_val = (
+                self._form_value_for_display("db_backend", saved_map) or "sqlite"
+            ).strip().lower()
+            db_backend_sel = self.query_one("#set-db-backend", Select)
+            with db_backend_sel.prevent(Select.Changed):
+                db_backend_sel.value = (
+                    db_backend_val if db_backend_val in DB_BACKEND_CHOICES else "sqlite"
+                )
+
+            db_ssl_val = (
+                self._form_value_for_display("db_ssl_mode", saved_map) or ""
+            ).strip().lower()
+            db_ssl_sel = self.query_one("#set-db-ssl-mode", Select)
+            with db_ssl_sel.prevent(Select.Changed):
+                db_ssl_sel.value = (
+                    db_ssl_val if db_ssl_val in DB_SSL_MODE_CHOICES else ""
+                )
+
             # AI Agent Tool Limits & Global Kill Switch
             self._populate_ai_policy_controls()
             self._rebuild_ai_model_dropdown()
@@ -2632,7 +2875,7 @@ class SettingsPane(BaseSocPane):
     @on(Checkbox.Changed, "#settings-show-secrets")
     def handle_toggle_show_secrets(self, event: Checkbox.Changed) -> None:
         hide = not bool(event.value)
-        for widget_id in (*_SECRET_INPUT_IDS, *_OSINT_SECRET_INPUT_IDS):
+        for widget_id in (*_SECRET_INPUT_IDS, *_OSINT_SECRET_INPUT_IDS, *_DB_SECRET_INPUT_IDS):
             try:
                 self.query_one(f"#{widget_id}", Input).password = hide
             except Exception:
@@ -2937,6 +3180,29 @@ class SettingsPane(BaseSocPane):
                 if (env_osint is not None or "osint_enabled" in existing_saved)
                 else None
             )
+
+        # Database & Storage selects
+        db_backend_val = str(
+            self.query_one("#set-db-backend", Select).value or "sqlite"
+        ).strip().lower()
+        env_db_backend = get_env_override_for_setting("db_backend")
+        values["db_backend"] = (
+            db_backend_val
+            if (
+                db_backend_val != "sqlite"
+                or "db_backend" in existing_saved
+                or env_db_backend is not None
+            )
+            else None
+        )
+
+        db_ssl_val = str(self.query_one("#set-db-ssl-mode", Select).value or "").strip().lower()
+        env_db_ssl = get_env_override_for_setting("db_ssl_mode")
+        values["db_ssl_mode"] = (
+            db_ssl_val
+            if (db_ssl_val or "db_ssl_mode" in existing_saved or env_db_ssl is not None)
+            else None
+        )
 
         return values, None
 
@@ -3254,6 +3520,18 @@ class SettingsPane(BaseSocPane):
                 self.query_one("#set-osint-enabled", Checkbox).value = (
                     imported["osint_enabled"].strip().lower() not in _SSL_VERIFY_FALSE
                 )
+
+            if "db_backend" in imported:
+                db_b = imported["db_backend"].strip().lower()
+                db_b_sel = self.query_one("#set-db-backend", Select)
+                with db_b_sel.prevent(Select.Changed):
+                    db_b_sel.value = db_b if db_b in DB_BACKEND_CHOICES else "sqlite"
+
+            if "db_ssl_mode" in imported:
+                db_s = imported["db_ssl_mode"].strip().lower()
+                db_s_sel = self.query_one("#set-db-ssl-mode", Select)
+                with db_s_sel.prevent(Select.Changed):
+                    db_s_sel.value = db_s if db_s in DB_SSL_MODE_CHOICES else ""
 
             if "rf_llm_provider" in imported:
                 raw_imp_prov = imported["rf_llm_provider"].strip()
@@ -4389,3 +4667,73 @@ class SettingsPane(BaseSocPane):
                 self.notify_user(msg, title="AI Connection Failed", severity="warning")
         except Exception as exc:
             self.report_error("Test AI Connection", exc)
+
+    @on(Button.Pressed, "#settings-test-db-btn")
+    def handle_test_db(self) -> None:
+        draft, err = self._snapshot_draft_values()
+        if err:
+            self.set_status(f"Cannot test DB: {err}")
+            self.notify_user(err, title="Invalid Database Setting", severity="error")
+            return
+        msg = "Testing database connection..."
+        self.set_status(msg)
+        with contextlib.suppress(Exception):
+            self.query_one("#settings-db-test-status", Static).update(msg)
+        self._test_db_worker(draft)
+
+    @work(thread=True, exit_on_error=False)
+    def _test_db_worker(self, draft: dict[str, str | None]) -> None:
+        try:
+            from soclens.storage import StorageManager
+
+            cfg = get_database_config(
+                workspace_dir=self.workspace_dir,
+                backend=draft.get("db_backend") or None,
+                sqlite_path=draft.get("db_sqlite_path") or None,
+                dsn=draft.get("db_dsn") or None,
+                host=draft.get("db_host") or None,
+                port=draft.get("db_port") or None,
+                database=draft.get("db_name") or None,
+                username=draft.get("db_user") or None,
+                password=draft.get("db_password") or None,
+                ssl_mode=draft.get("db_ssl_mode") or None,
+                ssl_ca=draft.get("db_ssl_ca") or None,
+                ssl_cert=draft.get("db_ssl_cert") or None,
+                ssl_key=draft.get("db_ssl_key") or None,
+                pool_size=draft.get("db_pool_size") or None,
+                max_overflow=draft.get("db_max_overflow") or None,
+                retention_days=draft.get("db_retention_days") or None,
+                workstation_id=draft.get("workstation_id") or None,
+                analyst_id=draft.get("analyst_id") or None,
+            )
+            with self.log_scope("settings"):
+                res = StorageManager.test_connection(cfg)
+            if res.get("ok"):
+                msg = f"DB OK ({res.get('dialect')}): {res.get('version') or 'connected'}"
+            else:
+                msg = f"DB FAILED ({res.get('dialect')}): {res.get('error') or 'unreachable'}"
+
+            def _apply_db_status() -> None:
+                with contextlib.suppress(Exception):
+                    self.query_one("#settings-db-test-status", Static).update(msg)
+                self.set_status(msg)
+                self.append_log(msg, level="INFO" if res.get("ok") else "WARNING")
+                self.notify_user(
+                    msg,
+                    title="DB Connection OK" if res.get("ok") else "DB Connection Failed",
+                    severity="information" if res.get("ok") else "warning",
+                )
+
+            self.run_on_ui(_apply_db_status)
+        except Exception as exc:
+            from soclens.storage import _sanitize_db_error
+
+            safe_msg = f"DB FAILED: {_sanitize_db_error(exc)}"
+            def _apply_err() -> None:
+                with contextlib.suppress(Exception):
+                    self.query_one("#settings-db-test-status", Static).update(safe_msg)
+                self.set_status(safe_msg)
+                self.append_log(safe_msg, level="WARNING")
+                self.notify_user(safe_msg, title="DB Connection Failed", severity="warning")
+
+            self.run_on_ui(_apply_err)

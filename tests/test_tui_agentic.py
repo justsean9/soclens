@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -51,6 +52,10 @@ def _richlog_text(log: RichLog) -> str:
     return "\n".join(str(line.text) for line in log.lines)
 
 
+def _recent_utc_iso(hours_ago: int = 1) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _make_rf_alert(alert_id: str = "rf-alert-1", title: str = "Suspicious C2 IP") -> dict[str, Any]:
     return normalize_alert_v3(
         {
@@ -62,7 +67,7 @@ def _make_rf_alert(alert_id: str = "rf-alert-1", title: str = "Suspicious C2 IP"
             "type": "ip_alert",
             "entities": [{"entity": {"id": "ip:198.51.100.42", "name": "198.51.100.42"}}],
             "hits": [{"document_id": "doc-1"}],
-            "triggered": "2026-11-26T00:00:00Z",
+            "triggered": _recent_utc_iso(1),
         }
     )
 
@@ -77,7 +82,7 @@ def _make_rf_playbook(pb_id: str = "pb-alert-1", title: str = "Lookalike Domain"
                 "priority": "High",
                 "status": "New",
                 "entity_name": "evil-soclens.example",
-                "updated": "2026-11-26T00:00:00Z",
+                "updated": _recent_utc_iso(1),
             },
             "panel_evidence_summary": {"targets": ["evil-soclens.example"]},
         }
@@ -95,7 +100,7 @@ def _make_s1_threat(threat_id: str = "s1-thr-1", name: str = "Trojan.Generic") -
             "incidentStatus": "unresolved",
             "mitigationStatus": "active",
             "sha1": "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
-            "createdAt": "2026-11-26T00:00:00Z",
+            "createdAt": _recent_utc_iso(1),
         },
         "agentRealtimeInfo": {
             "agentComputerName": "FIN-WKSTN-07",
@@ -113,7 +118,7 @@ def _make_s1_cloud_alert(alert_id: str = "s1-cld-1", name: str = "Cloud STAR Rul
             "alertId": alert_id,
             "ruleName": name,
             "incidentStatus": "UNRESOLVED",
-            "createdAt": "2026-11-26T00:00:00Z",
+            "createdAt": _recent_utc_iso(1),
         },
         "ruleInfo": {"name": name, "severity": "High"},
         "agentDetectionInfo": {
@@ -141,7 +146,7 @@ def _make_es_notable(
         "owner": "unassigned",
         "risk_object": "srv-auth-01",
         "risk_score": 80,
-        "_time": "2026-11-26T00:00:00Z",
+        "_time": _recent_utc_iso(1),
     }
 
 
@@ -856,6 +861,8 @@ def test_reload_settings_rebinds_ai_stores_and_respects_custom_injected(
             assert app.ai_policy_store.path == ws2 / ".soclens_cache" / "ai_policy.json"
             assert app.ai_audit_store.path == ws2 / ".soclens_cache" / "ai_audit.jsonl"
             assert app.event_ai_store.path == ws2 / ".soclens_cache" / "event_ai_panels.json"
+            assert app.storage.config.sqlite_path == ws2 / ".soclens_cache" / "soclens.db"
+            assert app.ai_orchestrator._resolve_storage() is app.storage
 
     asyncio.run(_run_rebind())
 

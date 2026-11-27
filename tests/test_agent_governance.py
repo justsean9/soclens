@@ -15,6 +15,7 @@ import pytest
 from soclens import splunk_es, splunk_rf_enrichment
 from soclens.agent_audit import AuditEntry, AuditLogStore, redact_sensitive_data
 from soclens.agent_policy import (
+    SOURCE_CATEGORY_LOCAL,
     SOURCE_CATEGORY_OSINT,
     SOURCE_CATEGORY_RF,
     SOURCE_CATEGORY_S1,
@@ -191,6 +192,7 @@ def test_evaluate_tool_permission_fail_closed_rules() -> None:
         (SOURCE_CATEGORY_S1, "sentinelone_enabled"),
         (SOURCE_CATEGORY_RF, "recorded_future_enabled"),
         (SOURCE_CATEGORY_OSINT, "watchlists_osint_enabled"),
+        (SOURCE_CATEGORY_LOCAL, "local_db_enabled"),
     ]:
         tool = {
             SOURCE_CATEGORY_SPLUNK: "splunk_search",
@@ -198,6 +200,7 @@ def test_evaluate_tool_permission_fail_closed_rules() -> None:
             SOURCE_CATEGORY_S1: "s1_list_threats",
             SOURCE_CATEGORY_RF: "rf_search_alerts",
             SOURCE_CATEGORY_OSINT: "osint_enrich_target",
+            SOURCE_CATEGORY_LOCAL: "local_search_alerts_history",
         }[cat]
         d_src = evaluate_tool_permission(
             tool,
@@ -609,13 +612,18 @@ def test_forbidden_mutating_method_inventory_matches_codebase() -> None:
     assert len(FORBIDDEN_MUTATING_METHOD_NAMES) >= 81
 
 
-def test_default_registry_has_exact_29_readonly_tools_and_zero_write_overlap() -> None:
+def test_default_registry_has_exact_32_readonly_tools_and_zero_write_overlap() -> None:
     registry = build_default_readonly_registry()
     specs = registry.list_tools()
     names = {spec.name for spec in specs}
 
-    assert len(specs) == 29
+    assert len(specs) == 32
     assert names == READONLY_TOOL_NAMES
+    assert {
+        "local_search_alerts_history",
+        "local_lookup_ioc_sightings",
+        "local_search_soc_knowledge",
+    } <= names
     assert names.isdisjoint(FORBIDDEN_MUTATING_METHOD_NAMES)
 
     for spec in specs:
@@ -623,7 +631,7 @@ def test_default_registry_has_exact_29_readonly_tools_and_zero_write_overlap() -
         assert set(spec.underlying_methods).isdisjoint(FORBIDDEN_MUTATING_METHOD_NAMES)
 
     schemas = registry.openai_schemas()
-    assert len(schemas) == 29
+    assert len(schemas) == 32
     filtered = registry.openai_schemas(allowed_names={"splunk_search", "rf_get_alert"})
     assert {item["function"]["name"] for item in filtered} == {"splunk_search", "rf_get_alert"}
 
@@ -757,11 +765,11 @@ def test_unconfigured_clients_fail_gracefully_without_crashing(
 
 
 # ---------------------------------------------------------------------------
-# 5. All 29 Read-Only Tool Wrappers (Mocked Clients & Lazy Factories)
+# 5. All 32 Read-Only Tool Wrappers (Mocked Clients & Lazy Factories)
 # ---------------------------------------------------------------------------
 
 
-def test_all_29_readonly_tool_wrappers_with_mocked_clients_and_lazy_factories(
+def test_all_32_readonly_tool_wrappers_with_mocked_clients_and_lazy_factories(
     tmp_path: Path,
 ) -> None:
     mock_splunk = MagicMock()
@@ -820,6 +828,28 @@ def test_all_29_readonly_tool_wrappers_with_mocked_clients_and_lazy_factories(
     fake_dossier.to_dict.return_value = {"query": "CVE-2024-1234", "sections": {"rf": {}}}
     mock_research_fn = MagicMock(return_value=fake_dossier)
 
+    from soclens.storage import DatabaseConfig, StorageManager
+
+    storage = StorageManager(DatabaseConfig(sqlite_path=tmp_path / "gov.db"))
+    storage.ensure_schema()
+    storage.upsert_alerts_snapshot(
+        "es_notables_24h",
+        [{"finding_id": "es-gov-1", "rule_name": "CobaltStrike Beacon"}],
+    )
+    storage.upsert_ioc_sighting(
+        indicator="CVE-2024-1234",
+        indicator_type="cve",
+        source="rf_alerts_24h",
+        event_key="rf_alert::rfa-1",
+    )
+    storage.upsert_learning(
+        title="Bastion Jump Rule",
+        content="bastion-01.corp.example is an approved RDP jump host.",
+        category="benign_tool",
+        source="manual_learn",
+        status="active",
+    )
+
     # Use lazy callable factories to verify dynamic resolution works identically
     registry = build_default_readonly_registry(
         rf_client=lambda: mock_rf,
@@ -828,9 +858,10 @@ def test_all_29_readonly_tool_wrappers_with_mocked_clients_and_lazy_factories(
         splunk_es_client=lambda: mock_es,
         osint_client=lambda: mock_osint,
         research_fn=mock_research_fn,
+        storage=lambda: storage,
     )
     policy = _full_enabled_policy()
-    audit = AuditLogStore(tmp_path / "all29.jsonl")
+    audit = AuditLogStore(tmp_path / "all32.jsonl")
 
     calls: list[tuple[str, dict[str, Any]]] = [
         ("splunk_search", {"spl": "index=main | stats count"}),
@@ -862,6 +893,9 @@ def test_all_29_readonly_tool_wrappers_with_mocked_clients_and_lazy_factories(
         ("rf_get_watchlist_entities", {"list_id": "wl-1", "query": "evil.com"}),
         ("osint_enrich_target", {"target": "CVE-2024-1234"}),
         ("unified_research_target", {"query": "CVE-2024-1234"}),
+        ("local_search_alerts_history", {"query": "CobaltStrike", "limit": 10}),
+        ("local_lookup_ioc_sightings", {"indicator": "cve-2024-1234"}),
+        ("local_search_soc_knowledge", {"query": "bastion-01"}),
     ]
     assert {name for name, _ in calls} == READONLY_TOOL_NAMES
 
@@ -3223,6 +3257,80 @@ def test_evaluate_tool_permission_ai_kill_switch_fail_closed() -> None:
     )
     assert dec_mut.allowed is False
     assert dec_mut.rule == "readonly_enforced"
+
+
+def test_local_db_tools_edge_cases_and_policy_gating(tmp_path: Path) -> None:
+    from soclens.storage import DatabaseConfig, StorageManager
+
+    # 1. With storage=None, local_* tools fail gracefully with ok=True and empty results
+    reg_none = build_default_readonly_registry(storage=None)
+    policy = AIPolicyConfig()
+    for tool_name, args in (
+        ("local_search_alerts_history", {"query": "CobaltStrike"}),
+        ("local_lookup_ioc_sightings", {"indicator": "203.0.113.50"}),
+        ("local_search_soc_knowledge", {"query": "bastion"}),
+    ):
+        res = reg_none.execute(tool_name, args, mode="full_investigation", policy=policy)
+        assert res["ok"] is True
+        assert res.get("blocked") is not True
+
+    # 2. Empty queries, negative/oversized limits, case-insensitive CVE/CIDR
+    storage = StorageManager(DatabaseConfig(sqlite_path=tmp_path / "edge.db"))
+    storage.ensure_schema()
+    storage.upsert_ioc_sighting(
+        indicator="CVE-2024-3094",
+        indicator_type="cve",
+        source="rf_alerts_24h",
+        event_key="rf_alert::1",
+    )
+    storage.upsert_ioc_sighting(
+        indicator="10.20.0.0/16",
+        indicator_type="cidr",
+        source="es_notables_24h",
+        event_key="splunk_es::1",
+    )
+    reg = build_default_readonly_registry(storage=storage)
+
+    for tool_name, args in (
+        ("local_search_alerts_history", {"query": "   ", "limit": 999999}),
+        ("local_lookup_ioc_sightings", {"indicator": ""}),
+        ("local_search_soc_knowledge", {"query": "", "limit": -5}),
+    ):
+        out = reg.execute(tool_name, args, mode="full_investigation", policy=policy)
+        assert out["ok"] is True and out.get("blocked") is not True
+
+    cve_res = reg.execute(
+        "local_lookup_ioc_sightings",
+        {"indicator": "cve-2024-3094"},
+        mode="full_investigation",
+        policy=policy,
+    )
+    assert cve_res["ok"] is True and cve_res["result"]["count"] == 1
+
+    cidr_res = reg.execute(
+        "local_lookup_ioc_sightings",
+        {"indicator": "10.20.0.0/16"},
+        mode="full_investigation",
+        policy=policy,
+    )
+    assert cidr_res["ok"] is True and cidr_res["result"]["count"] == 1
+
+    # 3. Policy gating
+    blocked_ask = reg.execute(
+        "local_lookup_ioc_sightings",
+        {"indicator": "10.20.0.0/16"},
+        mode="ask_only",
+        policy=policy,
+    )
+    assert blocked_ask["ok"] is False and blocked_ask["rule"] == "ask_only_no_tools"
+
+    blocked_local = reg.execute(
+        "local_lookup_ioc_sightings",
+        {"indicator": "10.20.0.0/16"},
+        mode="full_investigation",
+        policy=AIPolicyConfig(local_db_enabled=False),
+    )
+    assert blocked_local["ok"] is False and blocked_local["rule"] == "source_disabled:local_db"
 
 
 

@@ -147,6 +147,7 @@ def test_tier1_f2_default_registry_covers_all_five_source_categories(
     agentic_workspace: Path,
 ) -> None:
     from soclens.agent_policy import (
+        SOURCE_CATEGORY_LOCAL,
         SOURCE_CATEGORY_OSINT,
         SOURCE_CATEGORY_RF,
         SOURCE_CATEGORY_S1,
@@ -164,6 +165,7 @@ def test_tier1_f2_default_registry_covers_all_five_source_categories(
         SOURCE_CATEGORY_S1,
         SOURCE_CATEGORY_RF,
         SOURCE_CATEGORY_OSINT,
+        SOURCE_CATEGORY_LOCAL,
     }
 
 

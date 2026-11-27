@@ -10,9 +10,12 @@ import threading
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from soclens.config import get_workspace_dir
+
+if TYPE_CHECKING:
+    from soclens.storage import StorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,7 @@ SOURCE_CATEGORY_SPLUNK_ES: str = "splunk_es"
 SOURCE_CATEGORY_S1: str = "sentinelone"
 SOURCE_CATEGORY_RF: str = "recorded_future"
 SOURCE_CATEGORY_OSINT: str = "watchlists_osint"
+SOURCE_CATEGORY_LOCAL: str = "local_db"
 
 SOURCE_CATEGORY_TOGGLE_MAP: dict[str, str] = {
     SOURCE_CATEGORY_SPLUNK: "splunk_search_enabled",
@@ -31,6 +35,7 @@ SOURCE_CATEGORY_TOGGLE_MAP: dict[str, str] = {
     SOURCE_CATEGORY_S1: "sentinelone_enabled",
     SOURCE_CATEGORY_RF: "recorded_future_enabled",
     SOURCE_CATEGORY_OSINT: "watchlists_osint_enabled",
+    SOURCE_CATEGORY_LOCAL: "local_db_enabled",
 }
 
 DEFAULT_MAX_TOOL_STEPS: int = 50
@@ -172,6 +177,7 @@ class AIPolicyConfig:
     sentinelone_enabled: bool = True
     recorded_future_enabled: bool = True
     watchlists_osint_enabled: bool = True
+    local_db_enabled: bool = True
     disabled_tools: list[str] = field(default_factory=list)
     max_tool_steps: int = DEFAULT_MAX_TOOL_STEPS
     max_identical_tool_calls: int = DEFAULT_MAX_IDENTICAL_TOOL_CALLS
@@ -192,6 +198,7 @@ class AIPolicyConfig:
         self.sentinelone_enabled = _coerce_bool(self.sentinelone_enabled, True)
         self.recorded_future_enabled = _coerce_bool(self.recorded_future_enabled, True)
         self.watchlists_osint_enabled = _coerce_bool(self.watchlists_osint_enabled, True)
+        self.local_db_enabled = _coerce_bool(self.local_db_enabled, True)
         self.disabled_tools = _normalize_disabled_tools(self.disabled_tools)
         self.max_tool_steps = _coerce_bounded_int(
             self.max_tool_steps,
@@ -231,6 +238,7 @@ class AIPolicyConfig:
             "sentinelone_enabled": self.sentinelone_enabled,
             "recorded_future_enabled": self.recorded_future_enabled,
             "watchlists_osint_enabled": self.watchlists_osint_enabled,
+            "local_db_enabled": self.local_db_enabled,
             "disabled_tools": list(self.disabled_tools),
             "max_tool_steps": self.max_tool_steps,
             "max_identical_tool_calls": self.max_identical_tool_calls,
@@ -255,6 +263,7 @@ class AIPolicyConfig:
             sentinelone_enabled=_coerce_bool(raw.get("sentinelone_enabled"), True),
             recorded_future_enabled=_coerce_bool(raw.get("recorded_future_enabled"), True),
             watchlists_osint_enabled=_coerce_bool(raw.get("watchlists_osint_enabled"), True),
+            local_db_enabled=_coerce_bool(raw.get("local_db_enabled"), True),
             disabled_tools=_normalize_disabled_tools(raw.get("disabled_tools")),
             max_tool_steps=_coerce_bounded_int(
                 raw.get("max_tool_steps"),
@@ -309,11 +318,18 @@ def _atomic_write_text(path: Path, text: str, *, prefix: str) -> None:
 class AIPolicyStore:
     """Thread-safe, atomically persisted AI Control Panel policy store."""
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | str | None = None,
+        *,
+        storage: StorageManager | None = None,
+    ) -> None:
+        self._has_explicit_path = path is not None
         if path is not None:
             self._path = Path(path).expanduser()
         else:
             self._path = get_workspace_dir() / ".soclens_cache" / "ai_policy.json"
+        self._storage: StorageManager | None = storage
         self._lock = threading.RLock()
         self._io_lock = threading.Lock()
 
@@ -321,15 +337,38 @@ class AIPolicyStore:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def storage(self) -> StorageManager | None:
+        return self._storage
+
+    def rebind_storage(self, storage: StorageManager | None) -> None:
+        """Thread-safely rebind the backing ``StorageManager``."""
+        with self._lock:
+            with self._io_lock:
+                self._storage = storage
+
     def rebind_path(self, path: Path | str) -> None:
         """Thread-safely rebind this policy store to a new JSON file path."""
         new_path = Path(path).expanduser()
         with self._lock:
             with self._io_lock:
                 self._path = new_path
+                self._has_explicit_path = True
 
     def load(self) -> AIPolicyConfig:
         """Load the persisted AI policy, returning safe defaults if missing or corrupt."""
+        stor = self._storage
+        if stor is not None:
+            payload = stor.load_ai_policy()
+            if isinstance(payload, Mapping):
+                if "max_tool_steps" not in payload or payload.get("max_tool_steps") is None:
+                    merged = dict(payload)
+                    merged["max_tool_steps"] = _env_max_tool_steps_default()
+                    return AIPolicyConfig.from_dict(merged)
+                return AIPolicyConfig.from_dict(payload)
+            if not self._has_explicit_path:
+                return AIPolicyConfig(max_tool_steps=_env_max_tool_steps_default())
+
         with self._io_lock:
             if not self._path.is_file():
                 return AIPolicyConfig(max_tool_steps=_env_max_tool_steps_default())
@@ -354,8 +393,13 @@ class AIPolicyStore:
         return AIPolicyConfig.from_dict(payload)
 
     def save(self, policy: AIPolicyConfig) -> None:
-        """Persist ``policy`` atomically to disk."""
+        """Persist ``policy`` atomically to storage and/or disk."""
         normalized = AIPolicyConfig.from_dict(policy.to_dict())
+        stor = self._storage
+        if stor is not None:
+            stor.save_ai_policy(normalized.to_dict())
+            if not self._has_explicit_path:
+                return
         serialized = json.dumps(normalized.to_dict(), indent=2, ensure_ascii=False) + "\n"
         with self._io_lock:
             _atomic_write_text(self._path, serialized, prefix=".ai_policy.")
@@ -550,6 +594,7 @@ __all__ = [
     "MIN_SAME_TOOL_FAILURES",
     "MIN_TOOL_STEPS",
     "PermissionDecision",
+    "SOURCE_CATEGORY_LOCAL",
     "SOURCE_CATEGORY_OSINT",
     "SOURCE_CATEGORY_RF",
     "SOURCE_CATEGORY_S1",

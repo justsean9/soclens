@@ -427,11 +427,12 @@ class LocalLLMPane(BaseSocPane):
         policy_store = getattr(self.app, "ai_policy_store", None)
         audit_store = getattr(self.app, "ai_audit_store", None)
         registry = getattr(self.app, "ai_tool_registry", None)
+        storage = getattr(self.app, "storage", None)
         cache_dir = self.workspace_dir / ".soclens_cache"
         if not isinstance(policy_store, AIPolicyStore):
-            policy_store = AIPolicyStore(path=cache_dir / "ai_policy.json")
+            policy_store = AIPolicyStore(path=cache_dir / "ai_policy.json", storage=storage)
         if not isinstance(audit_store, AuditLogStore):
-            audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl")
+            audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl", storage=storage)
         return policy_store, audit_store, registry
 
     def _resolve_orchestrator(self) -> SocAgentOrchestrator:
@@ -439,15 +440,17 @@ class LocalLLMPane(BaseSocPane):
         if isinstance(existing, SocAgentOrchestrator):
             return existing
         policy_store, audit_store, registry = self._resolve_ai_stores()
+        storage = getattr(self.app, "storage", None)
         eff_registry = (
             registry
             if isinstance(registry, ReadOnlyToolRegistry)
-            else build_default_readonly_registry()
+            else build_default_readonly_registry(storage=storage)
         )
         return SocAgentOrchestrator(
             registry=eff_registry,
             policy_store=policy_store,
             audit_store=audit_store,
+            storage=storage,
         )
 
     def _sync_tools_toggle_button(self, enabled: bool) -> None:

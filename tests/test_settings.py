@@ -653,3 +653,63 @@ def test_vault_hydrated_session_overrides_never_persisted_to_disk(tmp_path: Path
     assert settings_mod.is_vault_hydrated_setting("rf_api_token") is False
     settings_mod.save_profile_settings({"rf_api_token": "manual-token-abc"}, settings_path=cfg_path)
     assert settings_mod.get_saved_setting("rf_api_token", settings_path=cfg_path) == "manual-token-abc"
+
+
+def test_database_settings_specs_validation_vault_keys_and_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.config import get_database_config
+
+    assert len(settings_mod.SECRET_MANAGED_SETTING_KEYS) == 14
+    assert settings_mod.DB_SECRET_MANAGED_SETTING_KEYS == ("db_password", "db_dsn")
+    assert settings_mod.SETTING_CATEGORIES[-1] == ("database", "Database & Storage")
+
+    parsed = settings_mod.parse_vault_secret_map(
+        '{"db_password":"hashicorp_vault:soclens/db:password","db_dsn":"hashicorp_vault:soclens/db:dsn"}'
+    )
+    assert parsed == {
+        "db_password": "hashicorp_vault:soclens/db:password",
+        "db_dsn": "hashicorp_vault:soclens/db:dsn",
+    }
+
+    bad_db_errs = settings_mod.validate_settings_values(
+        {
+            "db_backend": "oracle",
+            "db_port": "70000",
+            "db_pool_size": "0",
+            "db_max_overflow": "-1",
+            "db_retention_days": "-5",
+            "db_dsn": "not-a-valid-dsn",
+        }
+    )
+    assert {k for k, _ in bad_db_errs} == {
+        "db_backend",
+        "db_port",
+        "db_pool_size",
+        "db_max_overflow",
+        "db_retention_days",
+        "db_dsn",
+    }
+
+    ws = tmp_path / "ws_db"
+    ws.mkdir()
+    monkeypatch.setenv("SOCLENS_HOME", str(ws))
+    monkeypatch.setenv("SOCLENS_DB_BACKEND", "postgres")
+    monkeypatch.setenv("SOCLENS_DB_HOST", "pg-soc.internal")
+    monkeypatch.setenv("SOCLENS_DB_PORT", "5432")
+    monkeypatch.setenv("SOCLENS_DB_NAME", "soclens_prod")
+    monkeypatch.setenv("SOCLENS_DB_USER", "soc_ro")
+    monkeypatch.setenv("SOCLENS_DB_PASSWORD", "env-db-pw")
+    monkeypatch.setenv("SOCLENS_DB_RETENTION_DAYS", "45")
+    monkeypatch.setenv("SOCLENS_WORKSTATION_ID", "ws-cfg-1")
+    monkeypatch.setenv("SOCLENS_ANALYST_ID", "analyst-cfg-1")
+
+    db_cfg = get_database_config(workspace_dir=ws)
+    assert db_cfg.backend == "postgres"
+    assert db_cfg.host == "pg-soc.internal"
+    assert db_cfg.port == 5432
+    assert db_cfg.retention_days == 45
+    assert db_cfg.workstation_id == "ws-cfg-1"
+    assert db_cfg.analyst_id == "analyst-cfg-1"
+    assert "env-db-pw" not in repr(db_cfg)

@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import requests
@@ -22,12 +22,14 @@ from requests.utils import should_bypass_proxies
 
 from soclens.settings import (
     AKEYLESS_AUTH_MODES,
+    DB_SECRET_MANAGED_SETTING_KEYS,
     MS_COPILOT_AUTH_MODES,
     SECRET_MANAGED_SETTING_KEYS,
     SETTING_SPECS_BY_KEY,
     SUPPORTED_SECRET_PROVIDERS,
     TSS_AUTH_MODES,
     VAULT_AUTH_MODES,
+    get_active_profile_name,
     get_effective_setting,
     get_env_override_for_setting,
     get_saved_setting,
@@ -38,6 +40,9 @@ from soclens.settings import (
     parse_vault_secret_map,
     set_session_overrides,
 )
+
+if TYPE_CHECKING:
+    from soclens.storage import DatabaseConfig
 
 _ERROR_LOG_LOCK = threading.Lock()
 _SSL_WARNING_LOCK = threading.Lock()
@@ -1725,9 +1730,10 @@ def hydrate_secrets_from_store(
     if stop_event is not None and stop_event.is_set():
         return {}
 
+    allowed_secret_keys = set(SECRET_MANAGED_SETTING_KEYS) | set(DB_SECRET_MANAGED_SETTING_KEYS)
     target_map: dict[str, str] = {}
     for setting_key, ref in cfg.secret_map.items():
-        if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+        if setting_key not in allowed_secret_keys:
             continue
         if not overwrite_existing and get_env_override_for_setting(setting_key) is not None:
             continue
@@ -1749,7 +1755,7 @@ def hydrate_secrets_from_store(
 
     to_apply: dict[str, str] = {}
     for setting_key, secret_val in resolved.items():
-        if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+        if setting_key not in allowed_secret_keys:
             continue
         cleaned = _clean_optional_str(secret_val)
         if cleaned is None:
@@ -2132,6 +2138,84 @@ def get_image_viewer_mode(
             pass
 
     return normalize_image_viewer_mode(default_mode)
+
+
+def get_database_config(
+    *,
+    workspace_dir: Path | str | None = None,
+    backend: str | None = None,
+    sqlite_path: Path | str | None = None,
+    dsn: str | None = None,
+    host: str | None = None,
+    port: int | str | None = None,
+    database: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    ssl_mode: str | None = None,
+    ssl_ca: str | None = None,
+    ssl_cert: str | None = None,
+    ssl_key: str | None = None,
+    pool_size: int | str | None = None,
+    max_overflow: int | str | None = None,
+    retention_days: int | str | None = None,
+    workstation_id: str | None = None,
+    profile_name: str | None = None,
+    analyst_id: str | None = None,
+) -> DatabaseConfig:
+    """Resolve unified SQLAlchemy database settings from args, session, env, or settings."""
+    from soclens.storage import DatabaseConfig
+
+    def _opt_str(explicit: str | None, key: str, *, include_default: bool = False) -> str | None:
+        if explicit is not None:
+            return _clean_optional_str(explicit)
+        return get_effective_setting(key, include_default=include_default)
+
+    def _opt_int(
+        explicit: int | str | None,
+        key: str,
+        default: int | None = None,
+    ) -> int | None:
+        raw: Any = explicit if explicit is not None else get_effective_setting(key, include_default=True)
+        if raw is None or not str(raw).strip():
+            return default
+        try:
+            return int(str(raw).strip())
+        except ValueError as exc:
+            raise ConfigurationError(f"Invalid integer for {key}: {raw!r}") from exc
+
+    resolved_backend = _opt_str(backend, "db_backend", include_default=True) or "sqlite"
+    resolved_dsn = _opt_str(dsn, "db_dsn")
+    if sqlite_path is not None and str(sqlite_path).strip():
+        resolved_sqlite: Path | str | None = sqlite_path
+    else:
+        raw_sq = get_effective_setting("db_sqlite_path")
+        if raw_sq:
+            resolved_sqlite = raw_sq
+        else:
+            resolved_sqlite = get_workspace_dir(workspace_dir) / ".soclens_cache" / "soclens.db"
+
+    return DatabaseConfig(
+        backend=resolved_backend,
+        sqlite_path=resolved_sqlite,
+        dsn=resolved_dsn,
+        host=_opt_str(host, "db_host") or "",
+        port=_opt_int(port, "db_port", None),
+        database=_opt_str(database, "db_name") or "",
+        username=_opt_str(username, "db_user") or "",
+        password=_opt_str(password, "db_password") or "",
+        ssl_mode=_opt_str(ssl_mode, "db_ssl_mode") or "",
+        ssl_ca=_opt_str(ssl_ca, "db_ssl_ca"),
+        ssl_cert=_opt_str(ssl_cert, "db_ssl_cert"),
+        ssl_key=_opt_str(ssl_key, "db_ssl_key"),
+        pool_size=_opt_int(pool_size, "db_pool_size", 5) or 5,
+        max_overflow=_opt_int(max_overflow, "db_max_overflow", 10) or 0,
+        retention_days=(
+            val if (val := _opt_int(retention_days, "db_retention_days", 90)) is not None else 90
+        ),
+        workstation_id=_opt_str(workstation_id, "workstation_id") or "",
+        profile_name=_opt_str(profile_name, "soclens_profile") or get_active_profile_name(),
+        analyst_id=_opt_str(analyst_id, "analyst_id") or "",
+    )
 
 
 def format_image_viewer_status(mode: str) -> str:
