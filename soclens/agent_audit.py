@@ -318,6 +318,22 @@ def _is_redacted_placeholder(val: str) -> bool:
     return val in _REDACTED_PLACEHOLDERS
 
 
+_ENV_VAR_REF_RE = re.compile(
+    r"^(?:\$[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|\$\{[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\}|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)$"
+)
+_ENV_VAR_BRACED_AT_START_RE = re.compile(
+    r"\$\{[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\}(?=$|[\s,;\"'<>}\])&.])"
+)
+
+
+def _is_env_var_reference(val: str, *, allow_trailing_dot: bool = False) -> bool:
+    if not val:
+        return False
+    if allow_trailing_dot and val.startswith("$") and val.endswith("."):
+        return bool(_ENV_VAR_REF_RE.fullmatch(val[:-1]))
+    return bool(_ENV_VAR_REF_RE.fullmatch(val))
+
+
 _QUOTED_START_RE = re.compile(r"(\\*+)([\"'])")
 _AUTH_MULTI_SCHEME_RE = re.compile(r"(?i)(" + _AUTH_MULTIPARAM_SCHEMES + r")([ \t]++)")
 _AUTH_SINGLE_SCHEME_RE = re.compile(r"(?i)(" + _AUTH_SINGLE_TOKEN_SCHEMES + r")([ \t]++)")
@@ -819,7 +835,7 @@ def _find_closing_quote(
     return close_idx
 
 
-def _redact_quoted_fields(text: str) -> str:
+def _redact_quoted_fields(text: str, *, preserve_env_var_refs: bool = False) -> str:
     parts: list[str] = []
     pos = 0
     pem_index: tuple[dict[str, list[int]], list[int]] | None = None
@@ -856,7 +872,11 @@ def _redact_quoted_fields(text: str) -> str:
             ):
                 end_idx -= 1
             val = text[match.end() : end_idx]
-            if not val or _is_redacted_placeholder(val):
+            if (
+                not val
+                or _is_redacted_placeholder(val)
+                or (preserve_env_var_refs and _is_env_var_reference(val))
+            ):
                 parts.append(text[pos:end_idx])
                 pos = end_idx
                 continue
@@ -867,7 +887,11 @@ def _redact_quoted_fields(text: str) -> str:
 
         close_end = close_idx + len(q2_backslashes) + 1
         val = text[match.end() : close_idx]
-        if not val or _is_redacted_placeholder(val):
+        if (
+            not val
+            or _is_redacted_placeholder(val)
+            or (preserve_env_var_refs and _is_env_var_reference(val))
+        ):
             parts.append(text[pos:close_end])
             pos = close_end
             continue
@@ -882,7 +906,7 @@ def _redact_quoted_fields(text: str) -> str:
     return "".join(parts)
 
 
-def _redact_quoted_assignments(text: str) -> str:
+def _redact_quoted_assignments(text: str, *, preserve_env_var_refs: bool = False) -> str:
     parts: list[str] = []
     pos = 0
     pem_index: tuple[dict[str, list[int]], list[int]] | None = None
@@ -921,7 +945,11 @@ def _redact_quoted_assignments(text: str) -> str:
             ):
                 end_idx -= 1
             val = text[match.end() : end_idx]
-            if not val or _is_redacted_placeholder(val):
+            if (
+                not val
+                or _is_redacted_placeholder(val)
+                or (preserve_env_var_refs and _is_env_var_reference(val))
+            ):
                 parts.append(text[pos:end_idx])
                 pos = end_idx
                 continue
@@ -932,7 +960,11 @@ def _redact_quoted_assignments(text: str) -> str:
 
         close_end = close_idx + len(q_backslashes) + 1
         val = text[match.end() : close_idx]
-        if not val or _is_redacted_placeholder(val):
+        if (
+            not val
+            or _is_redacted_placeholder(val)
+            or (preserve_env_var_refs and _is_env_var_reference(val))
+        ):
             parts.append(text[pos:close_end])
             pos = close_end
             continue
@@ -1091,7 +1123,7 @@ def _scan_kv_value_end(text: str, start: int, *, multi_param: bool = False) -> i
     return end if end > start else None
 
 
-def _redact_url_query_secrets(text: str) -> str:
+def _redact_url_query_secrets(text: str, *, preserve_env_var_refs: bool = False) -> str:
     parts: list[str] = []
     pos = 0
     n = len(text)
@@ -1140,7 +1172,11 @@ def _redact_url_query_secrets(text: str) -> str:
                 ):
                     end_idx -= 1
                 val = text[q_m.end() : end_idx]
-                if not val or _is_redacted_placeholder(val):
+                if (
+                    not val
+                    or _is_redacted_placeholder(val)
+                    or (preserve_env_var_refs and _is_env_var_reference(val))
+                ):
                     parts.append(text[pos:end_idx])
                     pos = end_idx
                     continue
@@ -1164,7 +1200,11 @@ def _redact_url_query_secrets(text: str) -> str:
                 quote_tracker.restore(q_snap)
                 quote_tracker.advance_to(end_idx)
                 val = text[q_m.end() : end_idx]
-                if not val or _is_redacted_placeholder(val):
+                if (
+                    not val
+                    or _is_redacted_placeholder(val)
+                    or (preserve_env_var_refs and _is_env_var_reference(val))
+                ):
                     parts.append(text[pos:end_idx])
                     pos = end_idx
                     continue
@@ -1173,7 +1213,11 @@ def _redact_url_query_secrets(text: str) -> str:
                 pos = end_idx
                 continue
             val = text[q_m.end() : close_idx]
-            if not val or _is_redacted_placeholder(val):
+            if (
+                not val
+                or _is_redacted_placeholder(val)
+                or (preserve_env_var_refs and _is_env_var_reference(val))
+            ):
                 parts.append(text[pos:close_end])
                 pos = close_end
                 continue
@@ -1182,13 +1226,22 @@ def _redact_url_query_secrets(text: str) -> str:
             pos = close_end
             continue
 
+        if preserve_env_var_refs and (
+            braced_m := _ENV_VAR_BRACED_AT_START_RE.match(text, val_start)
+        ) is not None:
+            parts.append(text[pos : braced_m.end()])
+            pos = braced_m.end()
+            continue
+
         val_end = _scan_url_query_value_end(text, val_start)
         if val_end is None:
             parts.append(text[pos:val_start])
             pos = val_start
             continue
         val = text[val_start:val_end]
-        if _is_redacted_placeholder(val):
+        if _is_redacted_placeholder(val) or (
+            preserve_env_var_refs and _is_env_var_reference(val, allow_trailing_dot=True)
+        ):
             parts.append(text[pos:val_end])
             pos = val_end
             continue
@@ -1702,7 +1755,7 @@ def _resolve_encl_end(
     return end_pos, pem_index
 
 
-def _redact_header_kvs(text: str) -> str:
+def _redact_header_kvs(text: str, *, preserve_env_var_refs: bool = False) -> str:
     parts: list[str] = []
     pos = 0
     n = len(text)
@@ -2279,6 +2332,12 @@ def _redact_header_kvs(text: str) -> str:
                 pos = close_end
                 continue
 
+            if preserve_env_var_refs and (
+                braced_m := _ENV_VAR_BRACED_AT_START_RE.match(text, after_scheme)
+            ) is not None:
+                parts.append(text[pos : braced_m.end()])
+                pos = braced_m.end()
+                continue
             sv_end = _scan_kv_value_end(text, after_scheme, multi_param=False)
             if sv_end is None:
                 parts.append(text[pos:after_scheme])
@@ -2329,7 +2388,11 @@ def _redact_header_kvs(text: str) -> str:
                     pos = end_pos
                     continue
             sv_val = text[after_scheme:sv_end]
-            if _is_redacted_placeholder(sv_val) or _AUTH_REDACTED_KV_RE.fullmatch(sv_val) is not None:
+            if (
+                _is_redacted_placeholder(sv_val)
+                or _AUTH_REDACTED_KV_RE.fullmatch(sv_val) is not None
+                or (preserve_env_var_refs and _is_env_var_reference(sv_val, allow_trailing_dot=True))
+            ):
                 parts.append(text[pos:sv_end])
                 pos = sv_end
                 continue
@@ -2338,12 +2401,22 @@ def _redact_header_kvs(text: str) -> str:
             pos = sv_end
             continue
 
+        if preserve_env_var_refs and (
+            braced_m := _ENV_VAR_BRACED_AT_START_RE.match(text, val_start)
+        ) is not None:
+            parts.append(text[pos : braced_m.end()])
+            pos = braced_m.end()
+            continue
+
         sv_end = _scan_kv_value_end(text, val_start, multi_param=False)
         if sv_end is None:
             parts.append(text[pos:val_start])
             pos = val_start
             continue
-        if _is_redacted_placeholder(text[val_start:sv_end]):
+        sv_raw = text[val_start:sv_end]
+        if _is_redacted_placeholder(sv_raw) or (
+            preserve_env_var_refs and _is_env_var_reference(sv_raw, allow_trailing_dot=True)
+        ):
             parts.append(text[pos:sv_end])
             pos = sv_end
             continue
@@ -2357,7 +2430,7 @@ def _redact_header_kvs(text: str) -> str:
     return "".join(parts)
 
 
-def _redact_bearer_schemes(text: str) -> str:
+def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) -> str:
     parts: list[str] = []
     pos = 0
     n = len(text)
@@ -2398,7 +2471,11 @@ def _redact_bearer_schemes(text: str) -> str:
                 ):
                     end_idx -= 1
                 val = text[q_m.end() : end_idx]
-                if not val or _is_redacted_placeholder(val):
+                if (
+                    not val
+                    or _is_redacted_placeholder(val)
+                    or (preserve_env_var_refs and _is_env_var_reference(val))
+                ):
                     parts.append(text[pos:end_idx])
                     pos = end_idx
                     continue
@@ -2408,7 +2485,11 @@ def _redact_bearer_schemes(text: str) -> str:
                 continue
             close_end = close_idx + len(q_bs) + 1
             val = text[q_m.end() : close_idx]
-            if not val or _is_redacted_placeholder(val):
+            if (
+                not val
+                or _is_redacted_placeholder(val)
+                or (preserve_env_var_refs and _is_env_var_reference(val))
+            ):
                 parts.append(text[pos:close_end])
                 pos = close_end
                 continue
@@ -2456,7 +2537,12 @@ def _redact_bearer_schemes(text: str) -> str:
                     ):
                         end_idx -= 1
                     val = text[kv_m.end() : end_idx]
-                    if is_non_secret_kv or not val or _is_redacted_placeholder(val):
+                    if (
+                        is_non_secret_kv
+                        or not val
+                        or _is_redacted_placeholder(val)
+                        or (preserve_env_var_refs and _is_env_var_reference(val))
+                    ):
                         parts.append(text[pos:end_idx])
                         pos = end_idx
                         continue
@@ -2480,7 +2566,12 @@ def _redact_bearer_schemes(text: str) -> str:
                     quote_tracker.restore(kv_snap)
                     quote_tracker.advance_to(end_idx)
                     val = text[kv_m.end() : end_idx]
-                    if is_non_secret_kv or not val or _is_redacted_placeholder(val):
+                    if (
+                        is_non_secret_kv
+                        or not val
+                        or _is_redacted_placeholder(val)
+                        or (preserve_env_var_refs and _is_env_var_reference(val))
+                    ):
                         parts.append(text[pos:end_idx])
                         pos = end_idx
                         continue
@@ -2489,7 +2580,12 @@ def _redact_bearer_schemes(text: str) -> str:
                     pos = end_idx
                     continue
                 val = text[kv_m.end() : close_idx]
-                if is_non_secret_kv or not val or _is_redacted_placeholder(val):
+                if (
+                    is_non_secret_kv
+                    or not val
+                    or _is_redacted_placeholder(val)
+                    or (preserve_env_var_refs and _is_env_var_reference(val))
+                ):
                     parts.append(text[pos:close_end])
                     pos = close_end
                     continue
@@ -2504,7 +2600,9 @@ def _redact_bearer_schemes(text: str) -> str:
             pos = val_start
             continue
         val = val_m.group(0)
-        if _is_redacted_placeholder(val):
+        if _is_redacted_placeholder(val) or (
+            preserve_env_var_refs and _is_env_var_reference(val, allow_trailing_dot=True)
+        ):
             parts.append(text[pos : val_m.end()])
             pos = val_m.end()
             continue
@@ -2569,16 +2667,16 @@ def _redact_bearer_schemes(text: str) -> str:
     return "".join(parts)
 
 
-def _redact_string(text: str) -> str:
+def _redact_string(text: str, *, preserve_env_var_refs: bool = False) -> str:
     if not text:
         return text
     out = _URL_USERINFO_RE.sub(r"\1://\2:<REDACTED>@", text)
-    out = _redact_quoted_fields(out)
-    out = _redact_quoted_assignments(out)
+    out = _redact_quoted_fields(out, preserve_env_var_refs=preserve_env_var_refs)
+    out = _redact_quoted_assignments(out, preserve_env_var_refs=preserve_env_var_refs)
     out = _redact_pem_blocks(out)
-    out = _redact_url_query_secrets(out)
-    out = _redact_header_kvs(out)
-    out = _redact_bearer_schemes(out)
+    out = _redact_url_query_secrets(out, preserve_env_var_refs=preserve_env_var_refs)
+    out = _redact_header_kvs(out, preserve_env_var_refs=preserve_env_var_refs)
+    out = _redact_bearer_schemes(out, preserve_env_var_refs=preserve_env_var_refs)
     out = _JWT_RE.sub("<REDACTED_JWT>", out)
     out = _VENDOR_PREFIX_RE.sub("<REDACTED>", out)
     out = _VAULT_URI_RE.sub("<REDACTED>", out)
@@ -2586,7 +2684,9 @@ def _redact_string(text: str) -> str:
     return out
 
 
-def _redact_recursive(value: Any, *, _depth: int = 0) -> Any:
+def _redact_recursive(
+    value: Any, *, _depth: int = 0, preserve_env_var_refs: bool = False
+) -> Any:
     if _depth >= _MAX_REDACT_DEPTH:
         return "<REDACTED_MAX_DEPTH>"
 
@@ -2594,7 +2694,7 @@ def _redact_recursive(value: Any, *, _depth: int = 0) -> Any:
         return value
 
     if isinstance(value, str):
-        return _redact_string(value)
+        return _redact_string(value, preserve_env_var_refs=preserve_env_var_refs)
 
     if isinstance(value, Mapping):
         redacted: dict[str, Any] = {}
@@ -2605,29 +2705,64 @@ def _redact_recursive(value: Any, *, _depth: int = 0) -> Any:
                     redacted[key_str] = raw_v
                 elif isinstance(raw_v, str) and not raw_v:
                     redacted[key_str] = raw_v
+                elif (
+                    preserve_env_var_refs
+                    and isinstance(raw_v, str)
+                    and _is_env_var_reference(raw_v)
+                ):
+                    redacted[key_str] = raw_v
                 elif isinstance(raw_v, Mapping):
-                    redacted[key_str] = _redact_recursive(raw_v, _depth=_depth + 1)
+                    redacted[key_str] = _redact_recursive(
+                        raw_v,
+                        _depth=_depth + 1,
+                        preserve_env_var_refs=preserve_env_var_refs,
+                    )
                 else:
                     redacted[key_str] = "<REDACTED>"
             else:
-                redacted[key_str] = _redact_recursive(raw_v, _depth=_depth + 1)
+                redacted[key_str] = _redact_recursive(
+                    raw_v,
+                    _depth=_depth + 1,
+                    preserve_env_var_refs=preserve_env_var_refs,
+                )
         return redacted
 
     if isinstance(value, list):
-        return [_redact_recursive(item, _depth=_depth + 1) for item in value]
+        return [
+            _redact_recursive(
+                item,
+                _depth=_depth + 1,
+                preserve_env_var_refs=preserve_env_var_refs,
+            )
+            for item in value
+        ]
 
     if isinstance(value, tuple):
-        return tuple(_redact_recursive(item, _depth=_depth + 1) for item in value)
+        return tuple(
+            _redact_recursive(
+                item,
+                _depth=_depth + 1,
+                preserve_env_var_refs=preserve_env_var_refs,
+            )
+            for item in value
+        )
 
     if isinstance(value, set):
-        return [_redact_recursive(item, _depth=_depth + 1) for item in sorted(value, key=str)]
+        return [
+            _redact_recursive(
+                item,
+                _depth=_depth + 1,
+                preserve_env_var_refs=preserve_env_var_refs,
+            )
+            for item in sorted(value, key=str)
+        ]
 
-    return _redact_string(str(value))
+    return _redact_string(str(value), preserve_env_var_refs=preserve_env_var_refs)
 
 
-def redact_sensitive_data(value: Any) -> Any:
+def redact_sensitive_data(value: Any, *, preserve_env_var_refs: bool = False) -> Any:
     """Recursively redact Bearer tokens, API keys, secrets, JWTs, and passwords."""
-    return _redact_recursive(value, _depth=0)
+    return _redact_recursive(value, _depth=0, preserve_env_var_refs=preserve_env_var_refs)
 
 
 @dataclass(frozen=True)

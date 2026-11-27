@@ -313,10 +313,10 @@ class PromptAndSecretGuard:
 
     @staticmethod
     def redact_text(text: str) -> str:
-        """Apply SOCLens secret redaction plus supplementary token scrubbing."""
+        """Apply SOCLens secret redaction (preserving env-var placeholders) plus token scrubbing."""
         if not text:
             return ""
-        redacted = str(redact_sensitive_data(text))
+        redacted = str(redact_sensitive_data(text, preserve_env_var_refs=True))
         redacted = _GLPAT_SCRUB_RE.sub("<REDACTED>", redacted)
         return redacted
 

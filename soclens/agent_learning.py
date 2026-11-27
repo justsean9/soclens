@@ -195,7 +195,7 @@ class PassiveEnvironmentDiscoverer:
             return self._extract_es_notables(tool_output, outer_conf)
         if clean_tool in {"splunk_es_lookup_asset", "splunk_es_lookup_identity"}:
             return self._extract_es_assets_identities(clean_tool, tool_output, outer_conf)
-        if clean_tool in {"s1_list_agents", "s1_get_agent_details"}:
+        if clean_tool in {"s1_list_agents", "s1_get_agent", "s1_get_agent_details"}:
             return self._extract_s1_agents(tool_output, outer_conf)
         if clean_tool in {"s1_list_threats", "s1_get_threat_details"}:
             return self._extract_s1_threats(tool_output, outer_conf)
@@ -207,6 +207,18 @@ class PassiveEnvironmentDiscoverer:
 
     @staticmethod
     def _unwrap_items(tool_output: Any, *keys: str) -> list[Mapping[str, Any]]:
+        single_object_keys = (
+            "name",
+            "rule_name",
+            "orig_rule_title",
+            "siteName",
+            "siteId",
+            "osType",
+            "osName",
+            "processName",
+            "threatInfo",
+            "computerName",
+        )
         if isinstance(tool_output, Sequence) and not isinstance(tool_output, (str, bytes)):
             return [item for item in tool_output if isinstance(item, Mapping)]
         if isinstance(tool_output, Mapping):
@@ -218,18 +230,9 @@ class PassiveEnvironmentDiscoverer:
                     nested = val.get("results") or val.get("items") or val.get("data")
                     if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)):
                         return [item for item in nested if isinstance(item, Mapping)]
-            if any(
-                k in tool_output
-                for k in (
-                    "name",
-                    "rule_name",
-                    "orig_rule_title",
-                    "siteName",
-                    "processName",
-                    "threatInfo",
-                    "computerName",
-                )
-            ):
+                    if any(k in val for k in single_object_keys):
+                        return [val]
+            if any(k in tool_output for k in single_object_keys):
                 return [tool_output]
         return []
 

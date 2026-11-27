@@ -2292,9 +2292,16 @@ class StorageManager:
         """Insert or update a SOC learning entry (globally shared, redacted)."""
         self._ensure_ready()
         now = time.time()
-        clean_title = str(redact_sensitive_data(title or "")).strip()
-        clean_content = str(redact_sensitive_data(content or "")).strip()
-        clean_tags_raw = redact_sensitive_data(list(tags) if tags else [])
+        clean_title = str(
+            redact_sensitive_data(title or "", preserve_env_var_refs=True)
+        ).strip()
+        clean_content = str(
+            redact_sensitive_data(content or "", preserve_env_var_refs=True)
+        ).strip()
+        clean_tags_raw = redact_sensitive_data(
+            list(tags) if tags else [],
+            preserve_env_var_refs=True,
+        )
         clean_tags = (
             [str(t).strip() for t in clean_tags_raw if str(t).strip()]
             if isinstance(clean_tags_raw, list)
@@ -2615,7 +2622,10 @@ class StorageManager:
         self._ensure_ready()
         clean_id = str(learning_id or "").strip()
         now = time.time()
-        redacted_snap_raw = redact_sensitive_data(dict(snapshot) if snapshot else {})
+        redacted_snap_raw = redact_sensitive_data(
+            dict(snapshot) if snapshot else {},
+            preserve_env_var_refs=True,
+        )
         redacted_snap = dict(redacted_snap_raw) if isinstance(redacted_snap_raw, Mapping) else {}
         with self._lock:
             with self.session() as sess:
@@ -2632,8 +2642,12 @@ class StorageManager:
                         revision_no=next_rev,
                         action=str(action or "edit")[:64],
                         actor=str(redact_sensitive_data(actor or self._config.analyst_id))[:128],
-                        previous_content=str(redact_sensitive_data(previous_content or "")),
-                        new_content=str(redact_sensitive_data(new_content or "")),
+                        previous_content=str(
+                            redact_sensitive_data(previous_content or "", preserve_env_var_refs=True)
+                        ),
+                        new_content=str(
+                            redact_sensitive_data(new_content or "", preserve_env_var_refs=True)
+                        ),
                         previous_status=str(previous_status or "")[:32],
                         new_status=str(new_status or "")[:32],
                         snapshot_json=_json_dumps_safe(redacted_snap),

@@ -172,22 +172,65 @@ def test_guards_block_invisible_unicode_nfkc_injection_and_allow_negated_prose()
 def test_secret_guard_exempts_env_var_names_and_redacts_real_secrets(tmp_path: Path) -> None:
     storage, manager = _make_manager(tmp_path)
 
-    env_res = manager.scan_candidate(
-        'Configure Splunk integration using API_KEY="SPLUNK_API_TOKEN" from environment.'
-    )
-    assert env_res.allowed is True
-    assert env_res.blocked_reasons == []
+    env_samples = [
+        'Configure Splunk integration using API_KEY="SPLUNK_API_TOKEN" from environment.',
+        "Configure Splunk integration using API_KEY='SPLUNK_API_TOKEN' from environment.",
+        "Configure Splunk integration using API_KEY=$SPLUNK_API_TOKEN from environment.",
+        "Configure Splunk integration using API_KEY=${SPLUNK_API_TOKEN} from environment.",
+        '{"api_key": "SPLUNK_API_TOKEN"}',
+    ]
+    for idx, env_sample in enumerate(env_samples):
+        env_res = manager.scan_candidate(env_sample)
+        assert env_res.allowed is True
+        assert env_res.blocked_reasons == []
+        assert env_res.findings == []
+        assert "SPLUNK_API_TOKEN" in env_res.redacted_content
+        assert "<REDACTED>" not in env_res.redacted_content
+
+        persisted = manager.submit_manual_learn(
+            title=f"Env Var Reference Form {idx}",
+            content=env_sample,
+            category="environment_fact",
+            actor="analyst-1",
+        )
+        assert "SPLUNK_API_TOKEN" in persisted.content
+        assert "<REDACTED>" not in persisted.content
+        reloaded = storage.get_learning(persisted.id)
+        assert reloaded is not None and "SPLUNK_API_TOKEN" in reloaded["content"]
 
     real_sk = "sk" + "-proj-unitsecret1234567890"
     real_gh = "ghp" + "_unitsecret1234567890abcdef"
+    real_gl = "glpat" + "-unitsecret1234567890"
     real_aws = "AK" + "IAIOSFODNN7UNITKEY"
     real_assign = 'api_key="correct_horse_battery_staple"'
-    for sample in (real_sk, real_gh, real_aws, real_assign):
+    real_bearer = "Bearer super_secret_token_999"
+    real_dsn = "postgresql://soc_user:PgPass99!@pg.internal:5432/soclens"
+    real_vault = "vault://secret/data/soclens/prod#api_key"
+    real_hvs = "hvs.CAESIJSecret999"
+    real_pem = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"
+    for sample in (
+        real_sk,
+        real_gh,
+        real_gl,
+        real_aws,
+        real_assign,
+        real_bearer,
+        real_dsn,
+        real_vault,
+        real_hvs,
+        real_pem,
+    ):
         res = manager.scan_candidate(f"Splunk index wineventlog observed {sample}.")
         assert res.allowed is True
         assert sample not in res.redacted_content
         assert "correct_horse_battery_staple" not in res.redacted_content
         assert "<REDACTED>" in res.redacted_content
+
+    mixed = manager.scan_candidate(f'API_KEY="SPLUNK_API_TOKEN" and fallback {real_assign}')
+    assert mixed.allowed is True
+    assert "SPLUNK_API_TOKEN" in mixed.redacted_content
+    assert "correct_horse_battery_staple" not in mixed.redacted_content
+    assert "<REDACTED>" in mixed.redacted_content
 
     saved = manager.submit_manual_learn(
         title="Credential Hygiene Check",
@@ -333,3 +376,36 @@ def test_lifecycle_approve_edit_pin_rollback_delete_and_takeaway(tmp_path: Path)
     audits = AuditLogStore(storage=storage).query()
     assert len(audits) >= 6
     assert AIPolicyStore(storage=storage).load() == AIPolicyConfig(learning_mode="manual")
+
+
+def test_passive_discovery_supports_s1_get_agent_flat_and_wrapped_outputs(tmp_path: Path) -> None:
+    _storage, manager = _make_manager(tmp_path)
+
+    flat = manager.record_passive_discovery(
+        tool_name="s1_get_agent",
+        tool_args={"agent_id": "ag-2"},
+        tool_output={
+            "id": "ag-2",
+            "siteName": "Prod-US",
+            "osType": "windows",
+            "computerName": "win-01",
+        },
+        learning_mode="manual",
+    )
+    assert len(flat) == 1
+    assert flat[0].status == "pending"
+    assert "Prod-US" in flat[0].title
+    assert "windows" in flat[0].title
+
+    wrapped = manager.record_passive_discovery(
+        tool_name="s1_get_agent",
+        tool_args={"agent_id": "ag-3"},
+        tool_output={
+            "ok": True,
+            "data": {"id": "ag-3", "siteName": "EMEA-DC", "osType": "linux"},
+        },
+        learning_mode="manual",
+    )
+    assert len(wrapped) == 1
+    assert "EMEA-DC" in wrapped[0].title
+    assert "linux" in wrapped[0].title

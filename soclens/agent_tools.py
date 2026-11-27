@@ -2232,7 +2232,7 @@ def build_default_readonly_registry(
             except TypeError:
                 raw_entries = stor.search_learnings(query, limit=limit)
         safe_raw = _to_json_safe(list(raw_entries) if isinstance(raw_entries, Sequence) else [])
-        redacted_entries = redact_sensitive_data(safe_raw)
+        redacted_entries = redact_sensitive_data(safe_raw, preserve_env_var_refs=True)
         entries = redacted_entries if isinstance(redacted_entries, list) else []
         return {"ok": True, "query": query, "count": len(entries), "entries": entries}
 

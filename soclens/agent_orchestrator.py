@@ -761,7 +761,9 @@ class SocAgentOrchestrator:
                 if callable(getattr(lm, "build_frozen_snapshot", None)):
                     frozen = lm.build_frozen_snapshot(max_chars=2500)
                     if isinstance(frozen, str) and frozen.strip():
-                        safe_frozen = str(redact_sensitive_data(frozen.strip()))
+                        safe_frozen = str(
+                            redact_sensitive_data(frozen.strip(), preserve_env_var_refs=True)
+                        )
                         knowledge_blocks.append(safe_frozen)
                         stats["knowledge_hits"] += 1
                 if callable(getattr(lm, "match_relevant_entries", None)):
@@ -787,7 +789,12 @@ class SocAgentOrchestrator:
                                 continue
                             if eid:
                                 seen_k_ids.add(eid)
-                            safe_line = str(redact_sensitive_data(f"- [{title}] {content}"))
+                            safe_line = str(
+                                redact_sensitive_data(
+                                    f"- [{title}] {content}",
+                                    preserve_env_var_refs=True,
+                                )
+                            )
                             knowledge_blocks.append(safe_line)
                             stats["knowledge_hits"] += 1
             except Exception:
@@ -915,7 +922,7 @@ class SocAgentOrchestrator:
             except Exception:
                 frozen = ""
         if isinstance(frozen, str) and frozen.strip():
-            sections.append(str(redact_sensitive_data(frozen.strip())))
+            sections.append(str(redact_sensitive_data(frozen.strip(), preserve_env_var_refs=True)))
 
         clean_q = (query_text or "").strip()
         if clean_q and callable(getattr(lm, "match_relevant_entries", None)):
@@ -935,7 +942,14 @@ class SocAgentOrchestrator:
                 ).strip()
                 if not content or (frozen and content in frozen):
                     continue
-                matched_lines.append(str(redact_sensitive_data(f"- [{title}] {content}")))
+                matched_lines.append(
+                    str(
+                        redact_sensitive_data(
+                            f"- [{title}] {content}",
+                            preserve_env_var_refs=True,
+                        )
+                    )
+                )
             if matched_lines:
                 sections.append("Matched Playbooks & Facts:\n" + "\n".join(matched_lines[:8]))
 

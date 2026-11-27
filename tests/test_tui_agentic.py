@@ -1717,6 +1717,76 @@ def test_tui_learning_mode_control_panel_knowledge_manager_and_event_teach(
     asyncio.run(_run())
 
 
+def test_knowledge_manager_widget_handles_stale_deleted_entry_without_crashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from textual.widgets import DataTable, Static, TabbedContent
+
+    from soclens.tui.ai_widgets import KnowledgeManagerWidget
+    from soclens.tui.screens.llm import LocalLLMPane
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+    entry = app.learning_manager.submit_manual_learn(
+        title="Stale Entry Guard Test",
+        content="Splunk index stale_idx test.",
+        category="environment_fact",
+        actor="analyst-1",
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await pilot.pause()
+            llm_pane = app.query_one(LocalLLMPane)
+            subtabs = llm_pane.query_one("#llm-subtabs", TabbedContent)
+            subtabs.active = "llm-tab-knowledge"
+            await pilot.pause()
+
+            know = llm_pane.query_one(KnowledgeManagerWidget)
+            tbl = know.query_one("#ai-know-table", DataTable)
+            assert tbl.row_count == 1
+
+            for btn_id in (
+                "#ai-know-approve-btn",
+                "#ai-know-pin-btn",
+                "#ai-know-rollback-btn",
+                "#ai-know-delete-btn",
+            ):
+                # Re-seed if needed, load into UI table, then delete out-of-band before button press
+                if app.learning_manager.get_entry(entry.id) is None:
+                    entry_new = app.learning_manager.submit_manual_learn(
+                        title="Stale Entry Guard Test",
+                        content="Splunk index stale_idx test.",
+                        category="environment_fact",
+                        actor="analyst-1",
+                    )
+                    target_id = entry_new.id
+                else:
+                    target_id = entry.id
+                know.refresh_entries()
+                await pilot.pause()
+                assert tbl.row_count == 1
+                assert app.learning_manager.delete_entry(target_id, actor="other-tab") is True
+
+                know.query_one(btn_id, Button).press()
+                await pilot.pause()
+                assert tbl.row_count == 0
+                status_txt = str(know.query_one("#ai-know-status", Static).content)
+                assert "refreshed" in status_txt.lower()
+
+    asyncio.run(_run())
+
+
 
 
 

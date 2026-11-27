@@ -420,7 +420,7 @@ class TeachLearnModal(ModalScreen[dict[str, Any] | None]):
                     tags=tags,
                     actor=self._actor,
                 )
-        except ValueError as exc:
+        except (ValueError, KeyError) as exc:
             err_widget.update(str(exc))
             return
         self.dismiss(saved.to_dict())
@@ -1586,7 +1586,7 @@ class KnowledgeManagerWidget(Vertical):
         )
         if entry.tags:
             detail.write(f"Tags: {', '.join(entry.tags)}")
-        detail.write(str(redact_sensitive_data(entry.content)))
+        detail.write(str(redact_sensitive_data(entry.content, preserve_env_var_refs=True)))
         revisions = self._learning_manager.get_revisions(entry.id)
         if revisions:
             rev_summary = ", ".join(
@@ -1634,7 +1634,12 @@ class KnowledgeManagerWidget(Vertical):
         if entry is None:
             self._set_status("Select a knowledge entry first.")
             return
-        updated = self._learning_manager.approve_entry(entry.id)
+        try:
+            updated = self._learning_manager.approve_entry(entry.id)
+        except KeyError as exc:
+            self.refresh_entries()
+            self._set_status(f"Entry unavailable ({exc}); list refreshed.")
+            return
         self.refresh_entries()
         self._notify_audit_sibling()
         self._set_status(f"Approved entry '{updated.title}' -> active.")
@@ -1669,10 +1674,18 @@ class KnowledgeManagerWidget(Vertical):
         if entry is None:
             self._set_status("Select a pending entry to reject.")
             return
-        self._learning_manager.delete_entry(entry.id)
+        try:
+            deleted = self._learning_manager.delete_entry(entry.id)
+        except KeyError as exc:
+            self.refresh_entries()
+            self._set_status(f"Entry unavailable ({exc}); list refreshed.")
+            return
         self.refresh_entries()
         self._notify_audit_sibling()
-        self._set_status(f"Rejected and removed entry '{entry.title}'.")
+        if not deleted:
+            self._set_status(f"Entry '{entry.title}' was already removed; list refreshed.")
+        else:
+            self._set_status(f"Rejected and removed entry '{entry.title}'.")
 
     @on(Button.Pressed, "#ai-know-pin-btn")
     def handle_pin_btn(self) -> None:
@@ -1680,7 +1693,12 @@ class KnowledgeManagerWidget(Vertical):
         if entry is None:
             self._set_status("Select a knowledge entry to pin/unpin.")
             return
-        updated = self._learning_manager.pin_entry(entry.id, not entry.pinned)
+        try:
+            updated = self._learning_manager.pin_entry(entry.id, not entry.pinned)
+        except KeyError as exc:
+            self.refresh_entries()
+            self._set_status(f"Entry unavailable ({exc}); list refreshed.")
+            return
         self.refresh_entries()
         self._notify_audit_sibling()
         self._set_status(
@@ -1693,7 +1711,12 @@ class KnowledgeManagerWidget(Vertical):
         if entry is None:
             self._set_status("Select a knowledge entry to roll back.")
             return
-        updated = self._learning_manager.rollback_entry(entry.id)
+        try:
+            updated = self._learning_manager.rollback_entry(entry.id)
+        except KeyError as exc:
+            self.refresh_entries()
+            self._set_status(f"Entry unavailable ({exc}); list refreshed.")
+            return
         self.refresh_entries()
         self._notify_audit_sibling()
         self._set_status(f"Rolled back entry '{updated.title}' (status={updated.status}).")
@@ -1704,10 +1727,18 @@ class KnowledgeManagerWidget(Vertical):
         if entry is None:
             self._set_status("Select a knowledge entry to delete.")
             return
-        self._learning_manager.delete_entry(entry.id)
+        try:
+            deleted = self._learning_manager.delete_entry(entry.id)
+        except KeyError as exc:
+            self.refresh_entries()
+            self._set_status(f"Entry unavailable ({exc}); list refreshed.")
+            return
         self.refresh_entries()
         self._notify_audit_sibling()
-        self._set_status(f"Deleted entry '{entry.title}'.")
+        if not deleted:
+            self._set_status(f"Entry '{entry.title}' was already removed; list refreshed.")
+        else:
+            self._set_status(f"Deleted entry '{entry.title}'.")
 
     @on(DataTable.RowHighlighted, "#ai-know-table")
     def handle_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
