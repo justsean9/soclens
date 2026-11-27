@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import warnings
+import weakref
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -330,9 +331,13 @@ class TuiLogHandler(logging.Handler):
         ignore_prefixes: tuple[str, ...] = (),
         min_level: int = logging.NOTSET,
         active_source_fn: Callable[[], str | None] | None = None,
+        weak_store: bool = False,
     ) -> None:
         super().__init__(level=min_level)
-        self._store = store
+        self._store: AppLogStore | None = None if weak_store else store
+        self._store_ref: weakref.ref[AppLogStore] | None = (
+            weakref.ref(store) if weak_store else None
+        )
         self._ignore_prefixes = ignore_prefixes
         self._min_level = min_level
         self._active_source_fn = active_source_fn
@@ -340,6 +345,9 @@ class TuiLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            store = self._store_ref() if self._store_ref is not None else self._store
+            if store is None:
+                return
             for prefix in self._ignore_prefixes:
                 if record.name == prefix or record.name.startswith(f"{prefix}."):
                     return
@@ -367,7 +375,7 @@ class TuiLogHandler(logging.Handler):
             )
             created_utc = datetime.fromtimestamp(record.created, tz=UTC)
             timestamp = created_utc.strftime("%H:%M:%S")
-            self._store.append(
+            store.append(
                 LogEntry(
                     timestamp=timestamp,
                     level=_canonical_level(record.levelno),

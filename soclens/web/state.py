@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,42 @@ def _get_session_override_obj(session_state: Any, key: str) -> Any:
     if isinstance(session_state, dict):
         return session_state.get(key)
     return getattr(session_state, key, None)
+
+
+def _release_runtime_resources(
+    shutdown_event: threading.Event,
+    sse_bus: SSEEventBus,
+    log_store: AppLogStore,
+    attached_logger: logging.Logger,
+    log_handler: TuiLogHandler,
+    background_triage_queue: BackgroundTriageQueue,
+    auth_manager: WebAuthManager,
+    storage: StorageManager,
+) -> None:
+    """Idempotently detach logger handlers and dispose runtime resources."""
+    shutdown_event.set()
+    try:
+        sse_bus.close_all()
+    except Exception:
+        pass
+    try:
+        log_store.set_on_entry(None)
+        attached_logger.removeHandler(log_handler)
+        log_handler.close()
+    except Exception:
+        pass
+    try:
+        background_triage_queue.stop(timeout=2.0)
+    except Exception:
+        pass
+    try:
+        auth_manager.clear_sessions()
+    except Exception:
+        pass
+    try:
+        storage.dispose()
+    except Exception:
+        pass
 
 
 class WebRuntimeState:
@@ -194,12 +231,61 @@ class WebRuntimeState:
                 except Exception:
                     pass
 
+        runtime_ref = weakref.ref(self)
+
+        def _get_storage() -> StorageManager | None:
+            rt = runtime_ref()
+            return rt.storage if rt is not None else None
+
+        def _get_learning_manager() -> SOCLearningManager | None:
+            rt = runtime_ref()
+            return rt.learning_manager if rt is not None else None
+
+        def _get_rf_client() -> RecordedFutureClient | None:
+            rt = runtime_ref()
+            return rt.get_rf_client() if rt is not None else None
+
+        def _get_s1_client() -> SentinelOneClient | None:
+            rt = runtime_ref()
+            return rt.get_s1_client() if rt is not None else None
+
+        def _get_splunk_client() -> SplunkClient | None:
+            rt = runtime_ref()
+            return rt.get_splunk_client() if rt is not None else None
+
+        def _get_splunk_es_client() -> SplunkESClient | None:
+            rt = runtime_ref()
+            return rt.get_splunk_es_client() if rt is not None else None
+
+        def _get_osint_client() -> OSINTClient | None:
+            rt = runtime_ref()
+            return rt.get_osint_client() if rt is not None else None
+
+        def _get_llm_client() -> LocalLLMClient:
+            rt = runtime_ref()
+            if rt is not None:
+                return rt.get_llm_client()
+            return LocalLLMClient(get_local_llm_config())
+
+        def _on_bg_triage_complete(
+            event: UniqueEvent,
+            result: InvestigationResult,
+        ) -> None:
+            rt = runtime_ref()
+            if rt is not None:
+                rt._on_background_triage_complete(event, result)
+
+        def _on_log_entry_cb(entry: LogEntry) -> None:
+            rt = runtime_ref()
+            if rt is not None:
+                rt._on_log_entry(entry)
+
         injected_lm = _get_session_override_obj(session_state, "learning_manager")
         if isinstance(injected_lm, SOCLearningManager):
             self.learning_manager = injected_lm
         else:
             self.learning_manager = SOCLearningManager(
-                storage=lambda: self.storage,
+                storage=_get_storage,
                 workspace_dir=self.workspace_dir,
                 policy_store=self.ai_policy_store,
                 audit_store=self.ai_audit_store,
@@ -211,13 +297,13 @@ class WebRuntimeState:
                 pass
 
         self.ai_tool_registry: ReadOnlyToolRegistry = build_default_readonly_registry(
-            rf_client=self.get_rf_client,
-            s1_client=self.get_s1_client,
-            splunk_client=self.get_splunk_client,
-            splunk_es_client=self.get_splunk_es_client,
-            osint_client=self.get_osint_client,
-            storage=lambda: self.storage,
-            learning_manager=lambda: self.learning_manager,
+            rf_client=_get_rf_client,
+            s1_client=_get_s1_client,
+            splunk_client=_get_splunk_client,
+            splunk_es_client=_get_splunk_es_client,
+            osint_client=_get_osint_client,
+            storage=_get_storage,
+            learning_manager=_get_learning_manager,
         )
 
         injected_orch = _get_session_override_obj(session_state, "ai_orchestrator")
@@ -229,24 +315,36 @@ class WebRuntimeState:
                 registry=self.ai_tool_registry,
                 policy_store=self.ai_policy_store,
                 audit_store=self.ai_audit_store,
-                llm_client_factory=llm_factory if callable(llm_factory) else self.get_llm_client,
-                storage=lambda: self.storage,
-                learning_manager=lambda: self.learning_manager,
+                llm_client_factory=llm_factory if callable(llm_factory) else _get_llm_client,
+                storage=_get_storage,
+                learning_manager=_get_learning_manager,
             )
 
         self.background_triage_queue = BackgroundTriageQueue(
             orchestrator=self.ai_orchestrator,
             policy_store=self.ai_policy_store,
             event_store=self.event_ai_store,
-            on_complete=self._on_background_triage_complete,
+            on_complete=_on_bg_triage_complete,
         )
 
         injected_logs = _get_session_override_obj(session_state, "log_store")
         self.log_store = injected_logs if isinstance(injected_logs, AppLogStore) else AppLogStore()
-        self.log_store.set_on_entry(self._on_log_entry)
-        self._log_handler = TuiLogHandler(self.log_store)
+        self.log_store.set_on_entry(_on_log_entry_cb)
+        self._log_handler = TuiLogHandler(self.log_store, weak_store=True)
         self._attached_logger = logging.getLogger("soclens")
         self._attached_logger.addHandler(self._log_handler)
+        self._finalizer = weakref.finalize(
+            self,
+            _release_runtime_resources,
+            self.shutdown_event,
+            self.sse_bus,
+            self.log_store,
+            self._attached_logger,
+            self._log_handler,
+            self.background_triage_queue,
+            self.auth_manager,
+            self.storage,
+        )
 
     @property
     def web_layout_profile(self) -> str:
@@ -499,30 +597,23 @@ class WebRuntimeState:
             if self._cleaned_up:
                 return
             self._cleaned_up = True
-            self.shutdown_event.set()
-            try:
-                self.sse_bus.close_all()
-            except Exception:
-                pass
-            try:
-                self.log_store.set_on_entry(None)
-                self._attached_logger.removeHandler(self._log_handler)
-            except Exception:
-                pass
-            try:
-                self.background_triage_queue.stop(timeout=2.0)
-            except Exception:
-                pass
-            try:
-                self.auth_manager.clear_sessions()
-            except Exception:
-                pass
+            self.server_ref = None
+            finalizer = getattr(self, "_finalizer", None)
+            if finalizer is not None:
+                finalizer()
+            else:
+                _release_runtime_resources(
+                    self.shutdown_event,
+                    self.sse_bus,
+                    self.log_store,
+                    self._attached_logger,
+                    self._log_handler,
+                    self.background_triage_queue,
+                    self.auth_manager,
+                    self.storage,
+                )
             try:
                 clear_session_overrides()
                 clear_unlocked_keys()
-            except Exception:
-                pass
-            try:
-                self.storage.dispose()
             except Exception:
                 pass

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import http.client
 import json
+import logging
 import threading
 import time
+import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,7 @@ from typing import Any
 from soclens.agent_tools import READONLY_TOOL_NAMES
 from soclens.client import RecordedFutureClient
 from soclens.storage import StorageManager
+from soclens.tui.logging_bridge import TuiLogHandler
 from soclens.web import create_app, run_web_server
 
 
@@ -680,3 +684,137 @@ def test_admin_watchlists_add_remove_and_es_bundle_validation(tmp_path: Path) ->
         assert bad_conf.status == 400
     finally:
         app.state.runtime.cleanup()
+
+
+def test_create_app_discarded_without_lifespan_detaches_handler_and_disposes_storage_without_gc(
+    tmp_path: Path,
+) -> None:
+    pkg_logger = logging.getLogger("soclens")
+    before = sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers)
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        app = create_app(workspace_dir=tmp_path, bootstrap_token="gc-probe-tok")
+        during = sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers)
+        assert during == before + 1
+
+        rt_ref = weakref.ref(app.state.runtime)
+        storage = app.state.runtime.storage
+        assert storage._engine is not None
+
+        del app
+        assert rt_ref() is None
+        after = sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers)
+        assert after == before
+        assert storage._engine is None
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def test_create_app_without_lifespan_captures_logs_and_sse_then_detaches_on_delete(
+    tmp_path: Path,
+) -> None:
+    pkg_logger = logging.getLogger("soclens")
+    web_logger = logging.getLogger("soclens.web")
+    before = sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers)
+
+    app = create_app(workspace_dir=tmp_path, bootstrap_token="log-sse-tok")
+    rt_ref = weakref.ref(app.state.runtime)
+    storage = app.state.runtime.storage
+    hdrs = _auth_headers(app, "log-sse-tok")
+
+    async def _stream_log_event(asgi_app: Any) -> str:
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/events/stream",
+            "raw_path": b"/api/events/stream",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in hdrs.items()
+            ],
+            "client": ("127.0.0.1", 54321),
+            "server": ("127.0.0.1", 8765),
+        }
+        chunks: list[bytes] = []
+        sent_req = False
+        disconnect_ev = asyncio.Event()
+        got_log_ev = asyncio.Event()
+        got_initial_ev = asyncio.Event()
+
+        async def receive() -> dict[str, Any]:
+            nonlocal sent_req
+            if not sent_req:
+                sent_req = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await disconnect_ev.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body":
+                body = bytes(message.get("body") or b"")
+                if body:
+                    chunks.append(body)
+                    joined = b"".join(chunks).decode("utf-8", errors="replace")
+                    if "event: status" in joined:
+                        got_initial_ev.set()
+                    if "event: log" in joined and "live-log-probe-xyz" in joined:
+                        got_log_ev.set()
+
+        task = asyncio.create_task(asgi_app(scope, receive, send))
+        try:
+            await asyncio.wait_for(got_initial_ev.wait(), timeout=5.0)
+            web_logger.warning("live-log-probe-xyz")
+            await asyncio.wait_for(got_log_ev.wait(), timeout=5.0)
+        finally:
+            disconnect_ev.set()
+            await asyncio.wait_for(task, timeout=5.0)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    sse_text = asyncio.run(_stream_log_event(app))
+    assert "event: log" in sse_text
+    assert "live-log-probe-xyz" in sse_text
+
+    logs_res = asyncio.run(_call_asgi(app, "GET", "/api/logs", headers=hdrs))
+    assert logs_res.status == 200
+    assert any("live-log-probe-xyz" in str(e.get("message", "")) for e in logs_res.json()["entries"])
+
+    del app
+    gc.collect()
+    assert rt_ref() is None
+    assert sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers) == before
+    assert storage._engine is None
+
+
+def test_web_lifespan_and_cleanup_remain_idempotent(tmp_path: Path) -> None:
+    pkg_logger = logging.getLogger("soclens")
+    before = sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers)
+
+    app = create_app(workspace_dir=tmp_path, bootstrap_token="life-tok")
+    runtime = app.state.runtime
+    storage = runtime.storage
+    assert sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers) == before + 1
+
+    async def _run_lifespan(asgi_app: Any) -> None:
+        async with asgi_app.router.lifespan_context(asgi_app):
+            res = await _call_asgi(asgi_app, "GET", "/")
+            assert res.status == 200
+
+    asyncio.run(_run_lifespan(app))
+    assert runtime.shutdown_event.is_set()
+    assert sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers) == before
+    assert storage._engine is None
+
+    # Repeated cleanup() and subsequent deletion are safe no-ops
+    runtime.cleanup()
+    runtime.cleanup()
+    del runtime
+    del app
+    gc.collect()
+    assert sum(isinstance(h, TuiLogHandler) for h in pkg_logger.handlers) == before

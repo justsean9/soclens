@@ -342,11 +342,12 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def _lifespan(app: Starlette) -> AsyncIterator[None]:
-        _ = app
         try:
             yield
         finally:
-            runtime.cleanup()
+            rt = getattr(getattr(app, "state", None), "runtime", None)
+            if rt is not None:
+                rt.cleanup()
 
     routes: list[Route] = [
         Route("/", index_endpoint, methods=["GET"]),
