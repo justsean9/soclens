@@ -437,6 +437,55 @@ def test_cli_secrets_map_unmap_and_pull_no_plaintext_persisted(
     assert "rf_llm_api_key" not in saved_map
     assert saved_map["rf_api_token"] == "secret_server:1001:rf-api-token"
 
+    # DB secret-managed keys (db_password, db_dsn) also support map, pull, and unmap
+    assert (
+        _run_cli(
+            ["secrets", "map", "db_password", "secret_server:2001:db-pw", "--json"],
+            monkeypatch,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        _run_cli(
+            ["secrets", "map", "db_dsn", "secret_server:2002:db-dsn", "--json"],
+            monkeypatch,
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    fake_db_prov = MagicMock()
+    fake_db_prov.__enter__.return_value = fake_db_prov
+    fake_db_prov.__exit__.return_value = None
+    fake_db_prov.resolve_mapped_settings.return_value = {
+        "rf_api_token": "raw-secret-rf-token-9999",
+        "db_password": "raw-db-password-7777",
+        "db_dsn": "postgresql+pg8000://soc:raw-db-dsn-secret@pg.internal/soclens",
+    }
+    with (
+        patch.object(cli, "build_secret_store_provider", return_value=fake_db_prov),
+        patch("soclens.secret_stores.build_secret_store_provider", return_value=fake_db_prov),
+    ):
+        assert (
+            _run_cli(
+                ["secrets", "pull", "--provider", "secret_server", "--force", "--json"],
+                monkeypatch,
+            )
+            == 0
+        )
+    db_pull_out = capsys.readouterr().out
+    assert "raw-db-password-7777" not in db_pull_out
+    assert "raw-db-dsn-secret" not in db_pull_out
+    db_pull_json = json.loads(db_pull_out)
+    assert "db_password" in db_pull_json["pulled"]
+    assert "db_dsn" in db_pull_json["pulled"]
+
+    assert _run_cli(["secrets", "unmap", "db_password", "--json"], monkeypatch) == 0
+    assert json.loads(capsys.readouterr().out)["was_mapped"] is True
+    assert _run_cli(["secrets", "unmap", "db_dsn", "--json"], monkeypatch) == 0
+    assert json.loads(capsys.readouterr().out)["was_mapped"] is True
+
 
 # ---------------------------------------------------------------------------
 # 3. soclens s1 v2.1 Subcommands, Admin Gating, Site Delete Confirm & Cloning

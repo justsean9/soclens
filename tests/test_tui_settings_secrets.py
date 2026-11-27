@@ -841,3 +841,92 @@ def test_tui_settings_80x24_cat_secrets_form_pane_and_buttons_clickable(
                 )
 
         asyncio.run(_run())
+
+
+def test_tui_settings_vault_db_secrets_summary_pull_and_save_preserve(
+    tmp_path: Path,
+    isolated_settings_env: Path,
+) -> None:
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-settings",
+        workspace_dir=tmp_path,
+    )
+
+    with _LocalVaultStub() as vault:
+        vault.secrets["soclens/db"] = {
+            "password": "vault-db-password-4242",
+            "dsn": "postgresql+pg8000://soc:vault-db-dsn-4242@pg.internal:5432/soclens",
+        }
+        save_profile_settings(
+            {
+                "secret_provider": "hashicorp_vault",
+                "vault_addr": vault.base_url,
+                "vault_token": vault.expected_token,
+                "vault_secret_map": serialize_vault_secret_map(
+                    {
+                        "rf_api_token": "hashicorp_vault:soclens/rf:api_token",
+                        "db_password": "hashicorp_vault:soclens/db:password",
+                        "db_dsn": "hashicorp_vault:soclens/db:dsn",
+                    }
+                ),
+            }
+        )
+
+        async def _run() -> None:
+            async with app.run_test(size=(130, 40)) as pilot:
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                pane = app.query_one(SettingsPane)
+                assert pane.query_one("#set-db-password", Input).display is False
+                assert pane.query_one("#set-db-password-vault", Select).display is True
+                assert pane.query_one("#set-db-dsn", Input).display is False
+                assert pane.query_one("#set-db-dsn-vault", Select).display is True
+                assert (
+                    pane.query_one("#set-db-password-vault", Select).value
+                    == "hashicorp_vault:soclens/db:password"
+                )
+                assert (
+                    pane.query_one("#set-db-dsn-vault", Select).value
+                    == "hashicorp_vault:soclens/db:dsn"
+                )
+
+                # Pull Secrets hydrates db_password and db_dsn in memory and lists them in summary
+                pane.query_one("#settings-pull-secrets-btn", Button).press()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert is_vault_hydrated_setting("db_password") is True
+                assert is_vault_hydrated_setting("db_dsn") is True
+                assert get_effective_setting("db_password") == "vault-db-password-4242"
+                assert (
+                    get_effective_setting("db_dsn")
+                    == "postgresql+pg8000://soc:vault-db-dsn-4242@pg.internal:5432/soclens"
+                )
+                summary_text = str(pane.query_one("#settings-secrets-summary", Static).render())
+                assert "db_password" in summary_text
+                assert "db_dsn" in summary_text
+                assert "vault-db-password-4242" not in summary_text
+                assert "vault-db-dsn-4242" not in summary_text
+
+                # Saving in Vault mode preserves db_password and db_dsn mappings and never writes plaintext
+                await pilot.click("#settings-save-btn")
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                raw_disk = isolated_settings_env.read_text(encoding="utf-8")
+                assert "vault-db-password-4242" not in raw_disk
+                assert "vault-db-dsn-4242" not in raw_disk
+                saved = get_profile_settings()
+                assert "db_password" not in saved
+                assert "db_dsn" not in saved
+                saved_map = parse_vault_secret_map(saved["vault_secret_map"])
+                assert saved_map["db_password"] == "hashicorp_vault:soclens/db:password"
+                assert saved_map["db_dsn"] == "hashicorp_vault:soclens/db:dsn"
+
+        asyncio.run(_run())

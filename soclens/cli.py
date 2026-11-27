@@ -104,6 +104,7 @@ from soclens.sentinelone import (
     SentinelOneRateLimitError,
 )
 from soclens.settings import (
+    DB_SECRET_MANAGED_SETTING_KEYS,
     ENCRYPTION_MODE_OS_KEYSTORE,
     ENCRYPTION_MODE_PASSPHRASE,
     MIN_PASSPHRASE_LENGTH,
@@ -5492,61 +5493,64 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
             storage = None
         policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=storage)
         audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=storage)
+        try:
+            if getattr(args, "status", False):
+                policy = policy_store.load()
+                if use_json:
+                    _emit_json(
+                        {
+                            "ai_kill_switch_active": policy.ai_kill_switch_active,
+                            "kill_switch_visible": policy.kill_switch_visible,
+                            "kill_switch_hotkey": policy.kill_switch_hotkey,
+                            "kill_switch_label": policy.kill_switch_label,
+                        }
+                    )
+                else:
+                    state = "HALTED (ACTIVE)" if policy.ai_kill_switch_active else "DISENGAGED (AI ACTIVE)"
+                    print(f"AI Kill Switch: {state}")
+                    print(
+                        f"Button Label: {policy.kill_switch_label} | Hotkey: {policy.kill_switch_hotkey} | "
+                        f"Visible: {policy.kill_switch_visible}"
+                    )
+                return 0
 
-        if getattr(args, "status", False):
-            policy = policy_store.load()
+            engage = not bool(getattr(args, "off", False))
+            updated = policy_store.update(ai_kill_switch_active=engage)
+            audit_store.append(
+                AuditEntry(
+                    entry_id="",
+                    timestamp="",
+                    run_id="cli-kill",
+                    event_key="",
+                    provider="cli",
+                    mode="policy",
+                    event_type="policy_change",
+                    tool_name="ai_kill_switch",
+                    allowed=not engage,
+                    reason=(
+                        "CLI engaged AI Kill Switch"
+                        if engage
+                        else "CLI disengaged AI Kill Switch"
+                    ),
+                    payload={"ai_kill_switch_active": updated.ai_kill_switch_active},
+                )
+            )
             if use_json:
                 _emit_json(
                     {
-                        "ai_kill_switch_active": policy.ai_kill_switch_active,
-                        "kill_switch_visible": policy.kill_switch_visible,
-                        "kill_switch_hotkey": policy.kill_switch_hotkey,
-                        "kill_switch_label": policy.kill_switch_label,
+                        "ai_kill_switch_active": updated.ai_kill_switch_active,
+                        "policy": updated.to_dict(),
                     }
                 )
             else:
-                state = "HALTED (ACTIVE)" if policy.ai_kill_switch_active else "DISENGAGED (AI ACTIVE)"
-                print(f"AI Kill Switch: {state}")
-                print(
-                    f"Button Label: {policy.kill_switch_label} | Hotkey: {policy.kill_switch_hotkey} | "
-                    f"Visible: {policy.kill_switch_visible}"
-                )
+                if updated.ai_kill_switch_active:
+                    print("[!] AI Kill Switch ENGAGED — all AI actions are halted.")
+                else:
+                    print("[+] AI Kill Switch DISENGAGED — AI actions resumed.")
             return 0
-
-        engage = not bool(getattr(args, "off", False))
-        updated = policy_store.update(ai_kill_switch_active=engage)
-        audit_store.append(
-            AuditEntry(
-                entry_id="",
-                timestamp="",
-                run_id="cli-kill",
-                event_key="",
-                provider="cli",
-                mode="policy",
-                event_type="policy_change",
-                tool_name="ai_kill_switch",
-                allowed=not engage,
-                reason=(
-                    "CLI engaged AI Kill Switch"
-                    if engage
-                    else "CLI disengaged AI Kill Switch"
-                ),
-                payload={"ai_kill_switch_active": updated.ai_kill_switch_active},
-            )
-        )
-        if use_json:
-            _emit_json(
-                {
-                    "ai_kill_switch_active": updated.ai_kill_switch_active,
-                    "policy": updated.to_dict(),
-                }
-            )
-        else:
-            if updated.ai_kill_switch_active:
-                print("[!] AI Kill Switch ENGAGED — all AI actions are halted.")
-            else:
-                print("[+] AI Kill Switch DISENGAGED — AI actions resumed.")
-        return 0
+        finally:
+            if storage is not None:
+                storage.dispose()
 
     if subcmd == "policy":
         from soclens.agent_audit import AuditEntry, AuditLogStore
@@ -5566,51 +5570,55 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
         policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=storage_pol)
         audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=storage_pol)
 
-        updates: dict[str, Any] = {}
-        if getattr(args, "max_tool_steps", None) is not None:
-            updates["max_tool_steps"] = int(args.max_tool_steps)
-        if getattr(args, "max_identical_calls", None) is not None:
-            updates["max_identical_tool_calls"] = int(args.max_identical_calls)
-        if getattr(args, "max_tool_failures", None) is not None:
-            updates["max_same_tool_failures"] = int(args.max_tool_failures)
-        if getattr(args, "kill_visible", None) is not None:
-            updates["kill_switch_visible"] = args.kill_visible == "true"
-        if getattr(args, "kill_hotkey", None) is not None:
-            updates["kill_switch_hotkey"] = args.kill_hotkey
-        if getattr(args, "kill_label", None) is not None:
-            updates["kill_switch_label"] = args.kill_label
-        if getattr(args, "kill_confirm_engage", None) is not None:
-            updates["kill_switch_confirm_engage"] = args.kill_confirm_engage == "true"
-        if getattr(args, "kill_confirm_resume", None) is not None:
-            updates["kill_switch_confirm_resume"] = args.kill_confirm_resume == "true"
-        if getattr(args, "kill_persist", None) is not None:
-            updates["kill_switch_persist_across_restarts"] = args.kill_persist == "true"
+        try:
+            updates: dict[str, Any] = {}
+            if getattr(args, "max_tool_steps", None) is not None:
+                updates["max_tool_steps"] = int(args.max_tool_steps)
+            if getattr(args, "max_identical_calls", None) is not None:
+                updates["max_identical_tool_calls"] = int(args.max_identical_calls)
+            if getattr(args, "max_tool_failures", None) is not None:
+                updates["max_same_tool_failures"] = int(args.max_tool_failures)
+            if getattr(args, "kill_visible", None) is not None:
+                updates["kill_switch_visible"] = args.kill_visible == "true"
+            if getattr(args, "kill_hotkey", None) is not None:
+                updates["kill_switch_hotkey"] = args.kill_hotkey
+            if getattr(args, "kill_label", None) is not None:
+                updates["kill_switch_label"] = args.kill_label
+            if getattr(args, "kill_confirm_engage", None) is not None:
+                updates["kill_switch_confirm_engage"] = args.kill_confirm_engage == "true"
+            if getattr(args, "kill_confirm_resume", None) is not None:
+                updates["kill_switch_confirm_resume"] = args.kill_confirm_resume == "true"
+            if getattr(args, "kill_persist", None) is not None:
+                updates["kill_switch_persist_across_restarts"] = args.kill_persist == "true"
 
-        if updates:
-            policy = policy_store.update(**updates)
-            audit_store.append(
-                AuditEntry(
-                    entry_id="",
-                    timestamp="",
-                    run_id="cli-policy",
-                    event_key="",
-                    provider="cli",
-                    mode="policy",
-                    event_type="policy_change",
-                    tool_name="ai_policy",
-                    allowed=None,
-                    reason=f"CLI updated AI policy fields: {', '.join(sorted(updates))}",
-                    payload=updates,
+            if updates:
+                policy = policy_store.update(**updates)
+                audit_store.append(
+                    AuditEntry(
+                        entry_id="",
+                        timestamp="",
+                        run_id="cli-policy",
+                        event_key="",
+                        provider="cli",
+                        mode="policy",
+                        event_type="policy_change",
+                        tool_name="ai_policy",
+                        allowed=None,
+                        reason=f"CLI updated AI policy fields: {', '.join(sorted(updates))}",
+                        payload=updates,
+                    )
                 )
-            )
-        else:
-            policy = policy_store.load()
+            else:
+                policy = policy_store.load()
 
-        if use_json:
-            _emit_json(policy.to_dict())
-        else:
-            print(json.dumps(policy.to_dict(), indent=2, ensure_ascii=False))
-        return 0
+            if use_json:
+                _emit_json(policy.to_dict())
+            else:
+                print(json.dumps(policy.to_dict(), indent=2, ensure_ascii=False))
+            return 0
+        finally:
+            if storage_pol is not None:
+                storage_pol.dispose()
 
     if subcmd == "agents":
         from soclens.config import get_local_llm_config
@@ -5720,93 +5728,97 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                     cli_storage.migrate_legacy_files(cache_root)
                 except Exception:
                     cli_storage = None
-                policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=cli_storage)
-                audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=cli_storage)
+                try:
+                    policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=cli_storage)
+                    audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=cli_storage)
 
-                def _cli_rf() -> RecordedFutureClient | None:
-                    try:
-                        return _build_rf_client(args)
-                    except ConfigurationError:
-                        return None
+                    def _cli_rf() -> RecordedFutureClient | None:
+                        try:
+                            return _build_rf_client(args)
+                        except ConfigurationError:
+                            return None
 
-                def _cli_s1() -> SentinelOneClient | None:
-                    try:
-                        cfg = get_sentinelone_config(required=False)
-                        return SentinelOneClient(config=cfg) if cfg.has_auth else None
-                    except ConfigurationError:
-                        return None
+                    def _cli_s1() -> SentinelOneClient | None:
+                        try:
+                            cfg = get_sentinelone_config(required=False)
+                            return SentinelOneClient(config=cfg) if cfg.has_auth else None
+                        except ConfigurationError:
+                            return None
 
-                def _cli_splunk() -> SplunkClient | None:
-                    try:
-                        cfg = get_splunk_config(required=False)
-                        return SplunkClient() if cfg.has_auth else None
-                    except ConfigurationError:
-                        return None
+                    def _cli_splunk() -> SplunkClient | None:
+                        try:
+                            cfg = get_splunk_config(required=False)
+                            return SplunkClient() if cfg.has_auth else None
+                        except ConfigurationError:
+                            return None
 
-                def _cli_splunk_es() -> SplunkESClient | None:
-                    try:
-                        cfg = get_splunk_config(app=SPLUNK_ES_APP, required=False)
-                        return SplunkESClient() if cfg.has_auth else None
-                    except ConfigurationError:
-                        return None
+                    def _cli_splunk_es() -> SplunkESClient | None:
+                        try:
+                            cfg = get_splunk_config(app=SPLUNK_ES_APP, required=False)
+                            return SplunkESClient() if cfg.has_auth else None
+                        except ConfigurationError:
+                            return None
 
-                registry = build_default_readonly_registry(
-                    rf_client=_cli_rf,
-                    s1_client=_cli_s1,
-                    splunk_client=_cli_splunk,
-                    splunk_es_client=_cli_splunk_es,
-                    osint_client=lambda: OSINTClient(),
-                    storage=cli_storage,
-                )
-                orchestrator = SocAgentOrchestrator(
-                    registry=registry,
-                    policy_store=policy_store,
-                    audit_store=audit_store,
-                    storage=cli_storage,
-                )
+                    registry = build_default_readonly_registry(
+                        rf_client=_cli_rf,
+                        s1_client=_cli_s1,
+                        splunk_client=_cli_splunk,
+                        splunk_es_client=_cli_splunk_es,
+                        osint_client=lambda: OSINTClient(),
+                        storage=cli_storage,
+                    )
+                    orchestrator = SocAgentOrchestrator(
+                        registry=registry,
+                        policy_store=policy_store,
+                        audit_store=audit_store,
+                        storage=cli_storage,
+                    )
 
-                def _cli_tool_cb(ev: dict[str, Any]) -> None:
-                    if use_json:
-                        return
-                    kind = str(ev.get("kind") or "")
-                    if kind == "tool_result":
-                        state = "OK" if ev.get("ok") else f"ERROR: {ev.get('error', '')}"
-                        print(
-                            f"[Tool {ev.get('step', '?')}] {ev.get('tool_name', '')} -> {state}",
-                            file=sys.stderr,
-                        )
-                    elif kind == "tool_blocked":
-                        print(
-                            f"[Tool Blocked] {ev.get('tool_name', '')} "
-                            f"({ev.get('rule', 'blocked')}): {ev.get('reason', '')}",
-                            file=sys.stderr,
-                        )
+                    def _cli_tool_cb(ev: dict[str, Any]) -> None:
+                        if use_json:
+                            return
+                        kind = str(ev.get("kind") or "")
+                        if kind == "tool_result":
+                            state = "OK" if ev.get("ok") else f"ERROR: {ev.get('error', '')}"
+                            print(
+                                f"[Tool {ev.get('step', '?')}] {ev.get('tool_name', '')} -> {state}",
+                                file=sys.stderr,
+                            )
+                        elif kind == "tool_blocked":
+                            print(
+                                f"[Tool Blocked] {ev.get('tool_name', '')} "
+                                f"({ev.get('rule', 'blocked')}): {ev.get('reason', '')}",
+                                file=sys.stderr,
+                            )
 
-                chat_res = orchestrator.chat(
-                    user_prompt=prompt_text,
-                    attached_context=file_content or None,
-                    attached_title=Path(file_arg).name if file_arg else None,
-                    session_id="cli-chat",
-                    client=llm,
-                    provider=llm.provider,
-                    model=getattr(args, "model", None),
-                    system_prompt_override=system_override,
-                    enable_tools=True,
-                    tool_event_callback=_cli_tool_cb,
-                    max_tool_steps_override=getattr(args, "max_tool_steps", None),
-                )
-                if chat_res.status == "error":
-                    raise LocalLLMError(chat_res.error or "CLI agentic chat failed.", provider=llm.provider)
-                result = {
-                    "provider": chat_res.provider,
-                    "model": chat_res.model,
-                    "done": chat_res.done,
-                    "content": chat_res.content,
-                    "conversation_id": chat_res.conversation_id,
-                    "run_id": chat_res.run_id,
-                    "tool_calls": chat_res.tool_calls,
-                    "blocked_actions": chat_res.blocked_actions,
-                }
+                    chat_res = orchestrator.chat(
+                        user_prompt=prompt_text,
+                        attached_context=file_content or None,
+                        attached_title=Path(file_arg).name if file_arg else None,
+                        session_id="cli-chat",
+                        client=llm,
+                        provider=llm.provider,
+                        model=getattr(args, "model", None),
+                        system_prompt_override=system_override,
+                        enable_tools=True,
+                        tool_event_callback=_cli_tool_cb,
+                        max_tool_steps_override=getattr(args, "max_tool_steps", None),
+                    )
+                    if chat_res.status == "error":
+                        raise LocalLLMError(chat_res.error or "CLI agentic chat failed.", provider=llm.provider)
+                    result = {
+                        "provider": chat_res.provider,
+                        "model": chat_res.model,
+                        "done": chat_res.done,
+                        "content": chat_res.content,
+                        "conversation_id": chat_res.conversation_id,
+                        "run_id": chat_res.run_id,
+                        "tool_calls": chat_res.tool_calls,
+                        "blocked_actions": chat_res.blocked_actions,
+                    }
+                finally:
+                    if cli_storage is not None:
+                        cli_storage.dispose()
             elif system_override:
                 combined = (
                     f"{file_content.strip()}\n\n{prompt_text}".strip()
@@ -9387,10 +9399,12 @@ def _handle_secrets(
         _print_cli_table(disp_rows, ["field_key", "ref", "value"])
         return 0
 
+    all_secret_managed_keys = (*SECRET_MANAGED_SETTING_KEYS, *DB_SECRET_MANAGED_SETTING_KEYS)
+
     if subcmd == "map":
         canon = resolve_setting_key(args.setting_key)
-        if canon is None or canon not in SECRET_MANAGED_SETTING_KEYS:
-            valid = ", ".join(SECRET_MANAGED_SETTING_KEYS)
+        if canon is None or canon not in all_secret_managed_keys:
+            valid = ", ".join(all_secret_managed_keys)
             raise ValueError(
                 f"Setting {args.setting_key!r} is not a secret-managed credential key. "
                 f"Supported keys: {valid}."
@@ -9446,8 +9460,8 @@ def _handle_secrets(
 
     if subcmd == "unmap":
         canon = resolve_setting_key(args.setting_key)
-        if canon is None or canon not in SECRET_MANAGED_SETTING_KEYS:
-            valid = ", ".join(SECRET_MANAGED_SETTING_KEYS)
+        if canon is None or canon not in all_secret_managed_keys:
+            valid = ", ".join(all_secret_managed_keys)
             raise ValueError(
                 f"Setting {args.setting_key!r} is not a secret-managed credential key. "
                 f"Supported keys: {valid}."
@@ -9521,7 +9535,7 @@ def _handle_secrets(
         overwrite_flag = bool(getattr(args, "overwrite_existing", False))
         target_map: dict[str, str] = {}
         for setting_key, ref in cfg.secret_map.items():
-            if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+            if setting_key not in all_secret_managed_keys:
                 continue
             if not overwrite_flag and get_env_override_for_setting(setting_key) is not None:
                 continue
@@ -9566,7 +9580,7 @@ def _handle_secrets(
                 with build_secret_store_provider(cfg) as provider:
                     resolved = provider.resolve_mapped_settings(target_map)
                 for setting_key, secret_val in resolved.items():
-                    if setting_key not in SECRET_MANAGED_SETTING_KEYS:
+                    if setting_key not in all_secret_managed_keys:
                         continue
                     cleaned = str(secret_val or "").strip()
                     if not cleaned:

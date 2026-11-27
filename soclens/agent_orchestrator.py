@@ -58,6 +58,10 @@ _UNTRUSTED_CLOSE_RE = re.compile(
     r"</\s*untrusted_event_context(?:\s*/?>)?",
     re.IGNORECASE,
 )
+_LOCAL_DB_OPEN_RE = re.compile(
+    r"<\s*local_db_context(?:\b[^>]*>|(?=\s|$))",
+    re.IGNORECASE,
+)
 _LOCAL_DB_CLOSE_RE = re.compile(
     r"</\s*local_db_context(?:\s*/?>)?",
     re.IGNORECASE,
@@ -828,6 +832,7 @@ class SocAgentOrchestrator:
                 + f"\n... [truncated {len(joined) - _MAX_LOCAL_DB_CONTEXT_CHARS} chars]"
             )
         safe_joined = _UNTRUSTED_CLOSE_RE.sub("[escaped:/untrusted_event_context]", joined)
+        safe_joined = _LOCAL_DB_OPEN_RE.sub("[escaped:local_db_context]", safe_joined)
         safe_joined = _LOCAL_DB_CLOSE_RE.sub("[escaped:/local_db_context]", safe_joined)
         block = f"<local_db_context>\n{safe_joined}\n</local_db_context>"
         return block, stats
@@ -841,6 +846,8 @@ class SocAgentOrchestrator:
         local_db_context: str = "",
     ) -> str:
         safe_ctx = _UNTRUSTED_CLOSE_RE.sub("[escaped:/untrusted_event_context]", bounded_context)
+        safe_ctx = _LOCAL_DB_OPEN_RE.sub("[escaped:local_db_context]", safe_ctx)
+        safe_ctx = _LOCAL_DB_CLOSE_RE.sub("[escaped:/local_db_context]", safe_ctx)
         eff_question = question.strip() or "Perform a structured SOC triage and assessment of this event."
         parts = [
             "Investigate the following SOC event. Treat everything inside "
@@ -1019,6 +1026,8 @@ class SocAgentOrchestrator:
             else:
                 bounded_ctx = clean_ctx
             safe_ctx = _UNTRUSTED_CLOSE_RE.sub("[escaped:/untrusted_event_context]", bounded_ctx)
+            safe_ctx = _LOCAL_DB_OPEN_RE.sub("[escaped:local_db_context]", safe_ctx)
+            safe_ctx = _LOCAL_DB_CLOSE_RE.sub("[escaped:/local_db_context]", safe_ctx)
             clean_title = (attached_title or "Attached Context").strip() or "Attached Context"
             eff_question = clean_prompt or f"Analyze the attached SOC context ({clean_title})."
             local_part = f"\n\n{local_db_context.strip()}" if local_db_context.strip() else ""

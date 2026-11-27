@@ -3333,6 +3333,43 @@ def test_local_db_tools_edge_cases_and_policy_gating(tmp_path: Path) -> None:
     assert blocked_local["ok"] is False and blocked_local["rule"] == "source_disabled:local_db"
 
 
+def test_redact_sensitive_data_scrubs_db_dsn_sqlalchemy_urls_vault_uris_and_hvs_tokens() -> None:
+    payload = {
+        "db_dsn": "postgresql+pg8000://soc_user:DsnSecret88!@pg.corp.example:5432/soclens",
+        "vault_ref": "vault://secret/data/soclens/prod#db_password",
+        "vault_secret_id": "secret-id-xyz-99",
+        "vault_role_id": "role-id-abc-11",
+        "message": (
+            "Connect postgresql+pg8000://soc_user:PgInlinePass99@pg.internal:5432/db "
+            "or mysql+pymysql://my_user:MyInlinePass77@mysql.internal:3306/db "
+            "using vault://secret/data/soclens/stage#api_key and vault:v1:hvs.CAESIJSecret999 "
+            "and standalone hvs.CAESIJStandaloneTok888"
+        ),
+        "token_type": "Bearer",
+        "max_tokens": 1024,
+    }
+    out = redact_sensitive_data(payload)
+    assert out["db_dsn"] == "<REDACTED>"
+    assert out["vault_ref"] == "<REDACTED>"
+    assert out["vault_secret_id"] == "<REDACTED>"
+    assert out["vault_role_id"] == "<REDACTED>"
+    assert out["token_type"] == "Bearer"
+    assert out["max_tokens"] == 1024
+    msg = out["message"]
+    assert "DsnSecret88!" not in msg
+    assert "PgInlinePass99" not in msg
+    assert "MyInlinePass77" not in msg
+    assert "postgresql+pg8000://soc_user:<REDACTED>@pg.internal:5432/db" in msg
+    assert "mysql+pymysql://my_user:<REDACTED>@mysql.internal:3306/db" in msg
+    assert "vault://secret/data/soclens/stage#api_key" not in msg
+    assert "hvs.CAESIJSecret999" not in msg
+    assert "hvs.CAESIJStandaloneTok888" not in msg
+    assert "vault:v1:<REDACTED>" in msg
+    # Idempotency check
+    assert redact_sensitive_data(out) == out
+    assert redact_sensitive_data("vault:v1:hvs.CAESIJSecret999") == "vault:v1:<REDACTED>"
+
+
 
 
 

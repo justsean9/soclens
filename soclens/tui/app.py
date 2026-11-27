@@ -3372,6 +3372,9 @@ class SocLensApp(App[None]):
             self._alert_refresh_timer = None
         clear_session_overrides()
         clear_unlocked_keys(mark_locked=False)
+        if getattr(self, "storage", None) is not None:
+            with contextlib.suppress(Exception):
+                self.storage.dispose()
         self._logging_bridge.uninstall()
 
     def compose(self) -> ComposeResult:

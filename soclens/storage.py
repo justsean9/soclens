@@ -92,6 +92,7 @@ _DOMAIN_RE = re.compile(
     r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+(?:[a-zA-Z]{2,24})\b"
 )
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_MYSQL_BOOL_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _NON_DOMAIN_TLDS: frozenset[str] = frozenset(
     {"exe", "dll", "ps1", "bat", "cmd", "sh", "py", "json", "jsonl", "log", "txt", "bin", "png", "jpg", "pdf", "zip", "csv"}
 )
@@ -1083,10 +1084,14 @@ class StorageManager:
         with self._lock:
             with self.session() as sess:
                 existing_snap = sess.execute(
-                    select(alert_snapshots_table.c.source).where(
-                        alert_snapshots_table.c.source == clean_src
-                    )
+                    text("SELECT source, fetched_at FROM alert_snapshots WHERE source = :src"),
+                    {"src": clean_src},
                 ).first()
+                is_same_fetched_at = (
+                    existing_snap is not None
+                    and existing_snap[1] is not None
+                    and abs(float(existing_snap[1]) - ts) < 1e-6
+                )
                 if existing_snap is None:
                     sess.execute(
                         insert(alert_snapshots_table).values(
@@ -1186,14 +1191,101 @@ class StorageManager:
                     for ind_raw, ind_type in _dedupe_iocs(_extract_iocs_from_value(item)):
                         extracted_iocs.append((ind_raw, ind_type, ev_key))
 
-        for ind_raw, ind_type, ev_key in extracted_iocs:
-            self.upsert_ioc_sighting(
-                indicator=ind_raw,
-                indicator_type=ind_type,
-                source=clean_src,
-                event_key=ev_key,
-                seen_at=ts,
-            )
+                if extracted_iocs:
+                    deduped_iocs: list[tuple[str, str, str, str]] = []
+                    seen_ioc_keys: set[tuple[str, str]] = set()
+                    for ind_raw, ind_type, ev_key in extracted_iocs:
+                        raw_ind = str(ind_raw or "").strip()
+                        norm_ind = raw_ind.lower()
+                        if not norm_ind:
+                            continue
+                        dedup_key = (norm_ind, ev_key)
+                        if dedup_key in seen_ioc_keys:
+                            continue
+                        seen_ioc_keys.add(dedup_key)
+                        clean_type = str(ind_type or "").strip().lower() or "ioc"
+                        deduped_iocs.append((norm_ind, raw_ind, clean_type, ev_key))
+
+                    norm_inds = sorted({entry[0] for entry in deduped_iocs})
+                    existing_by_key: dict[tuple[str, str], RowMapping] = {}
+                    ioc_cols = (
+                        (
+                            ioc_sightings_table.c.id,
+                            ioc_sightings_table.c.indicator_norm,
+                            ioc_sightings_table.c.event_key,
+                            ioc_sightings_table.c.sighting_count,
+                        )
+                        if self._dialect == "postgres"
+                        else (
+                            ioc_sightings_table.c.id,
+                            ioc_sightings_table.c.indicator_norm,
+                            ioc_sightings_table.c.event_key,
+                            ioc_sightings_table.c.sighting_count,
+                            ioc_sightings_table.c.first_seen_at,
+                            ioc_sightings_table.c.last_seen_at,
+                        )
+                    )
+                    for chunk_start in range(0, len(norm_inds), 400):
+                        chunk = norm_inds[chunk_start : chunk_start + 400]
+                        existing_rows = sess.execute(
+                            select(*ioc_cols).where(
+                                and_(
+                                    ioc_sightings_table.c.source == clean_src,
+                                    ioc_sightings_table.c.indicator_norm.in_(chunk),
+                                )
+                            )
+                        ).mappings().all()
+                        for r in existing_rows:
+                            existing_by_key[(str(r["indicator_norm"]), str(r["event_key"]))] = r
+
+                    to_insert: list[dict[str, Any]] = []
+                    for norm_ind, raw_ind, clean_type, ev_key in deduped_iocs:
+                        existing_ioc = existing_by_key.get((norm_ind, ev_key))
+                        if existing_ioc is None:
+                            to_insert.append(
+                                {
+                                    "indicator_norm": norm_ind,
+                                    "indicator_raw": raw_ind,
+                                    "indicator_type": clean_type,
+                                    "source": clean_src,
+                                    "event_key": ev_key,
+                                    "sighting_count": 1,
+                                    "first_seen_at": ts,
+                                    "last_seen_at": ts,
+                                    "context_json": "{}",
+                                }
+                            )
+                        else:
+                            raw_prev_last = existing_ioc.get("last_seen_at")
+                            prev_last = float(raw_prev_last) if raw_prev_last is not None else ts
+                            if (
+                                is_same_fetched_at
+                                and raw_prev_last is not None
+                                and abs(prev_last - ts) < 1e-6
+                            ):
+                                continue
+                            new_count = int(existing_ioc["sighting_count"] or 0) + 1
+                            raw_first = existing_ioc.get("first_seen_at")
+                            first_seen = (
+                                min(float(raw_first), ts) if raw_first is not None else ts
+                            )
+                            last_seen = max(prev_last, ts)
+                            update_vals: dict[str, Any] = {
+                                "indicator_raw": raw_ind,
+                                "indicator_type": clean_type,
+                                "sighting_count": new_count,
+                                "last_seen_at": last_seen,
+                            }
+                            if raw_first is not None:
+                                update_vals["first_seen_at"] = first_seen
+                            sess.execute(
+                                update(ioc_sightings_table)
+                                .where(ioc_sightings_table.c.id == existing_ioc["id"])
+                                .values(**update_vals)
+                            )
+                    if to_insert:
+                        sess.execute(insert(ioc_sightings_table), to_insert)
+
         return len(redacted_items)
 
     def delete_alerts_snapshot(self, source: str | None = None) -> None:
@@ -1307,21 +1399,34 @@ class StorageManager:
 
             elif self._dialect == "mysql":
                 like_pat = f"%{_escape_like_pattern(clean_q)}%"
-                bool_tokens = _FTS_TOKEN_RE.findall(clean_q)
-                bool_q = " ".join(f"+{tok}*" for tok in bool_tokens[:8]) or clean_q
-                sql_mysql = (
-                    "SELECT id, source, alert_id, title, severity, status, "
-                    "occurred_at, fetched_at, payload_json "
-                    "FROM alerts_history "
-                    "WHERE (MATCH(title, search_text) AGAINST (:mq IN BOOLEAN MODE) "
-                    "OR title LIKE :like_pat ESCAPE '|' "
-                    "OR search_text LIKE :like_pat ESCAPE '|') "
-                )
-                params_mysql: dict[str, Any] = {
-                    "mq": bool_q,
-                    "like_pat": like_pat,
-                    "lim": eff_limit,
-                }
+                bool_tokens = _MYSQL_BOOL_TOKEN_RE.findall(clean_q)
+                if bool_tokens:
+                    bool_q = " ".join(f"+{tok}*" for tok in bool_tokens[:8])
+                    sql_mysql = (
+                        "SELECT id, source, alert_id, title, severity, status, "
+                        "occurred_at, fetched_at, payload_json "
+                        "FROM alerts_history "
+                        "WHERE (MATCH(title, search_text) AGAINST (:mq IN BOOLEAN MODE) "
+                        "OR title LIKE :like_pat ESCAPE '|' "
+                        "OR search_text LIKE :like_pat ESCAPE '|') "
+                    )
+                    params_mysql: dict[str, Any] = {
+                        "mq": bool_q,
+                        "like_pat": like_pat,
+                        "lim": eff_limit,
+                    }
+                else:
+                    sql_mysql = (
+                        "SELECT id, source, alert_id, title, severity, status, "
+                        "occurred_at, fetched_at, payload_json "
+                        "FROM alerts_history "
+                        "WHERE (title LIKE :like_pat ESCAPE '|' "
+                        "OR search_text LIKE :like_pat ESCAPE '|') "
+                    )
+                    params_mysql = {
+                        "like_pat": like_pat,
+                        "lim": eff_limit,
+                    }
                 if clean_src is not None:
                     sql_mysql += "AND source = :src "
                     params_mysql["src"] = clean_src
@@ -2391,16 +2496,25 @@ class StorageManager:
 
             elif self._dialect == "mysql":
                 like_pat = f"%{_escape_like_pattern(clean_q)}%"
-                bool_tokens = _FTS_TOKEN_RE.findall(clean_q)
-                bool_q = " ".join(f"+{tok}*" for tok in bool_tokens[:8]) or clean_q
-                sql_mysql = (
-                    "SELECT * FROM soc_learnings "
-                    "WHERE (MATCH(title, content) AGAINST (:mq IN BOOLEAN MODE) "
-                    "OR title LIKE :like_pat ESCAPE '|' "
-                    "OR content LIKE :like_pat ESCAPE '|' "
-                    "OR tags_text LIKE :like_pat ESCAPE '|') "
-                )
-                params_mysql: dict[str, Any] = {"mq": bool_q, "like_pat": like_pat, "lim": eff_limit}
+                bool_tokens = _MYSQL_BOOL_TOKEN_RE.findall(clean_q)
+                if bool_tokens:
+                    bool_q = " ".join(f"+{tok}*" for tok in bool_tokens[:8])
+                    sql_mysql = (
+                        "SELECT * FROM soc_learnings "
+                        "WHERE (MATCH(title, content) AGAINST (:mq IN BOOLEAN MODE) "
+                        "OR title LIKE :like_pat ESCAPE '|' "
+                        "OR content LIKE :like_pat ESCAPE '|' "
+                        "OR tags_text LIKE :like_pat ESCAPE '|') "
+                    )
+                    params_mysql: dict[str, Any] = {"mq": bool_q, "like_pat": like_pat, "lim": eff_limit}
+                else:
+                    sql_mysql = (
+                        "SELECT * FROM soc_learnings "
+                        "WHERE (title LIKE :like_pat ESCAPE '|' "
+                        "OR content LIKE :like_pat ESCAPE '|' "
+                        "OR tags_text LIKE :like_pat ESCAPE '|') "
+                    )
+                    params_mysql = {"like_pat": like_pat, "lim": eff_limit}
                 if clean_status is not None:
                     sql_mysql += "AND status = :st "
                     params_mysql["st"] = clean_status
@@ -2654,6 +2768,8 @@ class StorageManager:
             except OSError as exc:
                 logger.debug("Skipping unreadable legacy ai_audit.jsonl %s: %s", audit_path, exc)
                 lines = []
+            parsed_entries: list[AuditEntry] = []
+            seen_file_ids: set[str] = set()
             for line in lines:
                 stripped = line.strip()
                 if not stripped:
@@ -2667,8 +2783,95 @@ class StorageManager:
                 entry = AuditEntry.from_dict(raw_obj)
                 if entry is None:
                     continue
-                self.append_audit_entry(entry)
-                counts["audits"] += 1
+                eid = entry.entry_id.strip() if isinstance(entry.entry_id, str) else ""
+                if not eid:
+                    eid = uuid.uuid4().hex[:16]
+                if eid in seen_file_ids:
+                    continue
+                seen_file_ids.add(eid)
+                parsed_entries.append(
+                    AuditEntry(
+                        entry_id=eid,
+                        timestamp=entry.timestamp,
+                        run_id=entry.run_id,
+                        event_key=entry.event_key,
+                        provider=entry.provider,
+                        mode=entry.mode,
+                        event_type=entry.event_type,
+                        tool_name=entry.tool_name,
+                        allowed=entry.allowed,
+                        reason=entry.reason,
+                        payload=entry.payload,
+                        analyst_id=entry.analyst_id,
+                        workstation_id=entry.workstation_id,
+                    )
+                )
+            if parsed_entries:
+                with self._lock:
+                    with self.session() as sess:
+                        existing_audit_ids = {
+                            str(r[0])
+                            for r in sess.execute(select(audit_logs_table.c.entry_id)).all()
+                        }
+                        audit_rows: list[dict[str, Any]] = []
+                        for entry in parsed_entries:
+                            if entry.entry_id in existing_audit_ids:
+                                continue
+                            existing_audit_ids.add(entry.entry_id)
+                            ts_str = (
+                                entry.timestamp.strip()
+                                if isinstance(entry.timestamp, str)
+                                else ""
+                            )
+                            if not ts_str:
+                                ts_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            created_at = _parse_timestamp_epoch(ts_str, fallback=time.time())
+                            raw_payload = (
+                                dict(entry.payload)
+                                if isinstance(entry.payload, Mapping)
+                                else {}
+                            )
+                            redacted_payload_obj = redact_sensitive_data(raw_payload)
+                            redacted_payload: dict[str, Any] = (
+                                dict(redacted_payload_obj)
+                                if isinstance(redacted_payload_obj, Mapping)
+                                else {}
+                            )
+                            analyst_id = (
+                                getattr(entry, "analyst_id", "") or ""
+                            ).strip() or self._config.analyst_id
+                            workstation_id = (
+                                getattr(entry, "workstation_id", "") or ""
+                            ).strip() or self._config.workstation_id
+                            audit_rows.append(
+                                {
+                                    "entry_id": entry.entry_id,
+                                    "timestamp": ts_str,
+                                    "created_at": created_at,
+                                    "run_id": str(entry.run_id or "")[:128],
+                                    "event_key": str(
+                                        redact_sensitive_data(entry.event_key or "")
+                                    )[:512],
+                                    "provider": str(
+                                        redact_sensitive_data(entry.provider or "")
+                                    )[:64],
+                                    "mode": str(entry.mode or "")[:64],
+                                    "event_type": entry.event_type[:64],
+                                    "tool_name": str(
+                                        redact_sensitive_data(entry.tool_name or "")
+                                    )[:128],
+                                    "allowed": entry.allowed,
+                                    "reason": str(redact_sensitive_data(entry.reason or "")),
+                                    "payload_json": _json_dumps_safe(redacted_payload),
+                                    "analyst_id": str(redact_sensitive_data(analyst_id))[:128],
+                                    "workstation_id": str(
+                                        redact_sensitive_data(workstation_id)
+                                    )[:128],
+                                }
+                            )
+                        if audit_rows:
+                            sess.execute(insert(audit_logs_table), audit_rows)
+                            counts["audits"] += len(audit_rows)
 
         return counts
 

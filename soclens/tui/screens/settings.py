@@ -68,6 +68,7 @@ from soclens.sentinelone import SentinelOneClient
 from soclens.settings import (
     AKEYLESS_AUTH_MODES,
     DB_BACKEND_CHOICES,
+    DB_SECRET_MANAGED_SETTING_KEYS,
     DB_SSL_MODE_CHOICES,
     DEFAULT_PROFILE,
     ENCRYPTION_MODE_OS_KEYSTORE,
@@ -147,12 +148,27 @@ _SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
+_DB_SECRET_MANAGED_VAULT_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("db_password", "set-db-password", "set-db-password-vault"),
+    ("db_dsn", "set-db-dsn", "set-db-dsn-vault"),
+)
+
+_ALL_VAULT_MANAGED_FIELDS: tuple[tuple[str, str, str], ...] = (
+    *_SECRET_MANAGED_VAULT_FIELDS,
+    *_DB_SECRET_MANAGED_VAULT_FIELDS,
+)
+
+_ALL_SECRET_MANAGED_KEYS: tuple[str, ...] = (
+    *SECRET_MANAGED_SETTING_KEYS,
+    *DB_SECRET_MANAGED_SETTING_KEYS,
+)
+
 _SECRET_MANAGED_INPUT_KEYS: frozenset[str] = frozenset(
-    key for key, _inp_id, _sel_id in _SECRET_MANAGED_VAULT_FIELDS
+    key for key, _inp_id, _sel_id in _ALL_VAULT_MANAGED_FIELDS
 )
 
 _VAULT_SELECT_BY_KEY: dict[str, str] = {
-    key: sel_id for key, _inp_id, sel_id in _SECRET_MANAGED_VAULT_FIELDS
+    key: sel_id for key, _inp_id, sel_id in _ALL_VAULT_MANAGED_FIELDS
 }
 
 _VAULT_BANNER_IDS: tuple[str, ...] = (
@@ -160,6 +176,7 @@ _VAULT_BANNER_IDS: tuple[str, ...] = (
     "cat-splunk-vault-banner",
     "cat-s1-vault-banner",
     "cat-ai-vault-banner",
+    "cat-database-vault-banner",
 )
 
 _VAULT_MODE_BANNER_TEXT = (
@@ -1933,6 +1950,12 @@ class SettingsPane(BaseSocPane):
                             markup=False,
                         )
                         yield Static(
+                            _VAULT_MODE_BANNER_TEXT,
+                            id="cat-database-vault-banner",
+                            classes="info-box vault-mode-banner",
+                            markup=False,
+                        )
+                        yield Static(
                             "Default uses embedded local SQLite (WAL + FTS5) at "
                             "<workspace>/.soclens_cache/soclens.db. Optionally configure shared "
                             "PostgreSQL (pg8000), MySQL (PyMySQL), or custom SQLAlchemy DSN. "
@@ -1972,6 +1995,7 @@ class SettingsPane(BaseSocPane):
                             classes="setting-field",
                             compact=True,
                         )
+                        yield self._make_vault_select("set-db-dsn-vault")
                         yield self._make_label("db_host")
                         yield Input(
                             value="",
@@ -2013,6 +2037,7 @@ class SettingsPane(BaseSocPane):
                             classes="setting-field",
                             compact=True,
                         )
+                        yield self._make_vault_select("set-db-password-vault")
                         yield self._make_label("db_ssl_mode")
                         yield Select(
                             [
@@ -2320,7 +2345,7 @@ class SettingsPane(BaseSocPane):
             except Exception:
                 pass
 
-        for _key, inp_id, vault_sel_id in _SECRET_MANAGED_VAULT_FIELDS:
+        for _key, inp_id, vault_sel_id in _ALL_VAULT_MANAGED_FIELDS:
             try:
                 self.query_one(f"#{inp_id}", Input).display = not enabled
             except Exception:
@@ -2375,7 +2400,7 @@ class SettingsPane(BaseSocPane):
             prefix = ref_val.split(":", 1)[0].strip().lower() if ":" in ref_val else ""
             return prefix not in SUPPORTED_SECRET_PROVIDERS
 
-        for key, _inp_id, vault_sel_id in _SECRET_MANAGED_VAULT_FIELDS:
+        for key, _inp_id, vault_sel_id in _ALL_VAULT_MANAGED_FIELDS:
             sel = self.query_one(f"#{vault_sel_id}", Select)
             target_ref = ""
             if preserve_current:
@@ -2417,7 +2442,7 @@ class SettingsPane(BaseSocPane):
         provider_label = SECRET_PROVIDER_LABELS.get(provider, provider)
         mapped_refs: dict[str, str] = {}
         if provider != "none":
-            for key, _inp_id, vault_sel_id in _SECRET_MANAGED_VAULT_FIELDS:
+            for key, _inp_id, vault_sel_id in _ALL_VAULT_MANAGED_FIELDS:
                 try:
                     ref_val = str(self.query_one(f"#{vault_sel_id}", Select).value or "").strip()
                 except Exception:
@@ -2435,7 +2460,7 @@ class SettingsPane(BaseSocPane):
                     mapped_refs = {}
 
         hydrated_keys = [
-            key for key in SECRET_MANAGED_SETTING_KEYS if is_vault_hydrated_setting(key)
+            key for key in _ALL_SECRET_MANAGED_KEYS if is_vault_hydrated_setting(key)
         ]
         mapped_desc = ", ".join(sorted(mapped_refs.keys())) if mapped_refs else "None"
         hydrated_desc = ", ".join(hydrated_keys) if hydrated_keys else "None"
@@ -3039,13 +3064,13 @@ class SettingsPane(BaseSocPane):
                 values["vault_secret_map"] = existing_saved["vault_secret_map"]
         else:
             mapped: dict[str, str] = {}
-            for key, _inp_id, vault_sel_id in _SECRET_MANAGED_VAULT_FIELDS:
+            for key, _inp_id, vault_sel_id in _ALL_VAULT_MANAGED_FIELDS:
                 ref_val = str(self.query_one(f"#{vault_sel_id}", Select).value or "").strip()
                 if ref_val:
                     mapped[key] = ref_val
             serialized_map = serialize_vault_secret_map(mapped)
             values["vault_secret_map"] = serialized_map or None
-            for key, _inp_id, _vault_sel_id in _SECRET_MANAGED_VAULT_FIELDS:
+            for key, _inp_id, _vault_sel_id in _ALL_VAULT_MANAGED_FIELDS:
                 if key in mapped or is_vault_hydrated_setting(key):
                     values[key] = None
 
@@ -3306,7 +3331,7 @@ class SettingsPane(BaseSocPane):
         conflicts = self._apply_session_conflicts(values)
 
         if (values.get("secret_provider") or "none").strip().lower() != "none":
-            for key, inp_id, _vault_sel_id in _SECRET_MANAGED_VAULT_FIELDS:
+            for key, inp_id, _vault_sel_id in _ALL_VAULT_MANAGED_FIELDS:
                 if key in values and values[key] is None:
                     try:
                         inp = self.query_one(f"#{inp_id}", Input)
@@ -4034,7 +4059,7 @@ class SettingsPane(BaseSocPane):
                 self.notify_user(msg, title="Pull Secrets", severity="warning")
                 return
             target_map = {
-                k: v for k, v in cfg.secret_map.items() if k in SECRET_MANAGED_SETTING_KEYS
+                k: v for k, v in cfg.secret_map.items() if k in _ALL_SECRET_MANAGED_KEYS
             }
             if not target_map:
                 msg = "No vault secret mappings configured."
@@ -4047,7 +4072,7 @@ class SettingsPane(BaseSocPane):
 
             to_apply: dict[str, str] = {}
             for key, val in resolved.items():
-                if key not in SECRET_MANAGED_SETTING_KEYS:
+                if key not in _ALL_SECRET_MANAGED_KEYS:
                     continue
                 cleaned = val.strip() if isinstance(val, str) else ""
                 if cleaned:

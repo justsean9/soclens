@@ -24,7 +24,7 @@ from soclens.storage import (
     StorageManager,
     test_db_connection,
 )
-from tests.e2e.pillar_mocks import install_mock_db_drivers, make_sample_ca_cert_pem
+from tests.db_test_helpers import install_mock_db_drivers, make_sample_ca_cert_pem
 
 
 @pytest.fixture
@@ -569,3 +569,179 @@ def test_event_panels_preserve_insertion_order_within_same_second(isolated_db_ws
     assert [p["entry_id"] for p in panels] == ["zzzz-first", "aaaa-second"]
     assert [p["mode"] for p in panels] == ["ask_only", "full_investigation"]
     mgr.dispose()
+
+
+def test_db_and_wal_never_persist_dsn_or_vault_secrets_and_alert_cache_redacts(
+    isolated_db_ws: Path,
+) -> None:
+    db_path = isolated_db_ws / ".soclens_cache" / "soclens.db"
+    wal_path = Path(f"{db_path}-wal")
+    mgr = StorageManager(DatabaseConfig(sqlite_path=db_path))
+    mgr.ensure_schema()
+
+    pg_pw = "DsnPgSecretPass88!"
+    my_pw = "DsnMySqlSecretPass77!"
+    vault_uri = "vault://secret/data/soclens/prod#db_password"
+    hvs_tok = "hvs.CAESIJTestVaultServiceToken99999"
+
+    mgr.upsert_alerts_snapshot(
+        "es_notables_24h",
+        [
+            {
+                "finding_id": "es-sec-1",
+                "rule_name": "DB Credential Leak Check",
+                "db_dsn": f"postgresql+pg8000://soc_user:{pg_pw}@pg.corp.example:5432/soclens",
+                "vault_ref": vault_uri,
+                "summary": (
+                    f"mysql+pymysql://my_user:{my_pw}@mysql.corp.example:3306/soclens "
+                    f"and vault:v1:{hvs_tok}"
+                ),
+            }
+        ],
+    )
+    mgr.add_event_panel(
+        "splunk_es:default:es-sec-1",
+        {
+            "entry_id": "panel-sec-1",
+            "run_id": "run-sec-1",
+            "timestamp": "2026-11-27T00:00:00Z",
+            "mode": "ask_only",
+            "provider": "ollama",
+            "model": "llama3.2",
+            "question": f"Check {vault_uri}",
+            "answer_markdown": (
+                f"postgresql+pg8000://soc_user:{pg_pw}@pg.corp.example:5432/soclens "
+                f"token={hvs_tok}"
+            ),
+            "status": "completed",
+        },
+        event_dict={
+            "event_key": "splunk_es:default:es-sec-1",
+            "source_kind": "splunk_es",
+            "native_id": "es-sec-1",
+            "title": "Secret Leak Probe",
+            "metadata": {"db_dsn": f"mysql+pymysql://u:{my_pw}@h:3306/db"},
+        },
+    )
+    AuditLogStore(storage=mgr).append(
+        AuditEntry(
+            entry_id="aud-sec-1",
+            timestamp="2026-11-27T00:00:00Z",
+            run_id="run-sec-1",
+            event_key="splunk_es:default:es-sec-1",
+            provider="ollama",
+            mode="ask_only",
+            event_type="decision",
+            reason=f"Saw {vault_uri} and {hvs_tok}",
+            payload={
+                "db_dsn": f"postgresql+pg8000://soc_user:{pg_pw}@pg.corp.example:5432/soclens",
+                "vault_ref": vault_uri,
+            },
+        )
+    )
+    mgr.upsert_learning(
+        title="DB DSN Hygiene",
+        content=(
+            f"Never store postgresql+pg8000://soc_user:{pg_pw}@pg.corp.example:5432/soclens "
+            f"or mysql+pymysql://my_user:{my_pw}@mysql.corp.example:3306/soclens "
+            f"or {vault_uri} or {hvs_tok}"
+        ),
+        category="environment_fact",
+        source="manual_learn",
+        status="active",
+    )
+
+    for probe_path in (db_path, wal_path):
+        if probe_path.is_file():
+            raw = probe_path.read_bytes().decode("latin-1", errors="ignore")
+            for needle in (pg_pw, my_pw, "secret/data/soclens/prod", hvs_tok):
+                assert needle not in raw, f"Leaked {needle!r} in {probe_path.name}"
+
+    mgr.dispose()
+    raw_post = db_path.read_bytes().decode("latin-1", errors="ignore")
+    for needle in (pg_pw, my_pw, "secret/data/soclens/prod", hvs_tok):
+        assert needle not in raw_post
+
+    # AlertCacheStore.update_cached_item() must also redact before writing JSON to disk
+    ac_dir = isolated_db_ws / "alerts_cache_sec"
+    ac = AlertCacheStore(cache_dir=ac_dir, load_on_init=False)
+    ac.put("rf_playbook_24h", [{"playbook_alert_id": "pb-1", "title": "Initial"}])
+    updated = ac.update_cached_item(
+        "rf_playbook_24h",
+        "pb-1",
+        item_updates={
+            "db_dsn": f"postgresql+pg8000://soc_user:{pg_pw}@pg.corp.example:5432/soclens",
+            "vault_ref": vault_uri,
+        },
+        detail={"secret_note": f"mysql+pymysql://my_user:{my_pw}@mysql.corp.example:3306/soclens {hvs_tok}"},
+    )
+    assert updated is True
+    disk_json = (ac_dir / "rf_playbook_24h.json").read_text(encoding="utf-8")
+    for needle in (pg_pw, my_pw, "secret/data/soclens/prod", hvs_tok):
+        assert needle not in disk_json
+
+
+def test_mysql_boolean_mode_cve_tokenization_and_snapshot_ioc_and_audit_idempotency(
+    isolated_db_ws: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drivers = install_mock_db_drivers(monkeypatch)
+    mysql_cfg = DatabaseConfig(
+        backend="mysql",
+        dsn="mysql+pymysql://soc:pw@mysql.internal.example:3306/soclens",
+    )
+    mysql_stor = StorageManager(mysql_cfg)
+    mysql_stor.ensure_schema()
+
+    before = len(drivers["mysql"].executed_sql)
+    mysql_stor.search_alerts_history("CVE-2024-3094", limit=5)
+    mysql_stor.search_learnings("CVE-2024-3094", limit=5)
+    queries = drivers["mysql"].executed_sql[before:]
+    mq_params = [str(p.get("mq", "")) for _s, p in queries if isinstance(p, dict) and "mq" in p]
+    assert len(mq_params) == 2
+    for mq in mq_params:
+        assert mq == "+CVE* +2024* +3094*"
+        assert "-" not in mq
+    mysql_stor.dispose()
+
+    # Batch audit migration idempotency + snapshot IOC non-inflation on same fetched_at
+    cache_dir = isolated_db_ws / ".soclens_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audit_lines = [
+        json.dumps(
+            {
+                "entry_id": f"aud-batch-{i}",
+                "timestamp": "2026-11-27T00:00:00Z",
+                "run_id": "run-batch",
+                "event_key": "es::1",
+                "provider": "ollama",
+                "mode": "ask_only",
+                "event_type": "decision",
+                "reason": f"Batch entry {i}",
+            }
+        )
+        for i in range(5)
+    ]
+    (cache_dir / "ai_audit.jsonl").write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    stor = StorageManager(DatabaseConfig(sqlite_path=cache_dir / "soclens.db"))
+    stor.ensure_schema()
+    m1 = stor.migrate_legacy_files(cache_dir)
+    assert m1["audits"] == 5
+    m2 = stor.migrate_legacy_files(cache_dir)
+    assert m2["audits"] == 0
+    assert len(stor.query_audit_entries(run_id="run-batch", limit=20)) == 5
+
+    fixed_ts = time.time() - 30.0
+    items = [{"finding_id": "es-idem-1", "rule_name": "IOC 198.51.100.77 CVE-2024-3094"}]
+    stor.upsert_alerts_snapshot("es_notables_24h", items, fetched_at=fixed_ts)
+    stor.upsert_alerts_snapshot("es_notables_24h", items, fetched_at=fixed_ts)
+    s_same = stor.lookup_ioc_sightings("198.51.100.77")
+    assert len(s_same) == 1
+    assert s_same[0]["sighting_count"] == 1
+
+    stor.upsert_alerts_snapshot("es_notables_24h", items, fetched_at=fixed_ts + 60.0)
+    s_newer = stor.lookup_ioc_sightings("198.51.100.77")
+    assert len(s_newer) == 1
+    assert s_newer[0]["sighting_count"] == 2
+    stor.dispose()

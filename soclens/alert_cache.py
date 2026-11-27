@@ -381,7 +381,12 @@ class AlertCacheStore:
             self._entries[source] = updated_entry
             path = self._entry_path(source)
             if path is not None:
-                payload = updated_entry.to_payload()
+                raw_payload = redact_sensitive_data(updated_entry.to_payload())
+                payload = (
+                    dict(raw_payload)
+                    if isinstance(raw_payload, Mapping)
+                    else updated_entry.to_payload()
+                )
         if path is not None and payload is not None:
             try:
                 serialized = json.dumps(payload, ensure_ascii=False, default=str)

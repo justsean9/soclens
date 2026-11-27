@@ -114,6 +114,18 @@ _SENSITIVE_KEY_EXACT: frozenset[str] = frozenset(
         "ms_copilot_directline_secret",
         "sig",
         "session_token",
+        "db_dsn",
+        "db-dsn",
+        "db_password",
+        "db-password",
+        "vault_ref",
+        "vault-ref",
+        "vault_secret_id",
+        "vault-secret-id",
+        "vault_role_id",
+        "vault-role-id",
+        "vault_token",
+        "vault-token",
     }
 )
 
@@ -123,7 +135,7 @@ _SENSITIVE_KEY_RE = re.compile(
     r"id[-_]?token|auth[-_]?token|bearer[-_]?token|session[-_]?token|"
     r"client[-_]?secret|directline[-_]?secret|private[-_]?key|"
     r"password|passwd|passphrase|secret|credential|credentials|rftoken|"
-    r"authorization"
+    r"authorization|db[-_]?dsn|vault[-_]?ref|vault[-_]?secret[-_]?id|vault[-_]?role[-_]?id"
     r")(?:$|[_-])",
     re.IGNORECASE,
 )
@@ -281,9 +293,13 @@ _HTTP_AUTH_PARAM_KEYS: frozenset[str] = frozenset(
     }
 )
 
-# 1. URL userinfo: https://user:pass@host
+# 1. URL userinfo: https://user:pass@host, postgresql+pg8000://user:pass@host, mysql+pymysql://...
 _URL_USERINFO_RE = re.compile(
-    r"(https?|wss?|ftp)://([^/\s:@\"']++):([^/\s@\"']++)@",
+    r"(https?|wss?|ftp|"
+    r"postgresql(?:\+[a-z0-9_]+)?|postgres(?:\+[a-z0-9_]+)?|"
+    r"mysql(?:\+[a-z0-9_]+)?|mariadb(?:\+[a-z0-9_]+)?|"
+    r"mssql(?:\+[a-z0-9_]+)?|oracle(?:\+[a-z0-9_]+)?|sqlite(?:\+[a-z0-9_]+)?)"
+    r"://([^/\s:@\"']++):([^/\s@\"']++)@",
     re.IGNORECASE,
 )
 
@@ -359,12 +375,14 @@ _QUOTED_ASSIGNMENT_START_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_-])(-*+)([A-Za-z0-9_][A-Za-z0-9_-]*+)\s*+([:=])\s*+(\\*+)([\"'])"
 )
 
-# 8. Well-known vendor secret prefixes.
+# 8. Well-known vendor secret prefixes, Vault URIs, and Vault service tokens.
 _VENDOR_PREFIX_RE = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{10,}+|AIza[A-Za-z0-9_-]{20,}+|gh[pousr]_[A-Za-z0-9]{10,}+|"
     r"github_pat_[A-Za-z0-9_]{10,}+|"
     r"AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{10,}+)\b"
 )
+_VAULT_URI_RE = re.compile(r"vault://[^\s\"'<>]+", re.IGNORECASE)
+_VAULT_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])hvs\.[A-Za-z0-9_.-]{10,}")
 
 
 @lru_cache(maxsize=1024)
@@ -2563,6 +2581,8 @@ def _redact_string(text: str) -> str:
     out = _redact_bearer_schemes(out)
     out = _JWT_RE.sub("<REDACTED_JWT>", out)
     out = _VENDOR_PREFIX_RE.sub("<REDACTED>", out)
+    out = _VAULT_URI_RE.sub("<REDACTED>", out)
+    out = _VAULT_TOKEN_RE.sub("<REDACTED>", out)
     return out
 
 
