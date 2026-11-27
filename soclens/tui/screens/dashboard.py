@@ -10,7 +10,7 @@ from typing import Any
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Button, DataTable, Input, Select, Static, TabbedContent
+from textual.widgets import Button, DataTable, Input, Select, Static
 
 from soclens.config import (
     IMAGE_VIEWER_OS,
@@ -212,7 +212,7 @@ class DashboardPane(BaseSocPane):
     def _update_split_layout(self) -> None:
         try:
             workspace = self.query_one("#dash-workspace", Container)
-            width = int(getattr(self.app.size, "width", 120) or 120)
+            width = int(self.size.width or getattr(self.app.size, "width", 120) or 120)
             workspace.set_class(width >= _SPLIT_HORIZONTAL_MIN_WIDTH, "split-horizontal")
         except Exception:
             pass
@@ -415,7 +415,7 @@ class DashboardPane(BaseSocPane):
         if callable(open_fn):
             open_fn()
         else:
-            self.app.query_one("#main-tabs", TabbedContent).active = "tab-settings"
+            self.switch_to_pane("tab-settings")
 
     @on(Button.Pressed, "#dash-ssl-btn")
     def handle_toggle_insecure_ssl(self) -> None:

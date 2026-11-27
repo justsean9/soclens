@@ -18,7 +18,6 @@ from textual.widgets import (
     Input,
     Select,
     Static,
-    TabbedContent,
 )
 
 from soclens.client import LIST_TYPES, RecordedFutureClient
@@ -939,15 +938,7 @@ class WatchlistsPane(BaseSocPane):
                     list_type=list_type,
                 )
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-brand-logos", auto_enable_admin=True, on_ready=_apply)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-brand-logos"
-        brand_pane = self.app.query_one(BrandLogosPane)
-        self.call_after_refresh(_apply, brand_pane)
+        self.switch_to_pane("tab-brand-logos", auto_enable_admin=True, on_ready=_apply)
 
     @staticmethod
     def _entity_sort_menu_items() -> list[tuple[str, str]]:
@@ -1111,15 +1102,7 @@ class WatchlistsPane(BaseSocPane):
             if isinstance(rf_pane, RFIntelPane):
                 rf_pane.lookup_from_watchlist(ent_type, ent_val)
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-rf-intel", on_ready=_apply)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-rf-intel"
-        rf_pane = self.app.query_one(RFIntelPane)
-        self.call_after_refresh(rf_pane.lookup_from_watchlist, ent_type, ent_val)
+        self.switch_to_pane("tab-rf-intel", on_ready=_apply)
 
     def _research_entity_in_research_tab(self, ent_type: str, ent_val: str) -> None:
         from soclens.tui.screens.research import ResearchPane
@@ -1139,15 +1122,7 @@ class WatchlistsPane(BaseSocPane):
             if isinstance(res_pane, ResearchPane):
                 res_pane.investigate_external(ent_val, mapped)
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-research", on_ready=_apply)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-research"
-        res_pane = self.app.query_one(ResearchPane)
-        self.call_after_refresh(res_pane.investigate_external, ent_val, mapped)
+        self.switch_to_pane("tab-research", on_ready=_apply)
 
     @work(thread=True, exit_on_error=False)
     def _inspect_list_info_worker(self, list_id: str, list_name: str) -> None:

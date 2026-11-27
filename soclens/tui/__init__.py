@@ -24,6 +24,15 @@ from soclens.tui.modals import (
     SplunkNotableTriageModal,
     TriageItemModal,
 )
+from soclens.tui.tiling import (
+    LeafNode,
+    PanePickerModal,
+    SplitDivider,
+    SplitNode,
+    TileLeaf,
+    TileSplit,
+    WorkspaceHost,
+)
 
 __all__ = [
     "ADMIN_ONLY_TABS",
@@ -34,14 +43,21 @@ __all__ = [
     "CreateCaseModal",
     "DEFAULT_ADMIN_TAB",
     "DEFAULT_USER_TAB",
+    "LeafNode",
+    "PanePickerModal",
     "SocLensApp",
     "SaveFilterPresetModal",
     "ScreenshotViewerModal",
     "SettingsPassphraseModal",
     "SettingsUnlockModal",
+    "SplitDivider",
+    "SplitNode",
     "SplunkNotableTriageModal",
+    "TileLeaf",
+    "TileSplit",
     "TriageItemModal",
     "USER_VIEW_TABS",
+    "WorkspaceHost",
     "build_app",
     "create_app",
 ]

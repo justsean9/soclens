@@ -1013,6 +1013,36 @@ class BaseSocPane(VerticalScroll):
         """Hook invoked when the active TUI display timezone changes."""
         _ = tz_name
 
+    def switch_to_pane(
+        self,
+        tab_id: str,
+        *,
+        auto_enable_admin: bool = False,
+        on_ready: Callable[[BaseSocPane], None] | None = None,
+    ) -> bool:
+        """Activate ``tab_id`` via ``SocLensApp.activate_tab`` or ``WorkspaceHost``."""
+        activate_fn = getattr(self.app, "activate_tab", None)
+        if callable(activate_fn):
+            return bool(
+                activate_fn(
+                    tab_id,
+                    auto_enable_admin=auto_enable_admin,
+                    on_ready=on_ready,
+                )
+            )
+        from soclens.tui.tiling import WorkspaceHost
+
+        with contextlib.suppress(Exception):
+            host = self.app.query_one(WorkspaceHost)
+            return bool(
+                host.switch_to_pane(
+                    tab_id,
+                    auto_enable_admin=auto_enable_admin,
+                    on_ready=on_ready,
+                )
+            )
+        return False
+
     def sync_event_ai_panel(self, panel_selector: str, event: Any) -> None:
         """Bind ``event`` and its persisted AI entries to the pane-scoped ``EventAIPanelWidget``."""
         from soclens.tui.ai_widgets import EventAIPanelWidget

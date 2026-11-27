@@ -26,7 +26,6 @@ from textual.widgets import (
     RichLog,
     Select,
     Static,
-    TabbedContent,
 )
 
 from soclens.alert_cache import CACHE_SOURCE_RF, CACHE_SOURCE_RF_PLAYBOOK
@@ -2782,23 +2781,13 @@ class RFIntelPane(BaseSocPane):
         )
 
     def _send_entity_to_watchlists(self, ent_type: str, ent_val: str) -> None:
-        from soclens.tui.screens.watchlists import WatchlistsPane
-
         def _fill(wl_pane: BaseSocPane) -> None:
             wl_pane.query_one("#wl-ent-type", Input).value = ent_type
             wl_pane.query_one("#wl-ent-value", Input).value = ent_val
             wl_pane.query_one("#wl-ent-value", Input).focus()
             wl_pane.set_status(f"Populated entity from RF Intel: {ent_type} = {ent_val}")
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-watchlists", auto_enable_admin=True, on_ready=_fill)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-watchlists"
-        wl_pane = self.app.query_one(WatchlistsPane)
-        self.call_after_refresh(_fill, wl_pane)
+        self.switch_to_pane("tab-watchlists", auto_enable_admin=True, on_ready=_fill)
 
     def _research_in_research_tab(self, entity_val: str, entity_type: str = "") -> None:
         from soclens.tui.screens.research import ResearchPane
@@ -2809,15 +2798,7 @@ class RFIntelPane(BaseSocPane):
             if isinstance(pane, ResearchPane):
                 pane.investigate_external(clean_val, v2_type or "auto")
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-research", on_ready=_fill)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-research"
-        res_pane = self.app.query_one(ResearchPane)
-        self.call_after_refresh(res_pane.investigate_external, clean_val, v2_type or "auto")
+        self.switch_to_pane("tab-research", on_ready=_fill)
 
     # ------------------------------------------------------------------
     # Triage, Create Case & Screenshot Actions

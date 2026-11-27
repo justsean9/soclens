@@ -21,7 +21,6 @@ from textual.widgets import (
     RichLog,
     Select,
     Static,
-    TabbedContent,
 )
 
 from soclens.client import RecordedFutureError
@@ -612,8 +611,7 @@ class ResearchPane(BaseSocPane):
         if callable(open_fn):
             open_fn(category="cat-osint")
         else:
-            tabs = self.app.query_one("#main-tabs", TabbedContent)
-            tabs.active = "tab-settings"
+            self.switch_to_pane("tab-settings")
 
     def action_history_back(self) -> None:
         self._navigate_history(-1)
@@ -954,8 +952,6 @@ class ResearchPane(BaseSocPane):
         )
 
     def _send_to_watchlists(self, entity_value: str, kind: str) -> None:
-        from soclens.tui.screens.watchlists import WatchlistsPane
-
         clean_val = entity_value.strip()
         for prefix in ("ip:", "idn:", "hash:"):
             if clean_val.lower().startswith(prefix):
@@ -978,15 +974,7 @@ class ResearchPane(BaseSocPane):
             wl_pane.query_one("#wl-ent-value", Input).focus()
             wl_pane.set_status(f"Populated entity from Research: {wl_type} = {clean_val}")
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-watchlists", auto_enable_admin=True, on_ready=_fill)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-watchlists"
-        wl_pane = self.app.query_one(WatchlistsPane)
-        self.call_after_refresh(_fill, wl_pane)
+        self.switch_to_pane("tab-watchlists", auto_enable_admin=True, on_ready=_fill)
 
     def _send_to_rf_intel(self, entity_value: str, kind: str) -> None:
         from soclens.tui.screens.rf_intel import RFIntelPane
@@ -995,15 +983,7 @@ class ResearchPane(BaseSocPane):
             if isinstance(pane, RFIntelPane):
                 pane.lookup_from_watchlist(kind, entity_value)
 
-        activate_fn = getattr(self.app, "activate_tab", None)
-        if callable(activate_fn):
-            activate_fn("tab-rf-intel", on_ready=_fill)
-            return
-
-        tabs = self.app.query_one("#main-tabs", TabbedContent)
-        tabs.active = "tab-rf-intel"
-        rf_pane = self.app.query_one(RFIntelPane)
-        self.call_after_refresh(rf_pane.lookup_from_watchlist, kind, entity_value)
+        self.switch_to_pane("tab-rf-intel", on_ready=_fill)
 
     def _send_to_splunk(self, entity_value: str, kind: str) -> None:
         clean_val = entity_value.strip()

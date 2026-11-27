@@ -130,6 +130,12 @@ from soclens.tui.screens import (
     WatchlistsPane,
 )
 from soclens.tui.screens.base import BaseSocPane
+from soclens.tui.tiling import (
+    PanePickerModal,
+    SplitDirection,
+    TileLeaf,
+    WorkspaceHost,
+)
 
 USER_VIEW_TABS: tuple[str, ...] = (
     "tab-rf-intel",
@@ -184,17 +190,6 @@ _SOCLENS_THEME = Theme(
     error="#f85149",
     dark=True,
 )
-
-
-class _SocTabbedContent(TabbedContent):
-    """TabbedContent that ignores stale focus events from hidden panes."""
-
-    def _on_tab_pane_focused(self, event: TabPane.Focused) -> None:
-        if not event.tab_pane.display:
-            event.prevent_default()
-            event.stop()
-            return
-        super()._on_tab_pane_focused(event)
 
 
 class _SocFooter(Footer):
@@ -1197,6 +1192,243 @@ class SocLensApp(App[None]):
         height: 2fr;
         min-height: 7;
     }
+    WorkspaceHost {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+        margin: 0;
+        border: none;
+    }
+    #tiling-root {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+        margin: 0;
+        border: none;
+        display: none;
+    }
+    .tile-split {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+        margin: 0;
+    }
+    .tile-split.-horizontal {
+        layout: horizontal;
+    }
+    .tile-split.-vertical {
+        layout: vertical;
+    }
+    .split-divider {
+        background: #232d42;
+        color: #58a6ff;
+        content-align: center middle;
+    }
+    .split-divider.-horizontal {
+        width: 1;
+        height: 1fr;
+    }
+    .split-divider.-vertical {
+        width: 1fr;
+        height: 1;
+    }
+    .split-divider:hover,
+    .split-divider.-dragging {
+        background: #2f81f7;
+        color: #ffffff;
+    }
+    .tile-leaf {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+        margin: 0;
+        overflow-x: auto;
+        background: #0f131c;
+        border: solid #2e3c5c;
+        border-title-color: #9eb4dc;
+        border-title-background: #141a29;
+    }
+    .tile-leaf > * {
+        min-width: 36;
+    }
+    .tile-leaf.-focused {
+        border: solid #58a6ff;
+        border-title-color: #f0f6ff;
+        border-title-background: #1e273b;
+        border-title-style: bold;
+    }
+    .tile-leaf.-zoomed {
+        border: double #f2cc60;
+        border-title-color: #f2cc60;
+        border-title-background: #1e273b;
+        border-title-style: bold;
+    }
+    .tile-leaf.-compact-narrow Button.-textual-compact,
+    .tile-leaf.-compact-narrow Select.-textual-compact > SelectCurrent,
+    .tile-leaf.-compact-narrow Input.-textual-compact {
+        border-left: none !important;
+        border-right: none !important;
+        padding: 0;
+        min-width: 4;
+    }
+    .tile-leaf.-compact-narrow .toolbar-row,
+    .tile-leaf.-compact-narrow .filter-bar,
+    .tile-leaf.tile-compact .toolbar-row,
+    .tile-leaf.tile-compact .filter-bar {
+        padding: 0;
+    }
+    .tile-leaf.-compact-narrow #dash-toolbar,
+    .tile-leaf.-compact-narrow #sigma-toolbar,
+    .tile-leaf.-compact-narrow #splunk-bundle-toolbar,
+    .tile-leaf.-compact-narrow #res-toolbar,
+    .tile-leaf.-compact-narrow #logs-toolbar {
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .tile-leaf.-compact-narrow #dash-toolbar Button,
+    .tile-leaf.-compact-narrow #sigma-toolbar Button,
+    .tile-leaf.-compact-narrow #sigma-toolbar Input,
+    .tile-leaf.-compact-narrow #sigma-toolbar Select,
+    .tile-leaf.-compact-narrow #splunk-bundle-toolbar Button,
+    .tile-leaf.-compact-narrow #splunk-bundle-toolbar Input,
+    .tile-leaf.-compact-narrow #splunk-bundle-toolbar Select,
+    .tile-leaf.-compact-narrow #splunk-bundle-toolbar Checkbox,
+    .tile-leaf.-compact-narrow #res-toolbar Input,
+    .tile-leaf.-compact-narrow #res-toolbar Select,
+    .tile-leaf.-compact-narrow #res-toolbar Button,
+    .tile-leaf.-compact-narrow #logs-toolbar Button {
+        width: 1fr;
+        min-width: 5;
+        height: 1;
+        margin-right: 0;
+    }
+    .tile-leaf.-compact-narrow #wl-ent-type,
+    .tile-leaf.-compact-narrow #wl-entity-sort-select,
+    .tile-leaf.-compact-narrow #rf-limit-input,
+    .tile-leaf.-compact-narrow #rf-auto-enrich-btn,
+    .tile-leaf.-compact-narrow #rf-v2-type,
+    .tile-leaf.-compact-narrow #rf-preset-select,
+    .tile-leaf.-compact-narrow #rf-priority-filter,
+    .tile-leaf.-compact-narrow #rf-timeframe-filter,
+    .tile-leaf.-compact-narrow #rf-assignee-filter,
+    .tile-leaf.-compact-narrow #rf-sort-select,
+    .tile-leaf.-compact-narrow #rf-time-field-select,
+    .tile-leaf.-compact-narrow #rf-date-from,
+    .tile-leaf.-compact-narrow #rf-date-to,
+    .tile-leaf.-compact-narrow #rf-rule-filter,
+    .tile-leaf.-compact-narrow #rf-entity-filter,
+    .tile-leaf.-compact-narrow #rf-pb-category,
+    .tile-leaf.-compact-narrow #rf-triage-context,
+    .tile-leaf.-compact-narrow #rf-view-select,
+    .tile-leaf.-compact-narrow #sigma-days-input,
+    .tile-leaf.-compact-narrow #sigma-pipeline-select,
+    .tile-leaf.-compact-narrow #sigma-level-filter,
+    .tile-leaf.-compact-narrow #sigma-time-preset,
+    .tile-leaf.-compact-narrow #brand-interval,
+    .tile-leaf.-compact-narrow #brand-max-runs,
+    .tile-leaf.-compact-narrow #brand-list-id,
+    .tile-leaf.-compact-narrow #brand-source-list,
+    .tile-leaf.-compact-narrow #splunk-earliest,
+    .tile-leaf.-compact-narrow #splunk-latest,
+    .tile-leaf.-compact-narrow #splunk-bundle-time-preset,
+    .tile-leaf.-compact-narrow #splunk-search-preset,
+    .tile-leaf.-compact-narrow #splunk-search-earliest,
+    .tile-leaf.-compact-narrow #splunk-search-latest,
+    .tile-leaf.-compact-narrow #splunk-search-app,
+    .tile-leaf.-compact-narrow #splunk-search-limit,
+    .tile-leaf.-compact-narrow #splunk-search-filter-input,
+    .tile-leaf.-compact-narrow #es-view-select,
+    .tile-leaf.-compact-narrow #es-preset-select,
+    .tile-leaf.-compact-narrow #es-timeframe-select,
+    .tile-leaf.-compact-narrow #es-urgency-select,
+    .tile-leaf.-compact-narrow #es-status-select,
+    .tile-leaf.-compact-narrow #es-entity-kind-select,
+    .tile-leaf.-compact-narrow #es-collection-select,
+    .tile-leaf.-compact-narrow #es-earliest-input,
+    .tile-leaf.-compact-narrow #res-target-type,
+    .tile-leaf.-compact-narrow #res-source-mode,
+    .tile-leaf.-compact-narrow #res-source-group-filter,
+    .tile-leaf.-compact-narrow #res-timeframe-preset,
+    .tile-leaf.-compact-narrow #res-category-filter,
+    .tile-leaf.-compact-narrow #res-limit-input,
+    .tile-leaf.-compact-narrow #res-links-timeframe,
+    .tile-leaf.-compact-narrow #logs-source-select,
+    .tile-leaf.-compact-narrow #logs-level-select,
+    .tile-leaf.-compact-narrow #logs-timeframe-select,
+    .tile-leaf.-compact-narrow #s1-view-select,
+    .tile-leaf.-compact-narrow #s1-preset-select,
+    .tile-leaf.-compact-narrow #s1-timeframe-select,
+    .tile-leaf.-compact-narrow #s1-status-select,
+    .tile-leaf.-compact-narrow #dash-error-timeframe,
+    .tile-leaf.-compact-narrow #llm-provider-select,
+    .tile-leaf.-compact-narrow #llm-model-select,
+    .tile-leaf.-compact-narrow #llm-template-select,
+    .tile-leaf.tile-compact #wl-ent-type,
+    .tile-leaf.tile-compact #wl-entity-sort-select,
+    .tile-leaf.tile-compact #rf-limit-input,
+    .tile-leaf.tile-compact #rf-auto-enrich-btn,
+    .tile-leaf.tile-compact #rf-v2-type,
+    .tile-leaf.tile-compact #rf-preset-select,
+    .tile-leaf.tile-compact #rf-priority-filter,
+    .tile-leaf.tile-compact #rf-timeframe-filter,
+    .tile-leaf.tile-compact #rf-assignee-filter,
+    .tile-leaf.tile-compact #rf-sort-select,
+    .tile-leaf.tile-compact #rf-time-field-select,
+    .tile-leaf.tile-compact #rf-date-from,
+    .tile-leaf.tile-compact #rf-date-to,
+    .tile-leaf.tile-compact #rf-rule-filter,
+    .tile-leaf.tile-compact #rf-entity-filter,
+    .tile-leaf.tile-compact #rf-pb-category,
+    .tile-leaf.tile-compact #rf-triage-context,
+    .tile-leaf.tile-compact #rf-view-select,
+    .tile-leaf.tile-compact #es-view-select,
+    .tile-leaf.tile-compact #es-preset-select,
+    .tile-leaf.tile-compact #es-timeframe-select,
+    .tile-leaf.tile-compact #es-urgency-select,
+    .tile-leaf.tile-compact #es-status-select,
+    .tile-leaf.tile-compact #es-entity-kind-select,
+    .tile-leaf.tile-compact #es-collection-select,
+    .tile-leaf.tile-compact #es-earliest-input,
+    .tile-leaf.tile-compact #s1-view-select,
+    .tile-leaf.tile-compact #s1-preset-select,
+    .tile-leaf.tile-compact #s1-timeframe-select,
+    .tile-leaf.tile-compact #s1-status-select,
+    .tile-leaf.tile-compact #llm-provider-select,
+    .tile-leaf.tile-compact #llm-model-select,
+    .tile-leaf.tile-compact #llm-template-select {
+        width: 1fr;
+        min-width: 5;
+    }
+    .tile-leaf.tile-compact .info-box {
+        padding: 0;
+        margin: 0;
+    }
+    .tile-leaf.tile-compact .detail-toolbar {
+        height: auto;
+        padding: 0;
+    }
+    .tile-leaf.tile-short DataTable,
+    .tile-leaf.tile-short #dash-errors-table,
+    .tile-leaf.tile-short #dash-apis-table,
+    .tile-leaf.tile-short #brand-table,
+    .tile-leaf.tile-short #sigma-table,
+    .tile-leaf.tile-short #splunk-results-table {
+        min-height: 2;
+    }
+    .tile-leaf.tile-short RichLog,
+    .tile-leaf.tile-short RichLog.primary-log,
+    .tile-leaf.tile-short #llm-transcript {
+        min-height: 2;
+    }
+    .tile-leaf.tile-short .split-workspace {
+        min-height: 5;
+    }
+    .tile-leaf.tile-short .table-pane {
+        min-height: 3;
+    }
     """
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
@@ -1222,6 +1454,29 @@ class SocLensApp(App[None]):
         Binding("f12", "ai_kill_hotkey('f12')", "Kill AI", priority=True),
         Binding("f11", "ai_kill_hotkey('f11')", "Kill AI", priority=True),
         Binding("ctrl+backslash", "ai_kill_hotkey('ctrl+backslash')", "Kill AI", priority=True),
+        Binding("alt+t", "toggle_tiling_mode", "Tile Mode"),
+        Binding("alt+v", "split_tile('horizontal')", "Split Right"),
+        Binding("alt+s", "split_tile('vertical')", "Split Down"),
+        Binding("alt+p", "open_pane_picker", "Pick Pane"),
+        Binding("alt+h,alt+left", "focus_tile(-1, 0)", "Focus Left", show=False),
+        Binding("alt+j,alt+down", "focus_tile(0, 1)", "Focus Down", show=False),
+        Binding("alt+k,alt+up", "focus_tile(0, -1)", "Focus Up", show=False),
+        Binding("alt+l,alt+right", "focus_tile(1, 0)", "Focus Right", show=False),
+        Binding("alt+shift+h,shift+alt+h,alt+H", "swap_tile(-1, 0)", "Swap Left", show=False),
+        Binding("alt+shift+j,shift+alt+j,alt+J", "swap_tile(0, 1)", "Swap Down", show=False),
+        Binding("alt+shift+k,shift+alt+k,alt+K", "swap_tile(0, -1)", "Swap Up", show=False),
+        Binding("alt+shift+l,shift+alt+l,alt+L", "swap_tile(1, 0)", "Swap Right", show=False),
+        Binding("alt+ctrl+left,ctrl+alt+left", "resize_tile(-1, 0)", "Resize Left", show=False),
+        Binding("alt+ctrl+right,ctrl+alt+right", "resize_tile(1, 0)", "Resize Right", show=False),
+        Binding("alt+ctrl+up,ctrl+alt+up", "resize_tile(0, -1)", "Resize Up", show=False),
+        Binding("alt+ctrl+down,ctrl+alt+down", "resize_tile(0, 1)", "Resize Down", show=False),
+        Binding("alt+z", "toggle_tile_zoom", "Zoom Tile"),
+        Binding("alt+q", "close_tile", "Close Tile"),
+        Binding("alt+1", "switch_workspace(1)", "WS 1", show=False),
+        Binding("alt+2", "switch_workspace(2)", "WS 2", show=False),
+        Binding("alt+3", "switch_workspace(3)", "WS 3", show=False),
+        Binding("alt+4", "switch_workspace(4)", "WS 4", show=False),
+        Binding("alt+5", "switch_workspace(5)", "WS 5", show=False),
         Binding("slash", "toggle_watchlist_filter", "Search/Filter", show=False),
         Binding("escape", "collapse_watchlist_filter", "Close Filter", show=False),
         Binding("q", "quit", "Quit"),
@@ -1313,6 +1568,8 @@ class SocLensApp(App[None]):
         self.log_store.set_on_entry(self._on_store_entry)
         self._verify_ssl_override: bool | str | None = None
         self._mounted_tabs: set[str] = {self.initial_tab}
+        self._mounted_panes: dict[str, BaseSocPane] = {}
+        self._workspace_host: WorkspaceHost | None = None
         self._tab_mount_events: dict[str, asyncio.Event] = {}
         self._pending_tab_callbacks: dict[str, list[Callable[[BaseSocPane], None]]] = {}
         self._preload_alerts_opt: bool | None = preload_alerts
@@ -1410,6 +1667,22 @@ class SocLensApp(App[None]):
         ):
             self.log_store.set_file_sink(self.workspace_dir / "logs" / "soclens_debug.log")
         self._update_subtitle()
+
+    @property
+    def workspace_host(self) -> WorkspaceHost:
+        """Return the ``WorkspaceHost`` managing Tabbed and BSP Tiling workspaces."""
+        if self._workspace_host is not None:
+            return self._workspace_host
+        host = self.query_one("#workspace-host", WorkspaceHost)
+        self._workspace_host = host
+        return host
+
+    @property
+    def active_pane_id(self) -> str:
+        """Return the active/focused ``tab-*`` ID across Tabbed and Tiling modes."""
+        with contextlib.suppress(Exception):
+            return self.workspace_host.active_pane_id
+        return self.initial_tab
 
     @property
     def is_admin_view(self) -> bool:
@@ -1672,13 +1945,24 @@ class SocLensApp(App[None]):
     def _get_mounted_pane(self, tab_id: str) -> BaseSocPane | None:
         if not self._ui_mounted or not tab_id or tab_id in self._tab_mount_events:
             return None
+        cached = self._mounted_panes.get(tab_id)
+        if cached is not None and cached.is_attached and not getattr(cached, "_closing", False):
+            return cached
         try:
             tab_pane = self.query_one(f"#{tab_id}", TabPane)
         except Exception:
-            return None
-        for child in tab_pane.children:
-            if isinstance(child, BaseSocPane):
-                return child
+            tab_pane = None
+        if tab_pane is not None:
+            for child in tab_pane.children:
+                if isinstance(child, BaseSocPane):
+                    self._mounted_panes[tab_id] = child
+                    return child
+        pane_cls = self._TAB_PANE_CLASSES.get(tab_id)
+        if pane_cls is not None:
+            for candidate in self.query(pane_cls):
+                if isinstance(candidate, BaseSocPane) and not getattr(candidate, "_closing", False):
+                    self._mounted_panes[tab_id] = candidate
+                    return candidate
         return None
 
     async def ensure_tab_mounted(self, tab_id: str) -> BaseSocPane | None:
@@ -1727,6 +2011,7 @@ class SocLensApp(App[None]):
                 if pending:
                     break
             self._mounted_tabs.add(tab_id)
+            self._mounted_panes[tab_id] = pane
             return pane
         finally:
             done_event.set()
@@ -1848,9 +2133,7 @@ class SocLensApp(App[None]):
             ("splunk_keyword", f"Search in Splunk: {spl_preview}"),
         ]
 
-        active_tab = ""
-        with contextlib.suppress(Exception):
-            active_tab = str(self.query_one("#main-tabs", TabbedContent).active or "")
+        active_tab = self.active_pane_id
 
         def _on_select(action_id: str | None) -> None:
             if on_close is not None:
@@ -1900,9 +2183,7 @@ class SocLensApp(App[None]):
                 severity="warning",
             )
             return
-        active_tab = ""
-        with contextlib.suppress(Exception):
-            active_tab = str(self.query_one("#main-tabs", TabbedContent).active or "")
+        active_tab = self.active_pane_id
         self.dispatch_pivot(
             PivotPayload(
                 source_tab=active_tab or "selection",
@@ -2068,7 +2349,17 @@ class SocLensApp(App[None]):
                     logger_name="SocLensApp",
                 )
 
-        ok = self.activate_tab(target_tab, auto_enable_admin=False, on_ready=_deliver)
+        if self.workspace_host.mode == "tiling":
+            source_tab = str(effective_payload.source_tab or "").strip()
+            if not source_tab or source_tab == "selection":
+                source_tab = self.active_pane_id
+            ok = self.workspace_host.dispatch_pivot_tile(
+                source_tab,
+                target_tab,
+                on_ready=_deliver,
+            )
+        else:
+            ok = self.activate_tab(target_tab, auto_enable_admin=False, on_ready=_deliver)
         if ok:
             self.record_log(
                 f"Dispatched pivot {effective_payload.source_tab or '-'} -> {target_tab}",
@@ -2159,8 +2450,16 @@ class SocLensApp(App[None]):
             self._start_alert_preloader()
 
     def _focus_main_tabs(self) -> None:
-        """Keep focus on the main tab bar rather than the top view-mode chrome."""
+        """Keep focus on the active workspace surface rather than the top view-mode chrome."""
         with contextlib.suppress(Exception):
+            host = self.workspace_host
+            if host.mode == "tiling":
+                active_id = host.focused_pane_id
+                for leaf in host.query(TileLeaf):
+                    if leaf.pane_id == active_id and leaf.display:
+                        leaf.focus()
+                        return
+                return
             self.query_one("#main-tabs", TabbedContent).query_one("ContentTabs").focus()
 
     def _sync_responsive_chrome(self) -> None:
@@ -2181,6 +2480,16 @@ class SocLensApp(App[None]):
                     self.query_one(DashboardPane).sync_image_viewer_state()
                 with contextlib.suppress(Exception):
                     self.query_one(RFIntelPane).on_image_viewer_mode_changed()
+        with contextlib.suppress(Exception):
+            self._workspace_host = self.query_one("#workspace-host", WorkspaceHost)
+        with contextlib.suppress(Exception):
+            init_tp = self.query_one(f"#{self.initial_tab}", TabPane)
+            for child in init_tp.children:
+                if isinstance(child, BaseSocPane):
+                    self._mounted_panes[self.initial_tab] = child
+                    break
+        with contextlib.suppress(Exception):
+            self.workspace_host.load_persisted_state()
         with self.batch_update():
             self._apply_view_mode_to_ui()
             self.sync_ai_kill_switch_ui()
@@ -3415,19 +3724,34 @@ class SocLensApp(App[None]):
                 compact=True,
             )
             yield Button("Admin: OFF [F2]", id="view-mode-toggle-btn", compact=True)
-        with _SocTabbedContent(initial=self.initial_tab, id="main-tabs"):
-            for tab_id, title, pane_cls in self._TAB_SPECS:
-                with TabPane(title, id=tab_id):
-                    if tab_id == self.initial_tab:
-                        yield pane_cls()
+        yield WorkspaceHost(
+            initial_tab=self.initial_tab,
+            tab_specs=self._TAB_SPECS,
+            id="workspace-host",
+        )
         yield _SocFooter()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide and disable Admin-only tab keybindings while in User View, and inactive kill hotkeys."""
+        """Hide and disable Admin-only tab keybindings while in User View, and inactive kill/tiling hotkeys."""
         if action == "switch_tab" and parameters:
             return self.is_tab_visible(str(parameters[0]))
         if action == "ai_kill_hotkey" and parameters:
             return True if str(parameters[0]) == self._kill_switch_hotkey else None
+        if action in {
+            "split_tile",
+            "open_pane_picker",
+            "focus_tile",
+            "swap_tile",
+            "resize_tile",
+            "toggle_tile_zoom",
+            "close_tile",
+            "switch_workspace",
+        }:
+            if not self._ui_mounted:
+                return False
+            with contextlib.suppress(Exception):
+                return self.workspace_host.mode == "tiling"
+            return False
         return True
 
     def sync_ai_kill_switch_ui(self) -> None:
@@ -3655,6 +3979,9 @@ class SocLensApp(App[None]):
             for tab_id in ADMIN_ONLY_TABS:
                 tabs.hide_tab(tab_id)
 
+        with contextlib.suppress(Exception):
+            self.workspace_host.on_view_mode_changed(self.view_mode)
+
         label = self.query_one("#view-mode-label", Static)
         select = self.query_one("#view-mode-select", Select)
         toggle_btn = self.query_one("#view-mode-toggle-btn", Button)
@@ -3743,6 +4070,16 @@ class SocLensApp(App[None]):
                     severity="warning",
                 )
                 return False
+        if self.workspace_host.mode == "tiling":
+            return self.workspace_host.switch_to_pane(tab_id, on_ready=on_ready)
+        return self._activate_tabbed_pane(tab_id, on_ready=on_ready)
+
+    def _activate_tabbed_pane(
+        self,
+        tab_id: str,
+        *,
+        on_ready: Callable[[BaseSocPane], None] | None = None,
+    ) -> bool:
         tabs = self.query_one("#main-tabs", TabbedContent)
         pane = self._get_mounted_pane(tab_id)
         already_active = tabs.active == tab_id
@@ -3808,6 +4145,8 @@ class SocLensApp(App[None]):
         """Lazily mount the activated pane, notify it, and invoke pending callbacks."""
         if event.pane is None:
             return
+        if self.workspace_host.mode == "tiling":
+            return
         tab_id = str(event.pane.id or "")
         if tab_id in USER_VIEW_TABS:
             self._last_user_tab = tab_id
@@ -3832,20 +4171,88 @@ class SocLensApp(App[None]):
         """Activate a top-level workflow tab by ID when accessible in the active view."""
         if not self.is_tab_visible(tab_id):
             return
-        tabs = self.query_one("#main-tabs", TabbedContent)
-        tabs.active = tab_id
+        self.workspace_host.switch_to_pane(tab_id)
+
+    def action_toggle_tiling_mode(self) -> None:
+        """Toggle between Tabbed Mode and Linux-style BSP Tiling Mode (Alt+t)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.toggle_mode()
+
+    def action_split_tile(self, direction: SplitDirection) -> None:
+        """Split the focused tile right (horizontal) or down (vertical)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.split_tile(direction)
+
+    def action_open_pane_picker(self) -> None:
+        """Open the quick pane picker modal (Alt+p) in Tiling Mode."""
+        if isinstance(self.screen, ModalScreen) or self.workspace_host.mode != "tiling":
+            return
+        panes = [
+            (tid, title)
+            for tid, title, _ in self._TAB_SPECS
+            if self.is_tab_visible(tid)
+        ]
+        slot = self.workspace_host.workspaces.get(self.workspace_host.active_workspace)
+        visible_panes = {leaf.pane_id for leaf in slot.iter_leaves()} if slot is not None else set()
+        modal = PanePickerModal(
+            panes,
+            visible_panes=visible_panes,
+            focused_pane_id=self.workspace_host.focused_pane_id,
+        )
+
+        def _on_picked(selected: str | None) -> None:
+            if selected:
+                self.workspace_host.switch_to_pane(selected)
+
+        self.push_screen(modal, callback=_on_picked)
+
+    def action_focus_tile(self, dx: int, dy: int) -> None:
+        """Move directional focus between tiles (Alt+h/j/k/l or Alt+Arrows)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.focus_direction(dx, dy)
+
+    def action_swap_tile(self, dx: int, dy: int) -> None:
+        """Swap the focused tile with its directional neighbor (Alt+Shift+h/j/k/l)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.swap_direction(dx, dy)
+
+    def action_resize_tile(self, dx: int, dy: int) -> None:
+        """Resize the split divider adjacent to the focused tile (Alt+Ctrl+Arrows)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.resize_direction(dx, dy)
+
+    def action_toggle_tile_zoom(self) -> None:
+        """Toggle zoom/maximize on the focused tile (Alt+z)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.toggle_zoom()
+
+    def action_close_tile(self) -> None:
+        """Close the focused tile unless it is the last tile (Alt+q)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.close_focused_tile()
+
+    def action_switch_workspace(self, slot: int) -> None:
+        """Switch to named tiling workspace slot 1..5 (Alt+1..5)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.workspace_host.switch_workspace(slot)
 
     def action_toggle_watchlist_filter(self) -> None:
         """Toggle search/filter drawer when Watchlists, RF Intel, Research, or Logs tab is active."""
-        tabs = self.query_one("#main-tabs", TabbedContent)
-        pane = self._get_mounted_pane(str(tabs.active or ""))
+        pane = self._get_mounted_pane(self.active_pane_id)
         if isinstance(pane, (WatchlistsPane, RFIntelPane, ResearchPane, LogsPane)):
             pane.action_toggle_filter()
 
     def action_collapse_watchlist_filter(self) -> None:
         """Collapse search/filter drawer when Watchlists, RF Intel, Research, or Logs tab is active."""
-        tabs = self.query_one("#main-tabs", TabbedContent)
-        pane = self._get_mounted_pane(str(tabs.active or ""))
+        pane = self._get_mounted_pane(self.active_pane_id)
         if isinstance(pane, (WatchlistsPane, RFIntelPane, ResearchPane, LogsPane)):
             pane.action_collapse_filter()
 
@@ -3869,8 +4276,7 @@ class SocLensApp(App[None]):
                     )
                 ):
                     return
-            tabs = self.query_one("#main-tabs", TabbedContent)
-            active = tabs.active
+            active = self.active_pane_id
             if active == "tab-watchlists":
                 wl_pane = self.query_one(WatchlistsPane)
                 if focused is None or (focused is not wl_pane and wl_pane not in focused.ancestors):
