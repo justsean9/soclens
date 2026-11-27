@@ -253,6 +253,10 @@ def test_streaming_secret_redactor_handles_normal_prose_and_split_secrets() -> N
     prose_parts.append(prose_redactor.flush())
     assert "".join(prose_parts) == "Checking alert on srv-01."
 
+    unicode_prose = "Analyst café — Tokyo SOC 東京 (naïve résumé)"
+    u_red = StreamingSecretRedactor()
+    assert "".join(u_red.feed(c) for c in unicode_prose) + u_red.flush() == unicode_prose
+
     for chunks, forbidden in (
         (["Key: ", "sk-", "OpenAI", "SecretKey12345678", " ok"], ("OpenAISecretKey12345678",)),
         (["Auth ", "Bea", "rer ", "MySecret", "Bearer999", " ok"], ("MySecretBearer999",)),
@@ -261,11 +265,45 @@ def test_streaming_secret_redactor_handles_normal_prose_and_split_secrets() -> N
             ["-----BEG", "IN RSA PRIVATE KEY-----\n", "MIIEowIBAAKCAQEA\n", "-----END RSA PRIVATE KEY-----"],
             ("MIIEowIBAAKCAQEA", "BEGIN"),
         ),
+        (['Header Bearer "My ', 'QuotedSecret12345" end'], ("QuotedSecret12345",)),
+        (list('Header Bearer "My QuotedSecret12345" end'), ("QuotedSecret12345",)),
+        (['ApiToken "My ', 'QuotedApiToken12345" end'], ("QuotedApiToken12345",)),
+        (list('ApiToken "My QuotedApiToken12345" end'), ("QuotedApiToken12345",)),
+        (list('Header Bearer "My \\"Escaped\\" QuotedSecret12345" end'), ("QuotedSecret12345", "Escaped")),
+        (["B\u0307earer ", "MyMnBearerSecret99999"], ("MyMnBearerSecret99999",)),
+        (list("B\u0307earer MyMnBearerSecret99999 end"), ("MyMnBearerSecret99999",)),
+        (
+            list(
+                "\uff41\uff50\uff49\uff3f\uff4b\uff45\uff59\uff1d "
+                "\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14 end"
+            ),
+            ("\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14",),
+        ),
+        (
+            list(
+                "\uff22\uff45\uff41\uff52\uff45\uff52 "
+                "\uff2d\uff59\uff33\uff45\uff43\uff52\uff45\uff54\uff34\uff4f\uff4b\uff45\uff4e\uff11\uff12\uff13\uff14 end"
+            ),
+            ("\uff2d\uff59\uff33\uff45",),
+        ),
+        (
+            list(
+                "\uff0d\uff0d\uff0d\uff0d\uff0dBEGIN RSA PRIVATE KEY\uff0d\uff0d\uff0d\uff0d\uff0d\n"
+                "MIIEowIBAAKCAQEA\n"
+                "\uff0d\uff0d\uff0d\uff0d\uff0dEND RSA PRIVATE KEY\uff0d\uff0d\uff0d\uff0d\uff0d\nend"
+            ),
+            ("MIIEowIBAAKCAQEA", "BEGIN", "KEY"),
+        ),
+        (
+            list("Key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowSecretBody\n-----END RSA PRIVATE KEY-----\nend"),
+            ("MIIEowSecretBody", "KEY-----", "BEGIN"),
+        ),
+        (["p\u0307", "", 'assword="my secret12345"'], ("secret12345",)),
     ):
         red = StreamingSecretRedactor()
         out = "".join(red.feed(c) for c in chunks) + red.flush()
         for frag in forbidden:
-            assert frag not in out
+            assert frag not in out, f"Leaked {frag!r} in {out!r}"
         assert "<REDACTED>" in out
 
 

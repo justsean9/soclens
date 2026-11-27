@@ -316,6 +316,9 @@ class StreamingSecretRedactor:
 
     _MAX_HOLD_CHARS = 4096
     _MAX_PEM_HOLD_CHARS = 16384
+    _AUTH_HEADER_LINE_RE = re.compile(
+        r"(?i)(?:^|[\s,;\"'(\[{])(?:proxy[-_])?authorization\s*:"
+    )
     _AUTH_SCHEME_TAIL_RE = re.compile(
         r"(?i)(?:^|[\s,;\"'(\[{])(?:authorization|proxy[-_]authorization|bearer|apitoken|basic|"
         r"splunk|token|jwt|oauth|negotiate|ntlm|ssws|bot|dpop|apikey|digest|"
@@ -328,26 +331,21 @@ class StreamingSecretRedactor:
     _QUOTED_ASSIGN_OPEN_RE = re.compile(
         r"(?:[A-Za-z0-9_-]{1,64}|[\"'][A-Za-z0-9_-]{1,64}[\"'])\s*[:=]\s*([\"'])"
     )
+    _QUOTED_AUTH_OPEN_RE = re.compile(
+        r"(?i)(?:^|[\s,;:=\"'(\[{])((?:bearer|apitoken|splunk|token|jwt|oauth|basic|"
+        r"negotiate|ntlm|ssws|bot|dpop|apikey|digest|"
+        r"aws4-hmac-sha256|aws4-ecdsa-p256-sha256|hmac|hoba|mutual|"
+        r"scram-sha-256|scram-sha-1|signature|hawk|vapid)\s+([\"']))"
+    )
 
     def __init__(self) -> None:
         self._buf = ""
 
     @staticmethod
-    def _has_unclosed_pem(buf: str) -> int | None:
-        """Return start index of an unclosed PEM block in ``buf``, or ``None``."""
-        if "-----" not in buf:
-            return None
-        if buf.isascii():
-            last_begin = buf.rfind("-----BEGIN")
-            if last_begin == -1:
-                return None
-            after_begin = buf.find("-----END", last_begin + 10)
-            if after_begin == -1 or buf.find("-----", after_begin + 8) == -1:
-                return last_begin
-            return None
-        # Non-ASCII: check NFKD/Mn/Cf-stripped shadow and map back to buf index
+    def _build_nfkd_shadow(buf: str) -> tuple[str, list[tuple[int, int]]]:
+        """Build an NFKD (Cf/Mn/TAG-stripped) shadow string and source spans into ``buf``."""
         shadow_chars: list[str] = []
-        orig_idx: list[int] = []
+        orig_spans: list[tuple[int, int]] = []
         for idx, ch in enumerate(buf):
             cp = ord(ch)
             if unicodedata.category(ch) in ("Cf", "Mn") or (0xE0000 <= cp <= 0xE007F):
@@ -357,24 +355,69 @@ class StreamingSecretRedactor:
                 if unicodedata.category(sub) in ("Cf", "Mn") or (0xE0000 <= sub_cp <= 0xE007F):
                     continue
                 shadow_chars.append(sub)
-                orig_idx.append(idx)
-        shadow = "".join(shadow_chars)
+                orig_spans.append((idx, idx + 1))
+        return "".join(shadow_chars), orig_spans
+
+    @staticmethod
+    def _has_unclosed_pem(shadow: str) -> int | None:
+        """Return start index in ``shadow`` of an unclosed PEM block, or ``None``."""
+        if "-----" not in shadow:
+            return None
         last_begin = shadow.rfind("-----BEGIN")
         if last_begin == -1:
             return None
-        after_begin = shadow.find("-----END", last_begin + 10)
-        if after_begin == -1 or shadow.find("-----", after_begin + 8) == -1:
-            return orig_idx[last_begin]
+        after_end = shadow.find("-----END", last_begin + 10)
+        if after_end == -1:
+            return last_begin
+        end_close = shadow.find("-----", after_end + 8)
+        if (
+            end_close == -1
+            or (end_close + 5) >= len(shadow)
+            or not shadow[end_close + 5].isspace()
+        ):
+            return last_begin
         return None
 
+    @classmethod
+    def _iter_quoted_opens(cls, line: str) -> list[tuple[int, str, int]]:
+        """Return sorted ``(hold_start, quote_char, scan_from)`` tuples for ``line``."""
+        opens: list[tuple[int, str, int]] = []
+        for m in cls._QUOTED_ASSIGN_OPEN_RE.finditer(line):
+            opens.append((m.start(), m.group(1), m.end()))
+        for m in cls._QUOTED_AUTH_OPEN_RE.finditer(line):
+            opens.append((m.start(1), m.group(2), m.end()))
+        opens.sort(key=lambda item: item[0])
+        return opens
+
     def _safe_split_index(self, buf: str) -> int:
-        pem_start = self._has_unclosed_pem(buf)
-        if pem_start is not None and (len(buf) - pem_start) <= self._MAX_PEM_HOLD_CHARS:
-            return pem_start
+        if buf.isascii():
+            shadow = buf
+            orig_spans: list[tuple[int, int]] | None = None
+        else:
+            shadow, orig_spans = self._build_nfkd_shadow(buf)
+            if not shadow:
+                if len(buf) > self._MAX_HOLD_CHARS:
+                    return len(buf) - 512
+                return 0
+
+        def _to_buf_idx(shadow_idx: int) -> int:
+            if orig_spans is None:
+                return shadow_idx
+            if shadow_idx <= 0:
+                return 0
+            if shadow_idx >= len(orig_spans):
+                return orig_spans[-1][1]
+            return orig_spans[shadow_idx][0]
+
+        pem_shadow_start = self._has_unclosed_pem(shadow)
+        if pem_shadow_start is not None:
+            pem_buf_start = _to_buf_idx(pem_shadow_start)
+            if (len(buf) - pem_buf_start) <= self._MAX_PEM_HOLD_CHARS:
+                return pem_buf_start
 
         last_ws = -1
-        for i in range(len(buf) - 1, -1, -1):
-            if buf[i].isspace():
+        for i in range(len(shadow) - 1, -1, -1):
+            if shadow[i].isspace():
                 last_ws = i
                 break
 
@@ -383,19 +426,22 @@ class StreamingSecretRedactor:
                 return len(buf) - 512
             return 0
 
-        safe_end = last_ws + 1
-        line_start = buf.rfind("\n", 0, safe_end) + 1
-        current_line = buf[line_start:safe_end]
+        safe_shadow_end = last_ws + 1
+        line_start = shadow.rfind("\n", 0, safe_shadow_end) + 1
+        current_line = shadow[line_start:safe_shadow_end]
 
         # Hold unclosed auth headers on the current line until newline or cap.
-        if re.search(r"(?i)(?:^|[\s,;\"'(\[{])(?:proxy[-_])?authorization\s*:", current_line):
-            if len(buf) - line_start <= self._MAX_HOLD_CHARS:
-                return line_start
+        if self._AUTH_HEADER_LINE_RE.search(current_line):
+            line_buf_start = _to_buf_idx(line_start)
+            if (len(buf) - line_buf_start) <= self._MAX_HOLD_CHARS:
+                return line_buf_start
 
-        # Hold unclosed quoted assignments on the current line (e.g. password="my sec).
-        for q_m in self._QUOTED_ASSIGN_OPEN_RE.finditer(current_line):
-            q_ch = q_m.group(1)
-            pos = q_m.end()
+        # Hold unclosed quoted assignments or quoted auth schemes on the current line.
+        covered_until = 0
+        for q_start, q_ch, scan_from in self._iter_quoted_opens(current_line):
+            if q_start < covered_until:
+                continue
+            pos = scan_from
             closed = False
             while pos < len(current_line):
                 ch = current_line[pos]
@@ -406,24 +452,32 @@ class StreamingSecretRedactor:
                     closed = True
                     break
                 pos += 1
-            if not closed and (len(buf) - (line_start + q_m.start())) <= self._MAX_HOLD_CHARS:
-                safe_end = min(safe_end, line_start + q_m.start())
-                break
+            if closed:
+                covered_until = pos + 1
+                continue
+            hold_shadow_idx = line_start + q_start
+            hold_buf_idx = _to_buf_idx(hold_shadow_idx)
+            if (len(buf) - hold_buf_idx) <= self._MAX_HOLD_CHARS:
+                safe_shadow_end = min(safe_shadow_end, hold_shadow_idx)
+            break
 
-        prefix = buf[:safe_end]
-        if (m_auth := self._AUTH_SCHEME_TAIL_RE.search(prefix)) is not None:
+        prefix_shadow = shadow[:safe_shadow_end]
+        if (m_auth := self._AUTH_SCHEME_TAIL_RE.search(prefix_shadow)) is not None:
             hold_from = m_auth.start()
-            if hold_from < safe_end and prefix[hold_from].isspace():
+            if hold_from < safe_shadow_end and prefix_shadow[hold_from].isspace():
                 hold_from += 1
-            if (len(buf) - hold_from) <= self._MAX_HOLD_CHARS:
-                safe_end = min(safe_end, hold_from)
+            hold_buf_from = _to_buf_idx(hold_from)
+            if (len(buf) - hold_buf_from) <= self._MAX_HOLD_CHARS:
+                safe_shadow_end = min(safe_shadow_end, hold_from)
 
-        prefix = buf[:safe_end]
-        if (m_assign := self._ASSIGNMENT_TAIL_RE.search(prefix)) is not None:
+        prefix_shadow = shadow[:safe_shadow_end]
+        if (m_assign := self._ASSIGNMENT_TAIL_RE.search(prefix_shadow)) is not None:
             hold_from = m_assign.start()
-            if (len(buf) - hold_from) <= self._MAX_HOLD_CHARS:
-                safe_end = min(safe_end, hold_from)
+            hold_buf_from = _to_buf_idx(hold_from)
+            if (len(buf) - hold_buf_from) <= self._MAX_HOLD_CHARS:
+                safe_shadow_end = min(safe_shadow_end, hold_from)
 
+        safe_end = _to_buf_idx(safe_shadow_end)
         if len(buf) - safe_end > self._MAX_HOLD_CHARS:
             safe_end = len(buf) - 512
         return safe_end

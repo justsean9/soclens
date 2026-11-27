@@ -1,4 +1,4 @@
-"""Tier-5 white-box adversarial regression suite covering G1-G19 across Pillars 1-4 and packaging."""
+"""Tier-5 white-box adversarial regression suite covering G1-G20 across Pillars 1-4 and packaging."""
 
 from __future__ import annotations
 
@@ -969,3 +969,196 @@ def test_t5_18_readonly_registry_rejects_wrapped_callable_instance_and_dotted_me
                     underlying_methods=(bad_method,),
                 )
             )
+
+
+# T5-19 (G20): Web AI SSE blocks quoted auth-scheme, Mn/fullwidth, and 1-char PEM streaming leaks
+@pytest.mark.feature("F4")
+@pytest.mark.feature("F13")
+@pytest.mark.parametrize(
+    ("chunks", "leaked_substrings"),
+    [
+        (['Header Bearer "My ', 'QuotedSecret12345" end'], ["QuotedSecret12345"]),
+        (['ApiToken "My ', 'QuotedApiToken12345" end'], ["QuotedApiToken12345"]),
+        (["B\u0307earer ", "MyMnBearerSecret99999"], ["MyMnBearerSecret99999"]),
+        (list("B\u0307earer MyMnBearerSecret99999 end"), ["MyMnBearerSecret99999"]),
+        (
+            [
+                "\uff41\uff50\uff49\uff3f\uff4b\uff45\uff59\uff1d ",
+                "\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14",
+            ],
+            ["\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14"],
+        ),
+        (
+            list(
+                "\uff41\uff50\uff49\uff3f\uff4b\uff45\uff59\uff1d "
+                "\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14 end"
+            ),
+            ["\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14"],
+        ),
+        (
+            [
+                "\uff0d\uff0d\uff0d\uff0d\uff0dBEGIN RSA PRIVATE KEY\uff0d\uff0d\uff0d\uff0d\uff0d\n",
+                "MIIEowSecretBody\n",
+                "\uff0d\uff0d\uff0d\uff0d\uff0dEND RSA PRIVATE KEY\uff0d\uff0d\uff0d\uff0d\uff0d\n",
+            ],
+            ["MIIEowSecretBody"],
+        ),
+        (
+            list(
+                "\uff0d\uff0d\uff0d\uff0d\uff0dBEGIN RSA PRIVATE KEY\uff0d\uff0d\uff0d\uff0d\uff0d\n"
+                "MIIEowSecretBody\n"
+                "\uff0d\uff0d\uff0d\uff0d\uff0dEND RSA PRIVATE KEY\uff0d\uff0d\uff0d\uff0d\uff0d\nend"
+            ),
+            ["MIIEowSecretBody", "KEY\uff0d\uff0d\uff0d\uff0d\uff0d"],
+        ),
+        (
+            list("Key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowSecretBody\n-----END RSA PRIVATE KEY-----\nend"),
+            ["MIIEowSecretBody", "KEY-----"],
+        ),
+    ],
+)
+def test_t5_19_web_ai_sse_blocks_quoted_auth_and_unicode_streaming_leaks(
+    pillar_workspace: Path,
+    chunks: list[str],
+    leaked_substrings: list[str],
+) -> None:
+    import json
+
+    from soclens.config import LocalLLMConfig
+    from soclens.web.app import create_app
+
+    app = create_app(
+        workspace_dir=pillar_workspace,
+        admin_enabled=True,
+        bootstrap_token="tok-123",
+        dry_run=True,
+    )
+    rt = app.state.runtime
+
+    class ChunkedLLM:
+        config = LocalLLMConfig(provider="ollama", model="m")
+
+        def chat(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            system_prompt: str | None = None,
+            stream_callback: Any = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if callable(stream_callback):
+                for c in chunks:
+                    stream_callback(c)
+            return {
+                "content": "".join(chunks),
+                "model": "m",
+                "provider": "ollama",
+                "finish_reason": "stop",
+            }
+
+    rt.ai_orchestrator._llm_client_factory = lambda *a, **kw: ChunkedLLM()
+
+    def _parse_sse_events(raw_sse: str) -> list[tuple[str, dict[str, Any]]]:
+        parsed: list[tuple[str, dict[str, Any]]] = []
+        for block in raw_sse.strip().split("\n\n"):
+            ev_name = ""
+            data_lines: list[str] = []
+            for line in block.splitlines():
+                if line.startswith("event:"):
+                    ev_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+            if ev_name and data_lines:
+                parsed.append((ev_name, json.loads("\n".join(data_lines))))
+        return parsed
+
+    async def _asgi_post(
+        path: str, payload: dict[str, Any], cookie: str = "", csrf: str = ""
+    ) -> tuple[int, list[tuple[bytes, bytes]], str]:
+        body = json.dumps(payload).encode("utf-8")
+        out_chunks: list[bytes] = []
+        resp_headers: list[tuple[bytes, bytes]] = []
+        status_code = 0
+        sent = False
+        disconnect_waiter = asyncio.Event()
+
+        async def recv() -> dict[str, Any]:
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await disconnect_waiter.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg: dict[str, Any]) -> None:
+            nonlocal status_code
+            if msg["type"] == "http.response.start":
+                status_code = int(msg["status"])
+                resp_headers.extend(msg.get("headers", []))
+            elif msg["type"] == "http.response.body":
+                out_chunks.append(msg.get("body", b""))
+
+        hdrs: list[tuple[bytes, bytes]] = [
+            (b"host", b"127.0.0.1:8000"),
+            (b"content-type", b"application/json"),
+        ]
+        if cookie:
+            hdrs.append((b"cookie", cookie.encode("ascii")))
+        if csrf:
+            hdrs.append((b"x-soclens-token", csrf.encode("ascii")))
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": hdrs,
+            "client": ("127.0.0.1", 55555),
+            "server": ("127.0.0.1", 8000),
+        }
+        await app(scope, recv, send)
+        return status_code, resp_headers, b"".join(out_chunks).decode("utf-8", errors="replace")
+
+    async def _run() -> None:
+        try:
+            sc0, hdrs0, b0 = await _asgi_post("/api/auth/exchange", {"token": "tok-123"})
+            assert sc0 == 200
+            cookie = next(
+                v.decode().split(";", 1)[0] for k, v in hdrs0 if k.lower() == b"set-cookie"
+            )
+            csrf = str(json.loads(b0)["csrf_token"])
+            sub = rt.sse_bus.subscribe()
+            try:
+                sc1, _, body1 = await _asgi_post(
+                    "/api/ai/chat/stream",
+                    {"prompt": "Check secret stream", "enable_tools": False},
+                    cookie=cookie,
+                    csrf=csrf,
+                )
+                assert sc1 == 200
+                events1 = _parse_sse_events(body1)
+                toks1 = [d["token"] for ev, d in events1 if ev == "token"]
+                joined1 = "".join(toks1)
+                done1 = [d for ev, d in events1 if ev == "done"]
+                assert done1
+                assert "<REDACTED>" in joined1
+                bus_events: list[Any] = []
+                while not sub.queue.empty():
+                    bus_events.append(sub.queue.get_nowait())
+                ai_tokens = [p for ev, p in bus_events if ev == "ai_token"]
+                assert ai_tokens
+                bus_joined = "".join(str(p.get("token", "")) for p in ai_tokens)
+                for leaked in leaked_substrings:
+                    assert leaked not in joined1
+                    assert leaked not in body1
+                    assert leaked not in str(done1[0].get("content", ""))
+                    assert leaked not in bus_joined
+            finally:
+                rt.sse_bus.unsubscribe(sub)
+        finally:
+            rt.cleanup()
+
+    asyncio.run(_run())
