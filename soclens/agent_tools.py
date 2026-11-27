@@ -534,6 +534,23 @@ class ReadOnlyToolRegistry:
         current: Any = handler
         while id(current) not in seen_ids:
             seen_ids.add(id(current))
+            is_partial = isinstance(current, functools.partial)
+            if not (
+                is_partial
+                or inspect.isfunction(current)
+                or inspect.ismethod(current)
+                or inspect.isbuiltin(current)
+            ):
+                cls_name = type(current).__name__
+                if _has_invisible_or_combining_unicode(cls_name) or _is_forbidden_tool_identifier(
+                    cls_name
+                ):
+                    raise ValueError(
+                        f"Forbidden mutating callable handler cannot be registered: {cls_name}"
+                    )
+                raise ValueError(
+                    f"Opaque callable instance '{cls_name}' cannot be registered for tool '{tool_name}'."
+                )
             raw_name = getattr(current, "__name__", None)
             if isinstance(raw_name, str) and raw_name.strip():
                 if _has_invisible_or_combining_unicode(raw_name):
@@ -544,7 +561,7 @@ class ReadOnlyToolRegistry:
                     raise ValueError(
                         f"Forbidden mutating handler cannot be registered: {raw_name.strip()}"
                     )
-            if isinstance(current, functools.partial):
+            if is_partial:
                 current = current.func
                 continue
             wrapped = getattr(current, "__wrapped__", None)
@@ -611,6 +628,12 @@ class ReadOnlyToolRegistry:
                 raise ValueError(
                     f"Tool '{clean_name}' references forbidden mutating method '{clean_method}'."
                 )
+            for segment in re.split(r"[.:/]+", clean_method):
+                seg = segment.strip()
+                if seg and _is_forbidden_tool_identifier(seg):
+                    raise ValueError(
+                        f"Tool '{clean_name}' references forbidden mutating method '{clean_method}'."
+                    )
 
         self._tools[clean_name] = spec
 

@@ -7,6 +7,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
@@ -308,6 +309,145 @@ def redact_web_payload(value: Any) -> Any:
     if isinstance(redacted, list):
         return [redact_web_payload(v) for v in redacted]
     return redacted
+
+
+class StreamingSecretRedactor:
+    """Incremental string redactor that catches secrets split across streamed chunks."""
+
+    _MAX_HOLD_CHARS = 4096
+    _MAX_PEM_HOLD_CHARS = 16384
+    _AUTH_SCHEME_TAIL_RE = re.compile(
+        r"(?i)(?:^|[\s,;\"'(\[{])(?:authorization|proxy[-_]authorization|bearer|apitoken|basic|"
+        r"splunk|token|jwt|oauth|negotiate|ntlm|ssws|bot|dpop|apikey|digest|"
+        r"aws4-hmac-sha256|aws4-ecdsa-p256-sha256|hmac|hoba|mutual|"
+        r"scram-sha-256|scram-sha-1|signature|hawk|vapid)\s*[:=]?\s*$"
+    )
+    _ASSIGNMENT_TAIL_RE = re.compile(
+        r"(?:[A-Za-z0-9_-]{1,64}|[\"'][A-Za-z0-9_-]{1,64}[\"'])\s*[:=]\s*[\"']?\s*$"
+    )
+    _QUOTED_ASSIGN_OPEN_RE = re.compile(
+        r"(?:[A-Za-z0-9_-]{1,64}|[\"'][A-Za-z0-9_-]{1,64}[\"'])\s*[:=]\s*([\"'])"
+    )
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    @staticmethod
+    def _has_unclosed_pem(buf: str) -> int | None:
+        """Return start index of an unclosed PEM block in ``buf``, or ``None``."""
+        if "-----" not in buf:
+            return None
+        if buf.isascii():
+            last_begin = buf.rfind("-----BEGIN")
+            if last_begin == -1:
+                return None
+            after_begin = buf.find("-----END", last_begin + 10)
+            if after_begin == -1 or buf.find("-----", after_begin + 8) == -1:
+                return last_begin
+            return None
+        # Non-ASCII: check NFKD/Mn/Cf-stripped shadow and map back to buf index
+        shadow_chars: list[str] = []
+        orig_idx: list[int] = []
+        for idx, ch in enumerate(buf):
+            cp = ord(ch)
+            if unicodedata.category(ch) in ("Cf", "Mn") or (0xE0000 <= cp <= 0xE007F):
+                continue
+            for sub in unicodedata.normalize("NFKD", ch):
+                sub_cp = ord(sub)
+                if unicodedata.category(sub) in ("Cf", "Mn") or (0xE0000 <= sub_cp <= 0xE007F):
+                    continue
+                shadow_chars.append(sub)
+                orig_idx.append(idx)
+        shadow = "".join(shadow_chars)
+        last_begin = shadow.rfind("-----BEGIN")
+        if last_begin == -1:
+            return None
+        after_begin = shadow.find("-----END", last_begin + 10)
+        if after_begin == -1 or shadow.find("-----", after_begin + 8) == -1:
+            return orig_idx[last_begin]
+        return None
+
+    def _safe_split_index(self, buf: str) -> int:
+        pem_start = self._has_unclosed_pem(buf)
+        if pem_start is not None and (len(buf) - pem_start) <= self._MAX_PEM_HOLD_CHARS:
+            return pem_start
+
+        last_ws = -1
+        for i in range(len(buf) - 1, -1, -1):
+            if buf[i].isspace():
+                last_ws = i
+                break
+
+        if last_ws == -1:
+            if len(buf) > self._MAX_HOLD_CHARS:
+                return len(buf) - 512
+            return 0
+
+        safe_end = last_ws + 1
+        line_start = buf.rfind("\n", 0, safe_end) + 1
+        current_line = buf[line_start:safe_end]
+
+        # Hold unclosed auth headers on the current line until newline or cap.
+        if re.search(r"(?i)(?:^|[\s,;\"'(\[{])(?:proxy[-_])?authorization\s*:", current_line):
+            if len(buf) - line_start <= self._MAX_HOLD_CHARS:
+                return line_start
+
+        # Hold unclosed quoted assignments on the current line (e.g. password="my sec).
+        for q_m in self._QUOTED_ASSIGN_OPEN_RE.finditer(current_line):
+            q_ch = q_m.group(1)
+            pos = q_m.end()
+            closed = False
+            while pos < len(current_line):
+                ch = current_line[pos]
+                if ch == "\\":
+                    pos += 2
+                    continue
+                if ch == q_ch:
+                    closed = True
+                    break
+                pos += 1
+            if not closed and (len(buf) - (line_start + q_m.start())) <= self._MAX_HOLD_CHARS:
+                safe_end = min(safe_end, line_start + q_m.start())
+                break
+
+        prefix = buf[:safe_end]
+        if (m_auth := self._AUTH_SCHEME_TAIL_RE.search(prefix)) is not None:
+            hold_from = m_auth.start()
+            if hold_from < safe_end and prefix[hold_from].isspace():
+                hold_from += 1
+            if (len(buf) - hold_from) <= self._MAX_HOLD_CHARS:
+                safe_end = min(safe_end, hold_from)
+
+        prefix = buf[:safe_end]
+        if (m_assign := self._ASSIGNMENT_TAIL_RE.search(prefix)) is not None:
+            hold_from = m_assign.start()
+            if (len(buf) - hold_from) <= self._MAX_HOLD_CHARS:
+                safe_end = min(safe_end, hold_from)
+
+        if len(buf) - safe_end > self._MAX_HOLD_CHARS:
+            safe_end = len(buf) - 512
+        return safe_end
+
+    def feed(self, chunk: str) -> str:
+        """Accept a streamed chunk and return the safely redacted prefix ready to emit."""
+        if not chunk:
+            return ""
+        buf = self._buf + chunk
+        split_idx = self._safe_split_index(buf)
+        if split_idx <= 0:
+            self._buf = buf
+            return ""
+        ready = buf[:split_idx]
+        self._buf = buf[split_idx:]
+        return str(redact_web_payload(ready))
+
+    def flush(self) -> str:
+        """Redact and emit any buffered trailing text at end-of-stream or error."""
+        if not self._buf:
+            return ""
+        tail = self._buf
+        self._buf = ""
+        return str(redact_web_payload(tail))
 
 
 async def _send_json_error(send: Send, status_code: int, message: str) -> None:

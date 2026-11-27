@@ -237,10 +237,36 @@ def test_sse_events_and_ai_chat_streaming(tmp_path: Path) -> None:
         )
         assert chat_res.status == 200
         assert "event: token" in chat_res.text
-        assert "Hello " in chat_res.text
+        assert '"token": "Hello "' in chat_res.text
+        assert '"token": "SOC!"' in chat_res.text
+        assert "<REDACTED>" not in chat_res.text
         assert "event: done" in chat_res.text
     finally:
         app.state.runtime.cleanup()
+
+
+def test_streaming_secret_redactor_handles_normal_prose_and_split_secrets() -> None:
+    from soclens.web.security import StreamingSecretRedactor
+
+    prose_redactor = StreamingSecretRedactor()
+    prose_parts = [prose_redactor.feed(c) for c in ("Checking ", "alert ", "on srv-01.")]
+    prose_parts.append(prose_redactor.flush())
+    assert "".join(prose_parts) == "Checking alert on srv-01."
+
+    for chunks, forbidden in (
+        (["Key: ", "sk-", "OpenAI", "SecretKey12345678", " ok"], ("OpenAISecretKey12345678",)),
+        (["Auth ", "Bea", "rer ", "MySecret", "Bearer999", " ok"], ("MySecretBearer999",)),
+        (["set ", "password=", '"my secret ', 'value"', " ok"], ("my secret value",)),
+        (
+            ["-----BEG", "IN RSA PRIVATE KEY-----\n", "MIIEowIBAAKCAQEA\n", "-----END RSA PRIVATE KEY-----"],
+            ("MIIEowIBAAKCAQEA", "BEGIN"),
+        ),
+    ):
+        red = StreamingSecretRedactor()
+        out = "".join(red.feed(c) for c in chunks) + red.flush()
+        for frag in forbidden:
+            assert frag not in out
+        assert "<REDACTED>" in out
 
 
 def test_orchestrator_investigate_forwards_tool_event_callback(tmp_path: Path) -> None:

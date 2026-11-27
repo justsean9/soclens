@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import difflib
 import json
 import logging
 import re
@@ -2733,7 +2734,26 @@ def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) ->
     return "".join(parts)
 
 
-def _redact_unicode_obfuscated_tokens(text: str) -> str:
+def _tokenize_for_redaction_diff(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+    tokens: list[str] = []
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for m in _REDACTED_PLACEHOLDER_RE.finditer(text):
+        for i in range(pos, m.start()):
+            tokens.append(text[i])
+            spans.append((i, i + 1))
+        tokens.append(m.group(0))
+        spans.append((m.start(), m.end()))
+        pos = m.end()
+    for i in range(pos, len(text)):
+        tokens.append(text[i])
+        spans.append((i, i + 1))
+    return tokens, spans
+
+
+def _redact_unicode_obfuscated_tokens(
+    text: str, *, preserve_env_var_refs: bool = False
+) -> str:
     """Scrub fullwidth/NFKD-equivalent and invisible/combining-split secret tokens."""
     if not text or text.isascii():
         return text
@@ -2756,30 +2776,64 @@ def _redact_unicode_obfuscated_tokens(text: str) -> str:
         return text
 
     shadow = "".join(shadow_chars)
-    replacements: list[tuple[int, int, str]] = []
+    redacted_shadow = _redact_string_ascii(
+        shadow, preserve_env_var_refs=preserve_env_var_refs
+    )
+    if redacted_shadow == shadow:
+        return text
 
-    for m in _URL_USERINFO_RE.finditer(shadow):
-        pw = m.group(3)
-        if pw and not _is_redacted_placeholder(pw):
-            s_idx, e_idx = m.start(3), m.end(3)
-            if s_idx < e_idx:
-                replacements.append((orig_spans[s_idx][0], orig_spans[e_idx - 1][1], "<REDACTED>"))
+    shadow_tokens, shadow_tok_spans = _tokenize_for_redaction_diff(shadow)
+    redacted_tokens, _ = _tokenize_for_redaction_diff(redacted_shadow)
 
-    for pat, repl in (
-        (_JWT_RE, "<REDACTED_JWT>"),
-        (_VENDOR_PREFIX_RE, "<REDACTED>"),
-        (_VAULT_URI_RE, "<REDACTED>"),
-        (_VAULT_TOKEN_RE, "<REDACTED>"),
+    prefix = 0
+    limit = min(len(shadow_tokens), len(redacted_tokens))
+    while prefix < limit and shadow_tokens[prefix] == redacted_tokens[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < (limit - prefix)
+        and shadow_tokens[len(shadow_tokens) - 1 - suffix]
+        == redacted_tokens[len(redacted_tokens) - 1 - suffix]
     ):
-        for m in pat.finditer(shadow):
-            s_idx, e_idx = m.start(), m.end()
-            if s_idx < e_idx:
-                replacements.append((orig_spans[s_idx][0], orig_spans[e_idx - 1][1], repl))
+        suffix += 1
+
+    s_mid = shadow_tokens[prefix : len(shadow_tokens) - suffix]
+    r_mid = redacted_tokens[prefix : len(redacted_tokens) - suffix]
+    matcher = difflib.SequenceMatcher(None, s_mid, r_mid, autojunk=False)
+
+    replacements: list[tuple[int, int, str]] = []
+    for tag, i1_rel, i2_rel, j1_rel, j2_rel in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        i1 = prefix + i1_rel
+        i2 = prefix + i2_rel
+        j1 = prefix + j1_rel
+        j2 = prefix + j2_rel
+        repl_text = "".join(redacted_tokens[j1:j2])
+        if tag == "insert":
+            ins_pos = (
+                orig_spans[shadow_tok_spans[i1][0]][0]
+                if i1 < len(shadow_tok_spans)
+                else len(text)
+            )
+            replacements.append((ins_pos, ins_pos, repl_text))
+            continue
+        s_start = shadow_tok_spans[i1][0]
+        s_end = shadow_tok_spans[i2 - 1][1]
+        r_start = orig_spans[s_start][0]
+        r_end = orig_spans[s_end - 1][1]
+        next_orig_start = orig_spans[s_end][0] if s_end < len(orig_spans) else len(text)
+        while r_end < next_orig_start and (
+            unicodedata.category(text[r_end]) in ("Cf", "Mn")
+            or (0xE0000 <= ord(text[r_end]) <= 0xE007F)
+        ):
+            r_end += 1
+        replacements.append((r_start, r_end, repl_text))
 
     if not replacements:
         return text
 
-    replacements.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    replacements.sort(key=lambda item: (item[0], item[1]))
     out_parts: list[str] = []
     cursor = 0
     for r_start, r_end, repl in replacements:
@@ -2794,7 +2848,7 @@ def _redact_unicode_obfuscated_tokens(text: str) -> str:
     return "".join(out_parts)
 
 
-def _redact_string(text: str, *, preserve_env_var_refs: bool = False) -> str:
+def _redact_string_ascii(text: str, *, preserve_env_var_refs: bool = False) -> str:
     if not text:
         return text
     out = _URL_USERINFO_RE.sub(r"\1://\2:<REDACTED>@", text)
@@ -2808,8 +2862,16 @@ def _redact_string(text: str, *, preserve_env_var_refs: bool = False) -> str:
     out = _VENDOR_PREFIX_RE.sub("<REDACTED>", out)
     out = _VAULT_URI_RE.sub("<REDACTED>", out)
     out = _VAULT_TOKEN_RE.sub("<REDACTED>", out)
-    out = _redact_unicode_obfuscated_tokens(out)
     return out
+
+
+def _redact_string(text: str, *, preserve_env_var_refs: bool = False) -> str:
+    if not text:
+        return text
+    out = _redact_unicode_obfuscated_tokens(
+        text, preserve_env_var_refs=preserve_env_var_refs
+    )
+    return _redact_string_ascii(out, preserve_env_var_refs=preserve_env_var_refs)
 
 
 def _redact_recursive(

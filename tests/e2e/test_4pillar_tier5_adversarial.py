@@ -1,4 +1,4 @@
-"""Tier-5 white-box adversarial regression suite covering G1-G16 across Pillars 1-4 and packaging."""
+"""Tier-5 white-box adversarial regression suite covering G1-G19 across Pillars 1-4 and packaging."""
 
 from __future__ import annotations
 
@@ -552,13 +552,14 @@ def test_t5_13_web_ai_sse_redacts_tokens_and_triage_update_and_applies_template(
         resp_headers: list[tuple[bytes, bytes]] = []
         status_code = 0
         sent = False
+        disconnect_waiter = asyncio.Event()
 
         async def recv() -> dict[str, Any]:
             nonlocal sent
             if not sent:
                 sent = True
                 return {"type": "http.request", "body": body, "more_body": False}
-            await asyncio.sleep(0.05)
+            await disconnect_waiter.wait()
             return {"type": "http.disconnect"}
 
         async def send(msg: dict[str, Any]) -> None:
@@ -704,5 +705,267 @@ def test_t5_15_readonly_registry_rejects_partial_and_unicode_tool_bypass() -> No
                     parameters_schema={},
                     source_category="sentinelone",
                     handler=lambda x: x,
+                )
+            )
+
+
+# T5-16 (G17): Web AI SSE preserves normal streamed tokens and redacts chunk-split secrets
+@pytest.mark.feature("F4")
+@pytest.mark.feature("F13")
+def test_t5_16_web_ai_sse_preserves_normal_tokens_and_redacts_chunk_split_secrets(
+    pillar_workspace: Path,
+) -> None:
+    import json
+
+    from soclens.config import LocalLLMConfig
+    from soclens.web.app import create_app
+
+    app = create_app(
+        workspace_dir=pillar_workspace,
+        admin_enabled=True,
+        bootstrap_token="tok-123",
+        dry_run=True,
+    )
+    rt = app.state.runtime
+
+    class ChunkedLLM:
+        config = LocalLLMConfig(provider="ollama", model="m")
+
+        def chat(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            system_prompt: str | None = None,
+            stream_callback: Any = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            prompt_txt = str(messages[-1]["content"])
+            if "secret" in prompt_txt.lower():
+                chunks = ["Key: ", "sk-", "OpenAI", "SecretKey12345678", " done"]
+            else:
+                chunks = ["Investigating ", "host srv-01 ", "for CVE-2024-1234."]
+            if callable(stream_callback):
+                for c in chunks:
+                    stream_callback(c)
+            return {
+                "content": "".join(chunks),
+                "model": "m",
+                "provider": "ollama",
+                "finish_reason": "stop",
+            }
+
+    rt.ai_orchestrator._llm_client_factory = lambda *a, **kw: ChunkedLLM()
+
+    def _parse_sse_events(raw_sse: str) -> list[tuple[str, dict[str, Any]]]:
+        parsed: list[tuple[str, dict[str, Any]]] = []
+        for block in raw_sse.strip().split("\n\n"):
+            ev_name = ""
+            data_lines: list[str] = []
+            for line in block.splitlines():
+                if line.startswith("event:"):
+                    ev_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+            if ev_name and data_lines:
+                parsed.append((ev_name, json.loads("\n".join(data_lines))))
+        return parsed
+
+    async def _asgi_post(
+        path: str, payload: dict[str, Any], cookie: str = "", csrf: str = ""
+    ) -> tuple[int, list[tuple[bytes, bytes]], str]:
+        body = json.dumps(payload).encode("utf-8")
+        chunks: list[bytes] = []
+        resp_headers: list[tuple[bytes, bytes]] = []
+        status_code = 0
+        sent = False
+        disconnect_waiter = asyncio.Event()
+
+        async def recv() -> dict[str, Any]:
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await disconnect_waiter.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg: dict[str, Any]) -> None:
+            nonlocal status_code
+            if msg["type"] == "http.response.start":
+                status_code = int(msg["status"])
+                resp_headers.extend(msg.get("headers", []))
+            elif msg["type"] == "http.response.body":
+                chunks.append(msg.get("body", b""))
+
+        hdrs: list[tuple[bytes, bytes]] = [
+            (b"host", b"127.0.0.1:8000"),
+            (b"content-type", b"application/json"),
+        ]
+        if cookie:
+            hdrs.append((b"cookie", cookie.encode("ascii")))
+        if csrf:
+            hdrs.append((b"x-soclens-token", csrf.encode("ascii")))
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": hdrs,
+            "client": ("127.0.0.1", 55555),
+            "server": ("127.0.0.1", 8000),
+        }
+        await app(scope, recv, send)
+        return status_code, resp_headers, b"".join(chunks).decode("utf-8", errors="replace")
+
+    async def _run() -> None:
+        try:
+            sc0, hdrs0, b0 = await _asgi_post("/api/auth/exchange", {"token": "tok-123"})
+            assert sc0 == 200
+            cookie = next(
+                v.decode().split(";", 1)[0] for k, v in hdrs0 if k.lower() == b"set-cookie"
+            )
+            csrf = str(json.loads(b0)["csrf_token"])
+
+            # 1. Normal prose tokens stream intact without "<REDACTED>" clobbering
+            sc1, _, body1 = await _asgi_post(
+                "/api/ai/chat/stream",
+                {"prompt": "Investigate srv-01", "enable_tools": False},
+                cookie=cookie,
+                csrf=csrf,
+            )
+            assert sc1 == 200
+            events1 = _parse_sse_events(body1)
+            toks1 = [d["token"] for ev, d in events1 if ev == "token"]
+            joined1 = "".join(toks1)
+            assert joined1 == "Investigating host srv-01 for CVE-2024-1234."
+            assert "<REDACTED>" not in joined1
+
+            # 2. Chunk-split secrets must be scrubbed across token frames, done frame, and sse_bus
+            sub = rt.sse_bus.subscribe()
+            try:
+                sc2, _, body2 = await _asgi_post(
+                    "/api/ai/chat/stream",
+                    {"prompt": "Show secret check", "enable_tools": False},
+                    cookie=cookie,
+                    csrf=csrf,
+                )
+                assert sc2 == 200
+                events2 = _parse_sse_events(body2)
+                toks2 = [d["token"] for ev, d in events2 if ev == "token"]
+                joined2 = "".join(toks2)
+                done2 = [d for ev, d in events2 if ev == "done"]
+                assert done2
+                for leaked in ("OpenAISecretKey12345678", "SecretKey12345678", "sk-OpenAI"):
+                    assert leaked not in joined2
+                    assert leaked not in body2
+                    assert leaked not in str(done2[0].get("content", ""))
+                assert "<REDACTED>" in joined2
+                bus_events: list[Any] = []
+                while not sub.queue.empty():
+                    bus_events.append(sub.queue.get_nowait())
+                ai_tokens = [p for ev, p in bus_events if ev == "ai_token"]
+                assert ai_tokens
+                bus_dump = json.dumps(ai_tokens)
+                for leaked in ("OpenAISecretKey12345678", "SecretKey12345678", "sk-OpenAI"):
+                    assert leaked not in bus_dump
+            finally:
+                rt.sse_bus.unsubscribe(sub)
+        finally:
+            rt.cleanup()
+
+    asyncio.run(_run())
+
+
+# T5-17 (G18): Combining-mark & fullwidth KV/Bearer/PEM secrets redacted everywhere
+@pytest.mark.feature("F4")
+@pytest.mark.feature("F9")
+@pytest.mark.parametrize(
+    ("secret_payload", "leaked_fragment"),
+    [
+        ('Use p\u0307assword="MySuperSecret12345" in prod', "MySuperSecret12345"),
+        ("Header Authorization: B\u0307earer MySecretBearer99999", "MySecretBearer99999"),
+        ("-----BEGIN\u0307 RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA", "BEGIN"),
+        (
+            "\uff41\uff50\uff49\uff3f\uff4b\uff45\uff59\uff1d"
+            "\uff2d\uff59\uff33\uff55\uff50\uff45\uff52\uff33\uff45\uff43\uff52\uff45\uff54\uff11\uff12\uff13\uff14",
+            "\uff2d\uff59\uff33\uff55",
+        ),
+        (
+            "\uff22\uff45\uff41\uff52\uff45\uff52 "
+            "\uff2d\uff59\uff33\uff45\uff43\uff52\uff45\uff54\uff34\uff4f\uff4b\uff45\uff4e\uff11\uff12\uff13\uff14",
+            "\uff2d\uff59\uff33\uff45",
+        ),
+    ],
+)
+def test_t5_17_combining_and_fullwidth_kv_bearer_pem_secrets_redacted(
+    pillar_workspace: Path, secret_payload: str, leaked_fragment: str
+) -> None:
+    from soclens.agent_learning import SOCLearningManager
+    from soclens.web.security import redact_web_payload
+
+    guard = PromptAndSecretGuard()
+    res = guard.scan_candidate(secret_payload)
+    assert leaked_fragment not in res.redacted_content
+    assert leaked_fragment not in str(redact_sensitive_data(secret_payload))
+    assert leaked_fragment not in str(redact_web_payload(secret_payload))
+
+    # Normal non-secret Unicode prose stays intact
+    prose = "Caf\u00e9 r\u00e9sum\u00e9 \u65e5\u672c\u8a9e"
+    assert redact_sensitive_data(prose) == prose
+
+    stor = StorageManager(DatabaseConfig(sqlite_path=pillar_workspace / ".soclens_cache" / "soclens.db"))
+    try:
+        stor.ensure_schema()
+        lm = SOCLearningManager(storage=stor, workspace_dir=pillar_workspace)
+        entry = lm.submit_manual_learn(title="sec-check", content=secret_payload)
+        assert leaked_fragment not in entry.content
+    finally:
+        stor.dispose()
+
+
+# T5-18 (G19): ReadOnlyToolRegistry rejects opaque callable instance with __wrapped__ and dotted/namespaced underlying_methods
+@pytest.mark.feature("F2")
+def test_t5_18_readonly_registry_rejects_wrapped_callable_instance_and_dotted_methods() -> None:
+    class UpdateSiteWrapped:
+        __wrapped__ = staticmethod(lambda args: {"ok": True})
+
+        def __call__(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {"pwned": True}
+
+    class InnocentWrapped:
+        __wrapped__ = lambda args: {"ok": True}  # noqa: E731
+
+        def __call__(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {"pwned": True}
+
+    reg = ReadOnlyToolRegistry()
+    for bad_handler in (UpdateSiteWrapped(), InnocentWrapped()):
+        with pytest.raises(ValueError):
+            reg.register(
+                ReadOnlyToolSpec(
+                    name="safe_alias",
+                    description="alias",
+                    parameters_schema={},
+                    source_category="sentinelone",
+                    handler=bad_handler,
+                )
+            )
+    for bad_method in (
+        "SentinelOneClient.update_site",
+        "SentinelOneClient:update_site",
+        "api/v2/agents/disconnect_agent",
+    ):
+        with pytest.raises(ValueError):
+            reg.register(
+                ReadOnlyToolSpec(
+                    name="safe_alias_2",
+                    description="alias",
+                    parameters_schema={},
+                    source_category="sentinelone",
+                    handler=lambda a: a,
+                    underlying_methods=(bad_method,),
                 )
             )

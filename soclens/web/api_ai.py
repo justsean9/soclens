@@ -22,7 +22,7 @@ from soclens.llm import (
     discover_available_ai_models,
 )
 from soclens.settings import LLM_PROVIDER_CHOICES
-from soclens.web.security import redact_web_payload
+from soclens.web.security import StreamingSecretRedactor, redact_web_payload
 from soclens.web.sse import format_sse
 from soclens.web.state import WebRuntimeState
 
@@ -183,18 +183,27 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
     async def _chat_event_generator() -> AsyncIterator[str]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, Any] | None] = asyncio.Queue()
+        safe_session_id = str(redact_web_payload(session_id))
+        stream_redactor = StreamingSecretRedactor()
 
         def _push(ev_type: str, data: Any) -> None:
             if not loop.is_closed():
                 loop.call_soon_threadsafe(queue.put_nowait, (ev_type, data))
 
-        def _on_token(tok: str) -> None:
-            payload = dict(redact_web_payload({"token": tok, "session_id": session_id}))
+        def _emit_token_text(safe_tok: str) -> None:
+            if not safe_tok:
+                return
+            payload = {"token": safe_tok, "session_id": safe_session_id}
             _push("token", payload)
             runtime.sse_bus.publish("ai_token", payload)
 
+        def _on_token(tok: str) -> None:
+            if not tok:
+                return
+            _emit_token_text(stream_redactor.feed(str(tok)))
+
         def _on_tool(ev: dict[str, Any]) -> None:
-            safe_ev = dict(redact_web_payload({**ev, "session_id": session_id}))
+            safe_ev = dict(redact_web_payload({**ev, "session_id": safe_session_id}))
             _push("tool", safe_ev)
             runtime.sse_bus.publish("tool_event", safe_ev)
 
@@ -214,6 +223,7 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
                     stream_callback=_on_token,
                     tool_event_callback=_on_tool,
                 )
+                _emit_token_text(stream_redactor.flush())
                 done_payload = _entry_to_dict(res)
                 done_payload["ok"] = res.status != "error"
                 if res.status == "error" and res.error:
@@ -224,7 +234,15 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
                 else:
                     _push("done", done_payload)
             except Exception as exc:
-                _push("error", {"ok": False, "error": str(redact_web_payload(str(exc))), "session_id": session_id})
+                _emit_token_text(stream_redactor.flush())
+                _push(
+                    "error",
+                    {
+                        "ok": False,
+                        "error": str(redact_web_payload(str(exc))),
+                        "session_id": safe_session_id,
+                    },
+                )
             finally:
                 if not loop.is_closed():
                     loop.call_soon_threadsafe(queue.put_nowait, None)
