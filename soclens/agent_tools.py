@@ -1011,17 +1011,27 @@ def build_default_readonly_registry(
                 return None
         return storage
 
+    _fallback_learning_mgr: Any = None
+
     def get_learning_manager() -> Any | None:
-        if learning_manager is None:
-            return None
-        if hasattr(learning_manager, "_mock_return_value"):
+        nonlocal _fallback_learning_mgr
+        if learning_manager is not None:
+            if hasattr(learning_manager, "_mock_return_value"):
+                return learning_manager
+            if callable(learning_manager):
+                try:
+                    return learning_manager()
+                except Exception:
+                    return None
             return learning_manager
-        if callable(learning_manager):
-            try:
-                return learning_manager()
-            except Exception:
-                return None
-        return learning_manager
+        stor = get_storage()
+        if stor is not None and callable(getattr(stor, "search_learnings", None)):
+            if _fallback_learning_mgr is None:
+                from soclens.agent_learning import SOCLearningManager
+
+                _fallback_learning_mgr = SOCLearningManager(storage=stor)
+            return _fallback_learning_mgr
+        return None
 
     def get_splunk() -> SplunkClient | None:
         return _resolve_client(splunk_client, _default_splunk_factory)
@@ -2221,8 +2231,9 @@ def build_default_readonly_registry(
                 )
             except TypeError:
                 raw_entries = stor.search_learnings(query, limit=limit)
-        safe_entries = redact_sensitive_data(list(raw_entries) if isinstance(raw_entries, Sequence) else [])
-        entries = _to_json_safe(safe_entries) if isinstance(safe_entries, list) else []
+        safe_raw = _to_json_safe(list(raw_entries) if isinstance(raw_entries, Sequence) else [])
+        redacted_entries = redact_sensitive_data(safe_raw)
+        entries = redacted_entries if isinstance(redacted_entries, list) else []
         return {"ok": True, "query": query, "count": len(entries), "entries": entries}
 
     registry.register(

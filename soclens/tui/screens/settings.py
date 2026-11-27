@@ -1942,6 +1942,22 @@ class SettingsPane(BaseSocPane):
                             id="set-ai-kill-persist",
                             compact=True,
                         )
+                        yield Static(
+                            "Self-Learning Mode",
+                            classes="setting-label",
+                            markup=False,
+                        )
+                        yield Select(
+                            [
+                                ("Manual (Default — Stage Pending)", "manual"),
+                                ("Auto (Opt-In — Auto-Promote)", "auto"),
+                            ],
+                            allow_blank=False,
+                            value="manual",
+                            id="set-ai-learning-mode",
+                            classes="setting-field",
+                            compact=True,
+                        )
 
                     with VerticalScroll(id="cat-database", classes="settings-cat-scroll"):
                         yield Static(
@@ -2182,6 +2198,10 @@ class SettingsPane(BaseSocPane):
             sel = self.query_one("#set-ai-kill-hotkey", Select)
             with sel.prevent(Select.Changed):
                 sel.value = policy.kill_switch_hotkey
+        with contextlib.suppress(Exception):
+            lsel = self.query_one("#set-ai-learning-mode", Select)
+            with lsel.prevent(Select.Changed):
+                lsel.value = getattr(policy, "learning_mode", "manual")
         for wid, checked in (
             ("#set-ai-kill-visible", policy.kill_switch_visible),
             ("#set-ai-kill-confirm-engage", policy.kill_switch_confirm_engage),
@@ -2221,6 +2241,9 @@ class SettingsPane(BaseSocPane):
         )
         updates["kill_switch_persist_across_restarts"] = bool(
             self.query_one("#set-ai-kill-persist", Checkbox).value
+        )
+        updates["learning_mode"] = str(
+            self.query_one("#set-ai-learning-mode", Select).value or "manual"
         )
         return updates, None
 

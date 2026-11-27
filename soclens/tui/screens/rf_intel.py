@@ -1653,6 +1653,15 @@ class RFIntelPane(BaseSocPane):
         _ = message
         self.request_full_event_ai("#rf-ai-panel", self._active_unique_event())
 
+    @on(EventAIPanelWidget.TeachRequested, "#rf-ai-panel")
+    def handle_ai_teach_requested(self, message: EventAIPanelWidget.TeachRequested) -> None:
+        self.request_teach_event_ai(
+            "#rf-ai-panel",
+            self._active_unique_event(),
+            prefill_title=message.prefill_title,
+            prefill_content=message.prefill_content,
+        )
+
     def _write_detail_renderable(self, renderable: Any) -> None:
         log_widget = self.query_one("#rf-log", RichLog)
         avail = log_widget.scrollable_content_region.width

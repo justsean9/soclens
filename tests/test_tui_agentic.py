@@ -1608,6 +1608,116 @@ def test_ai_settings_page_queries_available_ais_and_picks_default_model_from_dro
         asyncio.run(_run())
 
 
+def test_tui_learning_mode_control_panel_knowledge_manager_and_event_teach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from textual.widgets import DataTable, Select, TabbedContent
+
+    from soclens.tui.ai_widgets import (
+        AIControlPanelWidget,
+        EventAIPanelWidget,
+        KnowledgeManagerWidget,
+        TeachLearnModal,
+    )
+    from soclens.tui.screens.llm import LocalLLMPane
+
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+
+    kdir = tmp_path / ".soclens_cache" / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    (kdir / "BASE_ENVIRONMENT.md").write_text(
+        "\ufeff# Base Env\n- Critical CIDR 10.20.0.0/16\n",
+        encoding="utf-8",
+    )
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-rf-intel",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+        preload_alerts=False,
+    )
+
+    # Seed one pending passive discovery before launching TUI
+    app.learning_manager.record_passive_discovery(
+        tool_name="splunk_list_indexes",
+        tool_args={},
+        tool_output={"ok": True, "indexes": [{"name": "dns_pending_idx", "totalEventCount": 3200}]},
+        learning_mode="manual",
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await pilot.pause()
+
+            # 1. EventAIPanelWidget has Teach / Learn button fitting within 150x42 and opens TeachLearnModal
+            rf_panel = app.query_one("#rf-ai-panel", EventAIPanelWidget)
+            teach_btn = rf_panel.query_one("#btn-ai-teach-event", Button)
+            assert teach_btn.region.right <= 150
+            assert teach_btn.region.bottom <= 42
+            teach_btn.press()
+            await pilot.pause()
+            assert isinstance(app.screen, TeachLearnModal)
+            app.screen.query_one("#teach-learn-cancel", Button).press()
+            await pilot.pause()
+
+            # 2. Switch to AI Control Panel: 0 spurious policy_change audits; toggling learning_mode audits 1
+            app.query_one("#main-tabs", TabbedContent).active = "tab-llm"
+            await pilot.pause()
+            llm_pane = app.query_one(LocalLLMPane)
+            subtabs = llm_pane.query_one("#llm-subtabs", TabbedContent)
+            subtabs.active = "llm-tab-control-panel"
+            await pilot.pause()
+            assert len(app.ai_audit_store.query(event_type="policy_change")) == 0
+
+            ctrl = llm_pane.query_one(AIControlPanelWidget)
+            ctrl.query_one("#ai-ctrl-learning-mode", Select).value = "auto"
+            await pilot.pause()
+            assert app.ai_policy_store.load().learning_mode == "auto"
+            assert len(app.ai_audit_store.query(event_type="policy_change")) == 1
+
+            # 3. Knowledge & Learning tab: approve, pin, rollback, delete & reload base info
+            subtabs.active = "llm-tab-knowledge"
+            await pilot.pause()
+            know = llm_pane.query_one(KnowledgeManagerWidget)
+            know.query_one("#ai-know-status-filter", Select).value = "pending"
+            await pilot.pause()
+            tbl = know.query_one("#ai-know-table", DataTable)
+            assert tbl.row_count == 1
+
+            know.query_one("#ai-know-approve-btn", Button).press()
+            await pilot.pause()
+            assert any(
+                "dns_pending_idx" in e.title and e.status == "active"
+                for e in app.learning_manager.list_entries(status="active")
+            )
+
+            know.query_one("#ai-know-status-filter", Select).value = "active"
+            await pilot.pause()
+            know.query_one("#ai-know-search", Input).value = "dns_pending_idx"
+            await pilot.pause()
+            assert tbl.row_count == 1
+            know.query_one("#ai-know-pin-btn", Button).press()
+            await pilot.pause()
+            assert any(
+                "dns_pending_idx" in e.title and e.pinned is True
+                for e in app.learning_manager.list_entries(status="active")
+            )
+
+            know.query_one("#ai-know-rollback-btn", Button).press()
+            await pilot.pause()
+            assert any(
+                "dns_pending_idx" in e.title and e.status == "rolled_back"
+                for e in app.learning_manager.list_entries(status="rolled_back")
+            )
+
+    asyncio.run(_run())
+
+
+
 
 
 

@@ -24,9 +24,15 @@ from textual.widgets import (
     Select,
     Static,
     Switch,
+    TextArea,
 )
 
 from soclens.agent_audit import AuditEntry, AuditLogStore, redact_sensitive_data
+from soclens.agent_learning import (
+    VALID_LEARNING_CATEGORIES,
+    SOCLearningEntry,
+    SOCLearningManager,
+)
 from soclens.agent_policy import (
     DEFAULT_KILL_SWITCH_LABEL,
     MAX_IDENTICAL_TOOL_CALLS,
@@ -40,6 +46,24 @@ from soclens.agent_policy import (
 )
 from soclens.agent_tools import ReadOnlyToolRegistry
 from soclens.event_tracker import EventAIPanelEntry, UniqueEvent
+
+_LEARNING_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Manual (Default — Stage Pending)", "manual"),
+    ("Auto (Opt-In — Auto-Promote)", "auto"),
+)
+
+_LEARNING_CATEGORY_OPTIONS: tuple[tuple[str, str], ...] = tuple(
+    (cat.replace("_", " ").title(), cat) for cat in VALID_LEARNING_CATEGORIES
+)
+
+_KNOWLEDGE_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("All Entries", "all"),
+    ("Pending Queue", "pending"),
+    ("Active", "active"),
+    ("Base Seed", "base_seed"),
+    ("Rolled Back", "rolled_back"),
+    ("Blocked", "blocked"),
+)
 
 _KILL_HOTKEY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("F12 (Default)", "f12"),
@@ -236,6 +260,184 @@ class AskEventAIModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class TeachLearnModal(ModalScreen[dict[str, Any] | None]):
+    """Editable preview modal for ``/learn``, Teach from This, and Knowledge editing."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS: ClassVar[str] = """
+    TeachLearnModal {
+        align: center middle;
+        background: $background 60%;
+    }
+    #teach-learn-dialog {
+        width: 82;
+        max-width: 94%;
+        height: auto;
+        max-height: 88%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #teach-learn-heading {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    .teach-learn-label {
+        color: $text-muted;
+        margin-top: 0;
+    }
+    #teach-learn-title,
+    #teach-learn-category,
+    #teach-learn-tags {
+        width: 1fr;
+        margin-bottom: 1;
+    }
+    #teach-learn-content {
+        width: 1fr;
+        height: 7;
+        min-height: 4;
+        margin-bottom: 1;
+    }
+    #teach-learn-error {
+        color: $error;
+        height: auto;
+        margin-bottom: 1;
+    }
+    #teach-learn-buttons {
+        height: auto;
+        align-horizontal: right;
+    }
+    #teach-learn-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        learning_manager: SOCLearningManager,
+        entry_id: str | None = None,
+        prefill_title: str = "",
+        prefill_content: str = "",
+        prefill_category: str = "environment_fact",
+        prefill_tags: str = "",
+        actor: str = "analyst",
+        modal_title: str = "Teach / Learn SOC Knowledge",
+    ) -> None:
+        super().__init__()
+        self._learning_manager = learning_manager
+        self._entry_id = entry_id
+        self._prefill_title = prefill_title.strip()
+        self._prefill_content = prefill_content.strip()
+        self._prefill_category = (
+            prefill_category
+            if prefill_category in VALID_LEARNING_CATEGORIES
+            else "environment_fact"
+        )
+        self._prefill_tags = prefill_tags.strip()
+        self._actor = actor or "analyst"
+        self._modal_title = modal_title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="teach-learn-dialog"):
+            yield Static(self._modal_title, id="teach-learn-heading", markup=False)
+            yield Static("Title:", classes="teach-learn-label", markup=False)
+            yield Input(
+                value=self._prefill_title,
+                placeholder="Short title (e.g. Escalation Contact or Benign Admin Tool)",
+                id="teach-learn-title",
+                compact=True,
+            )
+            yield Static("Category:", classes="teach-learn-label", markup=False)
+            yield Select(
+                list(_LEARNING_CATEGORY_OPTIONS),
+                allow_blank=False,
+                value=self._prefill_category,
+                id="teach-learn-category",
+                compact=True,
+            )
+            yield Static("Tags (comma-separated):", classes="teach-learn-label", markup=False)
+            yield Input(
+                value=self._prefill_tags,
+                placeholder="e.g. escalation, splunk, prod",
+                id="teach-learn-tags",
+                compact=True,
+            )
+            yield Static("Knowledge / Playbook Lesson:", classes="teach-learn-label", markup=False)
+            yield TextArea(
+                text=self._prefill_content,
+                id="teach-learn-content",
+            )
+            yield Static("", id="teach-learn-error", markup=False)
+            with Horizontal(id="teach-learn-buttons"):
+                yield Button("Cancel", id="teach-learn-cancel", variant="default", compact=True)
+                yield Button(
+                    "Save Learning",
+                    id="teach-learn-save",
+                    variant="primary",
+                    compact=True,
+                )
+
+    def on_mount(self) -> None:
+        if not self.app.is_running or getattr(self.app, "_exit", False):
+            return
+        if not self._prefill_title:
+            self.query_one("#teach-learn-title", Input).focus()
+        else:
+            self.query_one("#teach-learn-content", TextArea).focus()
+
+    def _submit_learning(self) -> None:
+        title = self.query_one("#teach-learn-title", Input).value.strip()
+        cat_val = self.query_one("#teach-learn-category", Select).value
+        category = str(cat_val) if isinstance(cat_val, str) and cat_val else "environment_fact"
+        raw_tags = self.query_one("#teach-learn-tags", Input).value
+        tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        content = self.query_one("#teach-learn-content", TextArea).text.strip()
+        err_widget = self.query_one("#teach-learn-error", Static)
+        if not content:
+            err_widget.update("Please enter the learning content before saving.")
+            self.query_one("#teach-learn-content", TextArea).focus()
+            return
+        try:
+            if self._entry_id:
+                saved = self._learning_manager.edit_entry(
+                    self._entry_id,
+                    title=title or content.splitlines()[0][:80],
+                    content=content,
+                    category=category,
+                    tags=tags,
+                    actor=self._actor,
+                )
+            else:
+                saved = self._learning_manager.submit_manual_learn(
+                    title=title or content.splitlines()[0][:80],
+                    content=content,
+                    category=category,
+                    tags=tags,
+                    actor=self._actor,
+                )
+        except ValueError as exc:
+            err_widget.update(str(exc))
+            return
+        self.dismiss(saved.to_dict())
+
+    @on(Button.Pressed, "#teach-learn-save")
+    def handle_save(self) -> None:
+        self._submit_learning()
+
+    @on(Button.Pressed, "#teach-learn-cancel")
+    def handle_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        """Dismiss the Teach/Learn modal without saving."""
+        self.dismiss(None)
+
+
 class EventAIPanelWidget(Vertical):
     """Per-event AI investigation panel displaying persisted and live AI responses."""
 
@@ -308,6 +510,27 @@ class EventAIPanelWidget(Vertical):
         def control(self) -> EventAIPanelWidget:
             return self.panel
 
+    class TeachRequested(Message):
+        """Posted when the analyst clicks Teach / Learn on the per-event AI panel."""
+
+        def __init__(
+            self,
+            panel: EventAIPanelWidget,
+            event: UniqueEvent | None,
+            *,
+            prefill_title: str = "",
+            prefill_content: str = "",
+        ) -> None:
+            self.panel: EventAIPanelWidget = panel
+            self.event: UniqueEvent | None = event
+            self.prefill_title: str = prefill_title
+            self.prefill_content: str = prefill_content
+            super().__init__()
+
+        @property
+        def control(self) -> EventAIPanelWidget:
+            return self.panel
+
     def __init__(self, *args: Any, classes: str | None = None, **kwargs: Any) -> None:
         merged_classes = f"event-ai-panel {classes}".strip() if classes else "event-ai-panel"
         super().__init__(*args, classes=merged_classes, **kwargs)
@@ -338,6 +561,9 @@ class EventAIPanelWidget(Vertical):
                 variant="primary",
                 compact=True,
             )
+            teach_btn = Button("Teach / Learn", id="btn-ai-teach-event", compact=True)
+            teach_btn.tooltip = "Teach / Learn from This"
+            yield teach_btn
         yield RichLog(
             classes="ai-panel-log",
             highlight=False,
@@ -439,6 +665,29 @@ class EventAIPanelWidget(Vertical):
         event.stop()
         self.post_message(self.FullInvestigateRequested(self, self._current_event))
 
+    @on(Button.Pressed, "#btn-ai-teach-event")
+    def handle_teach_button(self, event: Button.Pressed) -> None:
+        event.stop()
+        ev = self._current_event
+        ev_title = str(getattr(ev, "title", "") or getattr(ev, "event_key", "") or "SOC Event Lesson").strip()
+        prefill_parts: list[str] = []
+        if self._entries:
+            latest = self._entries[-1]
+            if latest.answer_markdown:
+                prefill_parts.append(latest.answer_markdown.strip()[:800])
+            elif latest.question:
+                prefill_parts.append(latest.question.strip())
+        elif ev is not None and getattr(ev, "summary", None):
+            prefill_parts.append(str(getattr(ev, "summary", "")).strip())
+        self.post_message(
+            self.TeachRequested(
+                self,
+                ev,
+                prefill_title=ev_title[:80],
+                prefill_content="\n\n".join(prefill_parts),
+            )
+        )
+
 
 class AIControlPanelWidget(VerticalScroll):
     """AI Control Panel governing background triage, cross-search, source, and tool policies."""
@@ -512,6 +761,9 @@ class AIControlPanelWidget(VerticalScroll):
     }
     AIControlPanelWidget #ai-ctrl-kill-hotkey {
         width: 28;
+    }
+    AIControlPanelWidget #ai-ctrl-learning-mode {
+        width: 38;
     }
     AIControlPanelWidget #ai-ctrl-kill-config-collapsible,
     AIControlPanelWidget #ai-ctrl-tools-collapsible {
@@ -604,6 +856,19 @@ class AIControlPanelWidget(VerticalScroll):
                     compact=True,
                 )
                 yield Button("Save Limits", id="ai-ctrl-save-limits", variant="primary", compact=True)
+            with Horizontal(classes="ai-ctrl-row"):
+                yield Static(
+                    "Self-Learning Mode:",
+                    classes="ai-ctrl-limit-label",
+                    markup=False,
+                )
+                yield Select(
+                    list(_LEARNING_MODE_OPTIONS),
+                    allow_blank=False,
+                    value=getattr(policy, "learning_mode", "manual"),
+                    id="ai-ctrl-learning-mode",
+                    compact=True,
+                )
 
         for sw_id, field_name, label in _CONTROL_SWITCH_SPECS:
             with Horizontal(classes="ai-ctrl-row"):
@@ -701,6 +966,13 @@ class AIControlPanelWidget(VerticalScroll):
                 if hsel.value != policy.kill_switch_hotkey:
                     with hsel.prevent(Select.Changed):
                         hsel.value = policy.kill_switch_hotkey
+
+            with contextlib.suppress(Exception):
+                lsel = self.query_one("#ai-ctrl-learning-mode", Select)
+                target_lm = getattr(policy, "learning_mode", "manual")
+                if lsel.value != target_lm:
+                    with lsel.prevent(Select.Changed):
+                        lsel.value = target_lm
 
             for sw_id, field_name, _label in (*_CONTROL_SWITCH_SPECS, *_KILL_CONFIG_SWITCH_SPECS):
                 with contextlib.suppress(Exception):
@@ -858,6 +1130,23 @@ class AIControlPanelWidget(VerticalScroll):
         )
         self._sync_app_kill_ui()
         self._update_status(f"Updated global kill hotkey: {updated.kill_switch_hotkey}")
+
+    @on(Select.Changed, "#ai-ctrl-learning-mode")
+    def handle_learning_mode_changed(self, event: Select.Changed) -> None:
+        if self._syncing or not self.is_mounted or not isinstance(event.value, str):
+            return
+        new_mode = event.value.strip().lower()
+        if new_mode not in {"manual", "auto"}:
+            return
+        if getattr(self._policy_store.load(), "learning_mode", "manual") == new_mode:
+            return
+        updated = self._policy_store.update(learning_mode=new_mode)
+        self._audit_policy_change(
+            "learning_mode",
+            f"Control panel set learning_mode={updated.learning_mode}",
+            {"field": "learning_mode", "value": updated.learning_mode},
+        )
+        self._update_status(f"Updated self-learning mode: {updated.learning_mode}")
 
     @on(Button.Pressed, "#ai-ctrl-save-kill-label")
     @on(Input.Submitted, "#ai-ctrl-kill-label")
@@ -1080,9 +1369,360 @@ class AuditLogViewWidget(Vertical):
         self._render_entry_detail(event.cursor_row)
 
 
+class KnowledgeManagerWidget(Vertical):
+    """Manage Pending Learnings Queue, Base Info seeding, pinning, edits, and rollback."""
+
+    DEFAULT_CSS: ClassVar[str] = """
+    KnowledgeManagerWidget {
+        width: 1fr;
+        height: 1fr;
+        background: #0f131c;
+    }
+    KnowledgeManagerWidget .ai-know-toolbar {
+        height: auto;
+        width: 1fr;
+        background: #161c2a;
+        padding: 0 1;
+        align-vertical: middle;
+    }
+    KnowledgeManagerWidget #ai-know-status-filter {
+        width: 24;
+        margin-right: 1;
+    }
+    KnowledgeManagerWidget #ai-know-search {
+        width: 1fr;
+        margin-right: 1;
+    }
+    KnowledgeManagerWidget .ai-know-toolbar Button {
+        margin-left: 1;
+    }
+    KnowledgeManagerWidget .ai-know-actions {
+        height: auto;
+        width: 1fr;
+        background: #131926;
+        padding: 0 1;
+        align-vertical: middle;
+    }
+    KnowledgeManagerWidget .ai-know-actions Button {
+        margin-right: 1;
+    }
+    KnowledgeManagerWidget #ai-know-table {
+        height: 1fr;
+        min-height: 6;
+    }
+    KnowledgeManagerWidget #ai-know-detail {
+        height: 9;
+        min-height: 4;
+        background: #0d111a;
+        border-top: solid #2e3c5c;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        learning_manager: SOCLearningManager,
+        audit_store: AuditLogStore | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._learning_manager = learning_manager
+        self._audit_store = audit_store
+        self._entries: list[SOCLearningEntry] = []
+
+    def rebind_learning_manager(
+        self,
+        learning_manager: SOCLearningManager,
+        audit_store: AuditLogStore | None = None,
+    ) -> None:
+        """Update the backing ``SOCLearningManager`` and refresh displayed rows."""
+        self._learning_manager = learning_manager
+        if audit_store is not None:
+            self._audit_store = audit_store
+        self.refresh_entries()
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="ai-know-toolbar"):
+            yield Select(
+                list(_KNOWLEDGE_FILTER_OPTIONS),
+                allow_blank=False,
+                value="all",
+                id="ai-know-status-filter",
+                compact=True,
+            )
+            yield Input(
+                placeholder="Filter by keyword, tag, or source...",
+                id="ai-know-search",
+                compact=True,
+            )
+            yield Button("Refresh", id="ai-know-refresh-btn", compact=True)
+            yield Button("+ Teach", id="ai-know-add-btn", variant="primary", compact=True)
+            yield Button("Seed / Reload Base Info", id="ai-know-reload-base-btn", compact=True)
+        yield Static(
+            "Knowledge & Pending Queue ready.",
+            id="ai-know-status",
+            classes="status-bar",
+            markup=False,
+        )
+        yield DataTable(id="ai-know-table")
+        with Horizontal(classes="ai-know-actions"):
+            yield Button("Approve", id="ai-know-approve-btn", variant="success", compact=True)
+            yield Button("Edit", id="ai-know-edit-btn", compact=True)
+            yield Button("Reject", id="ai-know-reject-btn", variant="warning", compact=True)
+            yield Button("Pin / Unpin", id="ai-know-pin-btn", compact=True)
+            yield Button("Rollback", id="ai-know-rollback-btn", compact=True)
+            yield Button("Delete", id="ai-know-delete-btn", variant="error", compact=True)
+        yield RichLog(
+            id="ai-know-detail",
+            highlight=False,
+            markup=False,
+            wrap=True,
+        )
+
+    def on_mount(self) -> None:
+        table = self.query_one("#ai-know-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("ID", key="id")
+        table.add_column("Status", key="status")
+        table.add_column("Source", key="source")
+        table.add_column("Category", key="category")
+        table.add_column("Title", key="title")
+        table.add_column("Conf", key="conf")
+        table.add_column("Seen", key="seen")
+        table.add_column("Pin", key="pinned")
+        self.refresh_entries()
+
+    def _selected_entry(self) -> SOCLearningEntry | None:
+        try:
+            table = self.query_one("#ai-know-table", DataTable)
+        except Exception:
+            return None
+        row_idx = int(table.cursor_row)
+        if 0 <= row_idx < len(self._entries):
+            return self._entries[row_idx]
+        return None
+
+    def _set_status(self, message: str) -> None:
+        with contextlib.suppress(Exception):
+            self.query_one("#ai-know-status", Static).update(message)
+
+    def _notify_audit_sibling(self) -> None:
+        with contextlib.suppress(Exception):
+            self.app.query_one(AuditLogViewWidget).refresh_entries()
+
+    def refresh_entries(self) -> None:
+        """Reload entries from ``SOCLearningManager`` matching filter/search controls."""
+        try:
+            flt_raw = self.query_one("#ai-know-status-filter", Select).value
+            flt = str(flt_raw) if isinstance(flt_raw, str) else "all"
+            search_q = self.query_one("#ai-know-search", Input).value.strip().lower()
+            table = self.query_one("#ai-know-table", DataTable)
+        except Exception:
+            return
+
+        if flt == "base_seed":
+            entries = self._learning_manager.list_entries(source="base_seed", limit=300)
+        elif flt in {"pending", "active", "rolled_back", "blocked"}:
+            entries = self._learning_manager.list_entries(status=flt, limit=300)
+        else:
+            entries = self._learning_manager.list_entries(limit=300)
+
+        if search_q:
+            entries = [
+                e
+                for e in entries
+                if search_q in f"{e.id} {e.title} {e.content} {e.category} {e.source} {' '.join(e.tags)}".lower()
+            ]
+
+        self._entries = entries
+        table.clear(columns=False)
+        for idx, entry in enumerate(entries):
+            table.add_row(
+                entry.id[:12],
+                entry.status,
+                entry.source,
+                entry.category,
+                entry.title[:50],
+                f"{entry.confidence:.2f}",
+                str(entry.seen_count),
+                "PIN" if entry.pinned else "-",
+                key=f"{idx}:{entry.id}",
+            )
+
+        all_pending = len(self._learning_manager.list_entries(status="pending", limit=300))
+        mode = self._learning_manager.get_learning_mode()
+        self._set_status(
+            f"Showing {len(entries)} knowledge entries | Pending Queue: {all_pending} | Mode: {mode}"
+        )
+
+        if entries:
+            with contextlib.suppress(Exception):
+                table.move_cursor(row=0)
+            self._render_detail(0)
+        else:
+            with contextlib.suppress(Exception):
+                detail = self.query_one("#ai-know-detail", RichLog)
+                detail.clear()
+                detail.write("No SOC knowledge entries match the active filter.")
+
+    def _render_detail(self, row_index: int) -> None:
+        if not (0 <= row_index < len(self._entries)):
+            return
+        try:
+            detail = self.query_one("#ai-know-detail", RichLog)
+        except Exception:
+            return
+        entry = self._entries[row_index]
+        detail.clear()
+        detail.write(
+            Text(
+                f"[{entry.status.upper()}] {entry.title} "
+                f"(id={entry.id}, source={entry.source}, category={entry.category}, "
+                f"conf={entry.confidence:.2f}, seen={entry.seen_count}, uses={entry.use_count}, "
+                f"pinned={entry.pinned})",
+                style="bold cyan",
+            )
+        )
+        if entry.tags:
+            detail.write(f"Tags: {', '.join(entry.tags)}")
+        detail.write(str(redact_sensitive_data(entry.content)))
+        revisions = self._learning_manager.get_revisions(entry.id)
+        if revisions:
+            rev_summary = ", ".join(
+                f"r{r['revision_no']}:{r['action']}({r['new_status']})"
+                for r in revisions[:5]
+            )
+            detail.write(f"Revisions: {rev_summary}")
+
+    @on(Select.Changed, "#ai-know-status-filter")
+    def handle_filter_changed(self) -> None:
+        self.refresh_entries()
+
+    @on(Input.Changed, "#ai-know-search")
+    @on(Input.Submitted, "#ai-know-search")
+    def handle_search_changed(self) -> None:
+        self.refresh_entries()
+
+    @on(Button.Pressed, "#ai-know-refresh-btn")
+    def handle_refresh_btn(self) -> None:
+        self.refresh_entries()
+
+    @on(Button.Pressed, "#ai-know-reload-base-btn")
+    def handle_reload_base(self) -> None:
+        ws_dir = getattr(self.app, "workspace_dir", None)
+        loaded = self._learning_manager.load_base_knowledge(ws_dir)
+        self.refresh_entries()
+        self._notify_audit_sibling()
+        self._set_status(f"Base Info reloaded ({len(loaded)} base_seed entries synced).")
+
+    @on(Button.Pressed, "#ai-know-add-btn")
+    def handle_add_btn(self) -> None:
+        modal = TeachLearnModal(learning_manager=self._learning_manager)
+
+        def _after(saved: dict[str, Any] | None) -> None:
+            if saved is not None:
+                self.refresh_entries()
+                self._notify_audit_sibling()
+                self._set_status(f"Saved active learning: {saved.get('title', '')}")
+
+        self.app.push_screen(modal, _after)
+
+    @on(Button.Pressed, "#ai-know-approve-btn")
+    def handle_approve_btn(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Select a knowledge entry first.")
+            return
+        updated = self._learning_manager.approve_entry(entry.id)
+        self.refresh_entries()
+        self._notify_audit_sibling()
+        self._set_status(f"Approved entry '{updated.title}' -> active.")
+
+    @on(Button.Pressed, "#ai-know-edit-btn")
+    def handle_edit_btn(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Select a knowledge entry first.")
+            return
+        modal = TeachLearnModal(
+            learning_manager=self._learning_manager,
+            entry_id=entry.id,
+            prefill_title=entry.title,
+            prefill_content=entry.content,
+            prefill_category=entry.category,
+            prefill_tags=", ".join(entry.tags),
+            modal_title=f"Edit SOC Knowledge ({entry.id[:8]})",
+        )
+
+        def _after(saved: dict[str, Any] | None) -> None:
+            if saved is not None:
+                self.refresh_entries()
+                self._notify_audit_sibling()
+                self._set_status(f"Updated learning '{saved.get('title', '')}'.")
+
+        self.app.push_screen(modal, _after)
+
+    @on(Button.Pressed, "#ai-know-reject-btn")
+    def handle_reject_btn(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Select a pending entry to reject.")
+            return
+        self._learning_manager.delete_entry(entry.id)
+        self.refresh_entries()
+        self._notify_audit_sibling()
+        self._set_status(f"Rejected and removed entry '{entry.title}'.")
+
+    @on(Button.Pressed, "#ai-know-pin-btn")
+    def handle_pin_btn(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Select a knowledge entry to pin/unpin.")
+            return
+        updated = self._learning_manager.pin_entry(entry.id, not entry.pinned)
+        self.refresh_entries()
+        self._notify_audit_sibling()
+        self._set_status(
+            f"{'Pinned' if updated.pinned else 'Unpinned'} entry '{updated.title}'."
+        )
+
+    @on(Button.Pressed, "#ai-know-rollback-btn")
+    def handle_rollback_btn(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Select a knowledge entry to roll back.")
+            return
+        updated = self._learning_manager.rollback_entry(entry.id)
+        self.refresh_entries()
+        self._notify_audit_sibling()
+        self._set_status(f"Rolled back entry '{updated.title}' (status={updated.status}).")
+
+    @on(Button.Pressed, "#ai-know-delete-btn")
+    def handle_delete_btn(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._set_status("Select a knowledge entry to delete.")
+            return
+        self._learning_manager.delete_entry(entry.id)
+        self.refresh_entries()
+        self._notify_audit_sibling()
+        self._set_status(f"Deleted entry '{entry.title}'.")
+
+    @on(DataTable.RowHighlighted, "#ai-know-table")
+    def handle_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._render_detail(event.cursor_row)
+
+    @on(DataTable.RowSelected, "#ai-know-table")
+    def handle_row_selected(self, event: DataTable.RowSelected) -> None:
+        self._render_detail(event.cursor_row)
+
+
 __all__ = [
     "AIControlPanelWidget",
     "AskEventAIModal",
     "AuditLogViewWidget",
     "EventAIPanelWidget",
+    "KnowledgeManagerWidget",
+    "TeachLearnModal",
 ]

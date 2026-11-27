@@ -27,6 +27,7 @@ from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Select, Static, TabbedContent, TabPane
 
 from soclens.agent_audit import AuditEntry, AuditLogStore
+from soclens.agent_learning import SOCLearningManager
 from soclens.agent_orchestrator import (
     InvestigationResult,
     SocAgentOrchestrator,
@@ -1368,6 +1369,17 @@ class SocLensApp(App[None]):
         self._default_ai_policy_store = self.ai_policy_store
         self._default_ai_audit_store = self.ai_audit_store
         self._default_event_ai_store = self.event_ai_store
+        self.learning_manager = SOCLearningManager(
+            storage=lambda: self.storage,
+            workspace_dir=self.workspace_dir,
+            policy_store=self.ai_policy_store,
+            audit_store=self.ai_audit_store,
+        )
+        self._default_learning_manager = self.learning_manager
+        try:
+            self.learning_manager.load_base_knowledge(self.workspace_dir)
+        except Exception:
+            pass
         self.ai_tool_registry: ReadOnlyToolRegistry = build_default_readonly_registry(
             rf_client=self._get_ai_rf_client,
             s1_client=self._get_ai_s1_client,
@@ -1375,6 +1387,7 @@ class SocLensApp(App[None]):
             splunk_es_client=self._get_ai_splunk_es_client,
             osint_client=self._get_ai_osint_client,
             storage=lambda: self.storage,
+            learning_manager=lambda: self.learning_manager,
         )
         self.ai_orchestrator = SocAgentOrchestrator(
             registry=self.ai_tool_registry,
@@ -1382,6 +1395,7 @@ class SocLensApp(App[None]):
             audit_store=self.ai_audit_store,
             llm_client_factory=self._get_ai_llm_client,
             storage=lambda: self.storage,
+            learning_manager=lambda: self.learning_manager,
         )
         self.background_triage_queue = BackgroundTriageQueue(
             orchestrator=self.ai_orchestrator,
@@ -2124,6 +2138,12 @@ class SocLensApp(App[None]):
                     self.ai_audit_store.rebind_path(new_cache_root / "ai_audit.jsonl")
                 if self.event_ai_store is self._default_event_ai_store:
                     self.event_ai_store.rebind_path(new_cache_root / "event_ai_panels.json")
+                if self.learning_manager is self._default_learning_manager:
+                    self.learning_manager.rebind_workspace(new_workspace)
+                    try:
+                        self.learning_manager.load_base_knowledge(new_workspace)
+                    except Exception:
+                        pass
         for attr in ("splunk_client", "splunk_es_client", "llm_client"):
             if hasattr(self, attr) and not getattr(self, f"_custom_{attr}_injected", False):
                 setattr(self, attr, None)

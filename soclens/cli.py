@@ -5729,8 +5729,20 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                 except Exception:
                     cli_storage = None
                 try:
+                    from soclens.agent_learning import SOCLearningManager
+
                     policy_store = AIPolicyStore(path=cache_root / "ai_policy.json", storage=cli_storage)
                     audit_store = AuditLogStore(path=cache_root / "ai_audit.jsonl", storage=cli_storage)
+                    cli_learning_mgr = SOCLearningManager(
+                        storage=cli_storage,
+                        workspace_dir=ws_dir,
+                        policy_store=policy_store,
+                        audit_store=audit_store,
+                    )
+                    try:
+                        cli_learning_mgr.load_base_knowledge(ws_dir)
+                    except Exception:
+                        pass
 
                     def _cli_rf() -> RecordedFutureClient | None:
                         try:
@@ -5766,12 +5778,14 @@ def _handle_llm(args: argparse.Namespace, *, use_json: bool) -> int:
                         splunk_es_client=_cli_splunk_es,
                         osint_client=lambda: OSINTClient(),
                         storage=cli_storage,
+                        learning_manager=cli_learning_mgr,
                     )
                     orchestrator = SocAgentOrchestrator(
                         registry=registry,
                         policy_store=policy_store,
                         audit_store=audit_store,
                         storage=cli_storage,
+                        learning_manager=cli_learning_mgr,
                     )
 
                     def _cli_tool_cb(ev: dict[str, Any]) -> None:

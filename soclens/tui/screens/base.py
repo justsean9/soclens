@@ -1088,3 +1088,61 @@ class BaseSocPane(VerticalScroll):
         trigger_fn = getattr(self.app, "trigger_event_ai_investigation", None)
         if callable(trigger_fn):
             trigger_fn(event, "full_investigation")
+
+    def request_teach_event_ai(
+        self,
+        panel_selector: str,
+        event: Any,
+        *,
+        prefill_title: str = "",
+        prefill_content: str = "",
+    ) -> None:
+        """Open ``TeachLearnModal`` prefilled from an event and its latest AI panel entry."""
+        _ = panel_selector
+        if self.is_app_shutting_down():
+            return
+        from soclens.agent_audit import AuditLogStore
+        from soclens.agent_learning import SOCLearningManager
+        from soclens.agent_policy import AIPolicyStore
+        from soclens.tui.ai_widgets import (
+            AuditLogViewWidget,
+            KnowledgeManagerWidget,
+            TeachLearnModal,
+        )
+
+        lm = getattr(self.app, "learning_manager", None)
+        if not isinstance(lm, SOCLearningManager):
+            stor = getattr(self.app, "storage", None)
+            cache_dir = self.workspace_dir / ".soclens_cache"
+            pol = getattr(self.app, "ai_policy_store", None)
+            aud = getattr(self.app, "ai_audit_store", None)
+            lm = SOCLearningManager(
+                storage=stor,
+                workspace_dir=self.workspace_dir,
+                policy_store=pol if isinstance(pol, AIPolicyStore) else AIPolicyStore(path=cache_dir / "ai_policy.json", storage=stor),
+                audit_store=aud if isinstance(aud, AuditLogStore) else AuditLogStore(path=cache_dir / "ai_audit.jsonl", storage=stor),
+            )
+
+        ev_title = prefill_title.strip() or str(
+            getattr(event, "title", "") or getattr(event, "event_key", "") or "SOC Event Lesson"
+        ).strip()
+        modal = TeachLearnModal(
+            learning_manager=lm,
+            prefill_title=ev_title[:80],
+            prefill_content=prefill_content,
+            modal_title="Teach / Learn from This Event",
+        )
+
+        def _after(saved: dict[str, Any] | None) -> None:
+            if saved is None or self.is_app_shutting_down():
+                return
+            with contextlib.suppress(Exception):
+                self.app.query_one(KnowledgeManagerWidget).refresh_entries()
+            with contextlib.suppress(Exception):
+                self.app.query_one(AuditLogViewWidget).refresh_entries()
+            self.notify_user(
+                f"Saved active learning: {saved.get('title', '')}",
+                title="SOC Knowledge",
+            )
+
+        self.run_on_ui(self.app.push_screen, modal, _after)

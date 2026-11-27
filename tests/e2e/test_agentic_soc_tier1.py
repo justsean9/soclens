@@ -1193,7 +1193,10 @@ def test_tier1_f8_app_preloader_triggers_background_triage_when_enabled(
             await pilot.pause()
             await app.workers.wait_for_complete()
             await _mocks.async_wait_until(
-                lambda: len(mock_agentic_llm_server.chat_requests()) >= 1,
+                lambda: (
+                    len(mock_agentic_llm_server.chat_requests()) >= 1
+                    and len(app.event_ai_store.query_investigated_keys()) >= 1
+                ),
                 timeout=6.0,
                 pilot=pilot,
             )

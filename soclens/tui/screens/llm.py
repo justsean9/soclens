@@ -15,6 +15,7 @@ from textual.containers import Horizontal
 from textual.widgets import Button, Input, RichLog, Select, Static, TabbedContent, TabPane
 
 from soclens.agent_audit import AuditLogStore
+from soclens.agent_learning import SOCLearningManager
 from soclens.agent_orchestrator import SocAgentOrchestrator
 from soclens.agent_policy import AIPolicyStore, evaluate_tool_permission
 from soclens.agent_tools import ReadOnlyToolRegistry, build_default_readonly_registry
@@ -30,7 +31,12 @@ from soclens.config import (
     has_rf_ssl_config_override,
 )
 from soclens.llm import SOC_PROMPT_TEMPLATES, LocalLLMClient, LocalLLMError
-from soclens.tui.ai_widgets import AIControlPanelWidget, AuditLogViewWidget
+from soclens.tui.ai_widgets import (
+    AIControlPanelWidget,
+    AuditLogViewWidget,
+    KnowledgeManagerWidget,
+    TeachLearnModal,
+)
 from soclens.tui.pivot import format_copilot_context
 from soclens.tui.screens.base import BaseSocPane, SelectableRichLog, extract_richlog_text
 
@@ -141,7 +147,8 @@ class LocalLLMPane(BaseSocPane):
     }
     LocalLLMPane #llm-tab-chat,
     LocalLLMPane #llm-tab-control-panel,
-    LocalLLMPane #llm-tab-audit-log {
+    LocalLLMPane #llm-tab-audit-log,
+    LocalLLMPane #llm-tab-knowledge {
         width: 1fr;
         height: 1fr;
         padding: 0;
@@ -389,6 +396,9 @@ class LocalLLMPane(BaseSocPane):
                     yield Button("Closing Note", id="llm-closing-note-btn", compact=True)
                     yield Button("Copy Reply", id="llm-copy-reply-btn", compact=True)
                     yield Button("Detach Ctx", id="llm-clear-context-btn", compact=True)
+                    teach_chat_btn = Button("Teach / Learn", id="llm-teach-btn", compact=True)
+                    teach_chat_btn.tooltip = "Teach / Learn from This"
+                    yield teach_chat_btn
 
                 yield Static("", id="llm-context-badge", classes="rf-summary-bar", markup=False)
                 yield SelectableRichLog(
@@ -423,6 +433,13 @@ class LocalLLMPane(BaseSocPane):
                     id="llm-ai-audit-log",
                 )
 
+            with TabPane("Knowledge & Learning", id="llm-tab-knowledge"):
+                yield KnowledgeManagerWidget(
+                    learning_manager=self._resolve_learning_manager(),
+                    audit_store=audit_store,
+                    id="llm-knowledge-manager",
+                )
+
     def _resolve_ai_stores(self) -> tuple[AIPolicyStore, AuditLogStore, Any]:
         policy_store = getattr(self.app, "ai_policy_store", None)
         audit_store = getattr(self.app, "ai_audit_store", None)
@@ -434,6 +451,19 @@ class LocalLLMPane(BaseSocPane):
         if not isinstance(audit_store, AuditLogStore):
             audit_store = AuditLogStore(path=cache_dir / "ai_audit.jsonl", storage=storage)
         return policy_store, audit_store, registry
+
+    def _resolve_learning_manager(self) -> SOCLearningManager:
+        existing = getattr(self.app, "learning_manager", None)
+        if isinstance(existing, SOCLearningManager):
+            return existing
+        policy_store, audit_store, _registry = self._resolve_ai_stores()
+        storage = getattr(self.app, "storage", None)
+        return SOCLearningManager(
+            storage=storage,
+            workspace_dir=self.workspace_dir,
+            policy_store=policy_store,
+            audit_store=audit_store,
+        )
 
     def _resolve_orchestrator(self) -> SocAgentOrchestrator:
         existing = getattr(self.app, "ai_orchestrator", None)
@@ -451,6 +481,7 @@ class LocalLLMPane(BaseSocPane):
             policy_store=policy_store,
             audit_store=audit_store,
             storage=storage,
+            learning_manager=self._resolve_learning_manager,
         )
 
     def _sync_tools_toggle_button(self, enabled: bool) -> None:
@@ -514,6 +545,9 @@ class LocalLLMPane(BaseSocPane):
         elif target == "llm-tab-audit-log":
             with contextlib.suppress(Exception):
                 self.query_one(AuditLogViewWidget).refresh_entries()
+        elif target == "llm-tab-knowledge":
+            with contextlib.suppress(Exception):
+                self.query_one(KnowledgeManagerWidget).refresh_entries()
 
     @on(TabbedContent.TabActivated, "#llm-subtabs")
     def handle_subtab_activated(self, event: TabbedContent.TabActivated) -> None:
@@ -702,6 +736,12 @@ class LocalLLMPane(BaseSocPane):
             self.query_one(AIControlPanelWidget).sync_from_store()
         with contextlib.suppress(Exception):
             self.query_one(AuditLogViewWidget).refresh_entries()
+        with contextlib.suppress(Exception):
+            _pol, audit_store, _reg = self._resolve_ai_stores()
+            self.query_one(KnowledgeManagerWidget).rebind_learning_manager(
+                self._resolve_learning_manager(),
+                audit_store=audit_store,
+            )
 
     def _current_provider(self) -> str:
         val = self.query_one("#llm-provider-select", Select).value
@@ -1046,6 +1086,56 @@ class LocalLLMPane(BaseSocPane):
         except Exception as exc:
             self.report_error("Refresh Models / Agents", exc)
 
+    def _open_teach_modal(
+        self,
+        *,
+        prefill_title: str = "",
+        prefill_content: str = "",
+        session_id: str | None = None,
+    ) -> None:
+        lm = self._resolve_learning_manager()
+        modal = TeachLearnModal(
+            learning_manager=lm,
+            prefill_title=prefill_title,
+            prefill_content=prefill_content,
+            modal_title="Teach / Learn SOC Knowledge",
+        )
+
+        def _after(saved: dict[str, Any] | None) -> None:
+            if saved is None or self.is_app_shutting_down():
+                return
+            saved_title = str(saved.get("title") or "")
+            self.set_status(f"Saved active SOC learning: {saved_title}")
+            if session_id:
+                note = Text()
+                note.append("[Learned] ", style="bold green")
+                note.append(f"Saved active knowledge entry: {saved_title}")
+                self._write_transcript(note, session_id=session_id)
+            with contextlib.suppress(Exception):
+                self.query_one(KnowledgeManagerWidget).refresh_entries()
+            with contextlib.suppress(Exception):
+                self.query_one(AuditLogViewWidget).refresh_entries()
+
+        self.app.push_screen(modal, _after)
+
+    @on(Button.Pressed, "#llm-teach-btn")
+    def handle_teach_button(self) -> None:
+        sess = self._active_session
+        content = (sess.last_reply or "").strip()
+        if not content:
+            for msg in reversed(sess.history):
+                if msg.get("role") == "assistant" and msg.get("content", "").strip():
+                    content = msg["content"].strip()
+                    break
+        if not content and sess.attached_context:
+            content = sess.attached_context.strip()[:800]
+        title = (sess.attached_title or "AI Chat Lesson").strip()[:80]
+        self._open_teach_modal(
+            prefill_title=title,
+            prefill_content=content[:1200],
+            session_id=sess.session_id,
+        )
+
     @on(Input.Submitted, "#llm-prompt")
     def handle_prompt_submitted(self) -> None:
         self.handle_send()
@@ -1056,6 +1146,27 @@ class LocalLLMPane(BaseSocPane):
         user_prompt = prompt_input.value.strip()
         sess = self._active_session
         session_id = sess.session_id
+
+        # Intercept /learn <lesson> BEFORE kill-switch/model checks & worker launch
+        lower_prompt = user_prompt.lower()
+        if lower_prompt == "/learn" or (
+            lower_prompt.startswith("/learn")
+            and len(user_prompt) > 6
+            and user_prompt[6].isspace()
+        ):
+            lesson = user_prompt[6:].strip()
+            if not lesson:
+                self.set_status("Usage: /learn <lesson text>")
+                return
+            with prompt_input.prevent(Input.Changed):
+                prompt_input.value = ""
+            first_line = lesson.splitlines()[0].strip()
+            self._open_teach_modal(
+                prefill_title=first_line[:80],
+                prefill_content=lesson,
+                session_id=session_id,
+            )
+            return
 
         is_killed_fn = getattr(self.app, "is_ai_killed", None)
         policy_store, _audit_store, _registry = self._resolve_ai_stores()

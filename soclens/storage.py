@@ -2287,6 +2287,7 @@ class StorageManager:
         created_by: str = "",
         created_at: float | None = None,
         updated_at: float | None = None,
+        dedupe_by_fingerprint: bool = False,
     ) -> dict[str, Any]:
         """Insert or update a SOC learning entry (globally shared, redacted)."""
         self._ensure_ready()
@@ -2300,7 +2301,7 @@ class StorageManager:
             else []
         )
         tags_text = " ".join(clean_tags)
-        eid = (entry_id or "").strip() or uuid.uuid4().hex[:16]
+        explicit_eid = (entry_id or "").strip()
         fp = (fingerprint or "").strip() or hashlib.sha256(
             f"{category}:{clean_title.lower()}:{clean_content.lower()}".encode()
         ).hexdigest()[:32]
@@ -2309,9 +2310,22 @@ class StorageManager:
 
         with self._lock:
             with self.session() as sess:
-                existing = sess.execute(
-                    select(soc_learnings_table).where(soc_learnings_table.c.id == eid)
-                ).mappings().first()
+                existing = None
+                eid = explicit_eid
+                if eid:
+                    existing = sess.execute(
+                        select(soc_learnings_table).where(soc_learnings_table.c.id == eid)
+                    ).mappings().first()
+                elif dedupe_by_fingerprint:
+                    existing = sess.execute(
+                        select(soc_learnings_table).where(
+                            soc_learnings_table.c.fingerprint == fp[:256]
+                        )
+                    ).mappings().first()
+                    if existing is not None:
+                        eid = str(existing["id"])
+                if not eid:
+                    eid = uuid.uuid4().hex[:16]
                 values = {
                     "fingerprint": fp[:256],
                     "category": str(category or "environment_fact")[:64],
@@ -2545,6 +2559,25 @@ class StorageManager:
                 rows = list(sess.execute(stmt).mappings().all())
 
         return [self._row_to_learning_dict(r) for r in rows]
+
+    def increment_learning_use(self, learning_id: str, delta: int = 1) -> bool:
+        """Increment ``use_count`` on a SOC learning entry without altering its content."""
+        clean_id = str(learning_id or "").strip()
+        step = max(1, int(delta))
+        if not clean_id:
+            return False
+        self._ensure_ready()
+        with self._lock:
+            with self.session() as sess:
+                res = cast(
+                    CursorResult[Any],
+                    sess.execute(
+                        update(soc_learnings_table)
+                        .where(soc_learnings_table.c.id == clean_id)
+                        .values(use_count=soc_learnings_table.c.use_count + step)
+                    ),
+                )
+                return bool(res.rowcount and res.rowcount > 0)
 
     def delete_learning(self, learning_id: str) -> bool:
         clean_id = str(learning_id or "").strip()
@@ -3010,6 +3043,9 @@ class SOCLearningStore:
 
     def delete(self, learning_id: str) -> bool:
         return self._storage.delete_learning(learning_id)
+
+    def increment_use(self, learning_id: str, delta: int = 1) -> bool:
+        return self._storage.increment_learning_use(learning_id, delta=delta)
 
     def record_revision(self, **kwargs: Any) -> dict[str, Any]:
         return self._storage.record_learning_revision(**kwargs)

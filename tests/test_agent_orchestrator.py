@@ -2617,6 +2617,122 @@ def test_orchestrator_local_db_precheck_injects_context_redacts_and_respects_tog
         assert "local_lookup_ioc_sightings" not in last_req_blob
 
 
+def test_orchestrator_injects_frozen_snapshot_across_all_7_providers_and_runs_passive_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.agent_learning import SOCLearningManager
+    from soclens.agent_policy import AIPolicyConfig
+    from soclens.agent_tools import build_default_readonly_registry
+    from soclens.storage import DatabaseConfig, StorageManager
+
+    kdir = tmp_path / ".soclens_cache" / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    (kdir / "BASE_ENVIRONMENT.md").write_text(
+        "\ufeff# Base Env\n- Critical subnet 10.20.0.0/16\n- Crown jewel vault-prod-01.corp.example\n",
+        encoding="utf-8",
+    )
+
+    storage = StorageManager(DatabaseConfig(sqlite_path=tmp_path / ".soclens_cache" / "soclens.db"))
+    storage.ensure_schema()
+    lm = SOCLearningManager(storage=storage, workspace_dir=tmp_path)
+    lm.load_base_knowledge(tmp_path)
+
+    policy_store = AIPolicyStore(storage=storage)
+    policy_store.save(AIPolicyConfig(max_tool_steps=5))
+    audit_store = AuditLogStore(storage=storage)
+
+    mock_s1 = MagicMock()
+    mock_s1.list_agents.return_value = [
+        {"siteName": "Prod-Servers", "osType": "linux", "computerName": "app-01.corp.example"}
+    ]
+    registry = build_default_readonly_registry(s1_client=mock_s1, storage=storage, learning_manager=lm)
+
+    all_7 = (
+        "ollama",
+        "openai",
+        "gemini",
+        "m365_copilot",
+        "copilot_studio",
+        "copilot_directline",
+        "security_copilot",
+    )
+    with MockAgenticLLMAndCopilotServer() as server:
+        for provider in all_7:
+            server.configure_provider(monkeypatch, provider)
+            server.queue_scripted_turn(
+                provider=provider,
+                content=f"Snapshot verified on {provider}.",
+            )
+            orch = SocAgentOrchestrator(
+                registry=registry,
+                policy_store=policy_store,
+                audit_store=audit_store,
+                llm_client_factory=lambda: LocalLLMClient(get_local_llm_config()),
+                storage=storage,
+                learning_manager=lm,
+            )
+            res = orch.investigate(
+                event_key=f"splunk_es:default:es-snap-{provider}",
+                event_context="",
+                mode="ask_only",
+                provider=provider,
+            )
+            assert res.status == "completed"
+            blob = _extract_llm_request_text(server.chat_requests(provider)[-1])
+            assert "vault-prod-01.corp.example" in blob
+            assert "10.20.0.0/16" in blob
+            assert "\ufeff" not in blob
+
+        # Full investigation with s1_list_agents triggers zero-API passive discovery + takeaway
+        server.configure_provider(monkeypatch, "openai")
+        server.queue_scripted_turn(
+            provider="openai",
+            tool_calls=[
+                {
+                    "id": "call_s1_agents",
+                    "type": "function",
+                    "function": {"name": "s1_list_agents", "arguments": json.dumps({"limit": 10})},
+                }
+            ],
+        )
+        server.queue_scripted_turn(
+            provider="openai",
+            content="SentinelOne Prod-Servers fleet checked.",
+        )
+        orch_full = SocAgentOrchestrator(
+            registry=registry,
+            policy_store=policy_store,
+            audit_store=audit_store,
+            llm_client_factory=lambda: LocalLLMClient(get_local_llm_config()),
+            storage=storage,
+            learning_manager=lm,
+        )
+        full_res = orch_full.investigate(
+            event_key="s1_threat::passive-1",
+            event_context="Check S1 agents.",
+            mode="full_investigation",
+            provider="openai",
+        )
+        assert full_res.status == "completed"
+        assert mock_s1.list_agents.call_count == 1
+        pending = lm.list_entries(status="pending")
+        assert any("Prod-Servers" in (e.title + e.content) for e in pending)
+        assert any(e.source == "ai_takeaway" for e in pending)
+
+        # local_search_soc_knowledge returns properly structured dicts
+        know_out = registry.execute(
+            "local_search_soc_knowledge",
+            {"query": "vault-prod-01"},
+            mode="full_investigation",
+            policy=AIPolicyConfig(),
+        )
+        assert know_out["ok"] is True
+        assert know_out["result"]["count"] >= 1
+        assert isinstance(know_out["result"]["entries"][0], dict)
+
+
+
 def test_orchestrator_escapes_local_db_context_tags_in_untrusted_payloads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

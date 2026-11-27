@@ -3370,6 +3370,20 @@ def test_redact_sensitive_data_scrubs_db_dsn_sqlalchemy_urls_vault_uris_and_hvs_
     assert redact_sensitive_data("vault:v1:hvs.CAESIJSecret999") == "vault:v1:<REDACTED>"
 
 
+def test_ai_policy_learning_mode_defaults_manual_and_persists(tmp_path: Path) -> None:
+    cfg = AIPolicyConfig()
+    assert cfg.learning_mode == "manual"
+    assert AIPolicyConfig.from_dict({"learning_mode": "invalid-mode"}).learning_mode == "manual"
+    assert AIPolicyConfig.from_dict({"learning_mode": "auto"}).learning_mode == "auto"
+
+    store = AIPolicyStore(tmp_path / "ai_policy.json")
+    assert store.load().learning_mode == "manual"
+    updated = store.update(learning_mode="auto")
+    assert updated.learning_mode == "auto"
+    assert store.load().learning_mode == "auto"
+
+
+
 
 
 

@@ -309,3 +309,57 @@ def test_tui_llm_gemini_provider_switch_and_chat(tmp_path: Path) -> None:
                 assert mock_llm.chat.call_count == 1
 
     asyncio.run(_run())
+
+
+def test_tui_llm_slash_learn_and_teach_button_persist_active_and_fit_80x24(
+    tmp_path: Path,
+) -> None:
+    from soclens.tui.ai_widgets import TeachLearnModal
+
+    app = create_app(
+        client=MagicMock(),
+        dry_run=True,
+        initial_tab="tab-llm",
+        workspace_dir=tmp_path,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            pane = app.query_one(LocalLLMPane)
+            teach_btn = pane.query_one("#llm-teach-btn", Button)
+            assert teach_btn.region.width > 0
+            assert teach_btn.region.right <= 80
+            assert teach_btn.region.bottom <= 24
+
+            # Empty /learn must not open modal or create any entry
+            before_cnt = len(app.learning_manager.list_entries())
+            pane.query_one("#llm-prompt", Input).value = "/learn   "
+            stack_before = len(app.screen_stack)
+            pane.query_one("#llm-send-btn", Button).press()
+            await pilot.pause()
+            assert len(app.screen_stack) == stack_before
+            assert len(app.learning_manager.list_entries()) == before_cnt
+
+            # /learn <lesson> works without any model configured and saves active on confirm
+            pane.query_one("#llm-prompt", Input).value = (
+                "/learn Escalate Mimikatz on dc-core-01 to Tier-3 IR."
+            )
+            pane.query_one("#llm-send-btn", Button).press()
+            await pilot.pause()
+            assert isinstance(app.screen, TeachLearnModal)
+            app.screen.query_one("#teach-learn-save", Button).press()
+            await pilot.pause()
+
+            active = app.learning_manager.list_entries(status="active")
+            assert any("Mimikatz" in (e.title + " " + e.content) for e in active)
+
+            # Clicking Teach / Learn button opens modal cleanly
+            pane.query_one("#llm-teach-btn", Button).press()
+            await pilot.pause()
+            assert isinstance(app.screen, TeachLearnModal)
+            app.screen.query_one("#teach-learn-cancel", Button).press()
+            await pilot.pause()
+
+    asyncio.run(_run())
+

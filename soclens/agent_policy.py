@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 InvestigationMode = Literal["ask_only", "full_investigation"]
 VALID_INVESTIGATION_MODES: frozenset[str] = frozenset({"ask_only", "full_investigation"})
 
+LearningMode = Literal["manual", "auto"]
+DEFAULT_LEARNING_MODE: LearningMode = "manual"
+VALID_LEARNING_MODES: tuple[str, ...] = ("manual", "auto")
+
 SOURCE_CATEGORY_SPLUNK: str = "splunk_search"
 SOURCE_CATEGORY_SPLUNK_ES: str = "splunk_es"
 SOURCE_CATEGORY_S1: str = "sentinelone"
@@ -154,6 +158,12 @@ def _normalize_kill_switch_hotkey(value: Any) -> str:
     return DEFAULT_KILL_SWITCH_HOTKEY
 
 
+def _normalize_learning_mode(value: Any) -> LearningMode:
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    return "manual"
+
+
 def format_kill_switch_hotkey_badge(hotkey: str) -> str:
     """Return a compact display badge (e.g. ``[F12]``) for ``hotkey``, or ``''``."""
     return _KILL_SWITCH_HOTKEY_BADGES.get(_normalize_kill_switch_hotkey(hotkey), "")
@@ -189,6 +199,7 @@ class AIPolicyConfig:
     kill_switch_persist_across_restarts: bool = True
     kill_switch_label: str = DEFAULT_KILL_SWITCH_LABEL
     kill_switch_hotkey: str = DEFAULT_KILL_SWITCH_HOTKEY
+    learning_mode: LearningMode = DEFAULT_LEARNING_MODE
 
     def __post_init__(self) -> None:
         self.background_triage_enabled = _coerce_bool(self.background_triage_enabled, False)
@@ -227,6 +238,7 @@ class AIPolicyConfig:
         )
         self.kill_switch_label = _normalize_kill_switch_label(self.kill_switch_label)
         self.kill_switch_hotkey = _normalize_kill_switch_hotkey(self.kill_switch_hotkey)
+        self.learning_mode = _normalize_learning_mode(self.learning_mode)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize policy configuration into a JSON-friendly dictionary."""
@@ -250,6 +262,7 @@ class AIPolicyConfig:
             "kill_switch_persist_across_restarts": self.kill_switch_persist_across_restarts,
             "kill_switch_label": self.kill_switch_label,
             "kill_switch_hotkey": self.kill_switch_hotkey,
+            "learning_mode": self.learning_mode,
         }
 
     @classmethod
@@ -292,6 +305,7 @@ class AIPolicyConfig:
             ),
             kill_switch_label=_normalize_kill_switch_label(raw.get("kill_switch_label")),
             kill_switch_hotkey=_normalize_kill_switch_hotkey(raw.get("kill_switch_hotkey")),
+            learning_mode=_normalize_learning_mode(raw.get("learning_mode")),
         )
 
 
@@ -582,10 +596,12 @@ __all__ = [
     "AIPolicyStore",
     "DEFAULT_KILL_SWITCH_HOTKEY",
     "DEFAULT_KILL_SWITCH_LABEL",
+    "DEFAULT_LEARNING_MODE",
     "DEFAULT_MAX_IDENTICAL_TOOL_CALLS",
     "DEFAULT_MAX_SAME_TOOL_FAILURES",
     "DEFAULT_MAX_TOOL_STEPS",
     "InvestigationMode",
+    "LearningMode",
     "MAX_IDENTICAL_TOOL_CALLS",
     "MAX_KILL_SWITCH_LABEL_LEN",
     "MAX_SAME_TOOL_FAILURES",
@@ -603,6 +619,7 @@ __all__ = [
     "SOURCE_CATEGORY_TOGGLE_MAP",
     "VALID_INVESTIGATION_MODES",
     "VALID_KILL_SWITCH_HOTKEYS",
+    "VALID_LEARNING_MODES",
     "evaluate_tool_permission",
     "format_kill_switch_hotkey_badge",
     "get_registered_readonly_tool_names",
