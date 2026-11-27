@@ -54,6 +54,8 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset(
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
+        ".soclens_cache",
+        "cache",
         "build",
         "dist",
         "logs",
@@ -77,7 +79,17 @@ EXCLUDED_FILE_NAMES: frozenset[str] = frozenset(
     }
 )
 
-EXCLUDED_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo", ".log", ".key")
+EXCLUDED_SUFFIXES: tuple[str, ...] = (
+    ".pyc",
+    ".pyo",
+    ".log",
+    ".key",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".sqlite",
+    ".sqlite3",
+)
 
 
 def _canonicalize_name(name: str) -> str:

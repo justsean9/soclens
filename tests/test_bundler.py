@@ -480,6 +480,16 @@ class TestReleaseBundlesAndLaunchers:
         (ws / "soclens" / "research.py").write_text("RESEARCH = 1\n", encoding="utf-8")
         (ws / "soclens" / "tui").mkdir(parents=True)
         (ws / "soclens" / "tui" / "logging_bridge.py").write_text("LOG = 1\n", encoding="utf-8")
+        (ws / "soclens" / "web" / "static").mkdir(parents=True)
+        (ws / "soclens" / "web" / "__init__.py").write_text("WEB = 1\n", encoding="utf-8")
+        (ws / "soclens" / "web" / "app.py").write_text("APP = 1\n", encoding="utf-8")
+        (ws / "soclens" / "web" / "static" / "index.html").write_text(
+            "<html><body>SOCLens Offline</body></html>\n", encoding="utf-8"
+        )
+        (ws / ".soclens_cache").mkdir()
+        (ws / ".soclens_cache" / "soclens.db").write_bytes(b"SQLite format 3\x00")
+        (ws / "soclens" / "cache").mkdir()
+        (ws / "soclens" / "cache" / "temp.db").write_bytes(b"nope")
         (ws / "install_offline.ps1").write_text(
             "# Install-WindowsPowerShellShims\nWrite-Host 'OK'\n", encoding="utf-8"
         )
@@ -608,9 +618,13 @@ class TestReleaseBundlesAndLaunchers:
             names = set(zf.namelist())
         assert "soclens.ps1" in names
         assert "soclens/__main__.py" in names
+        assert "soclens/web/__init__.py" in names
+        assert "soclens/web/app.py" in names
+        assert "soclens/web/static/index.html" in names
         assert "install_offline.ps1" in names
         assert "scripts/soclens-brand-sync.ps1" in names
-        assert not any(n.endswith(".exe") and "/" not in n for n in names)
+        assert not any(n.startswith((".soclens_cache/", "cache/")) for n in names)
+        assert not any(n.endswith((".exe", ".db", ".db-wal", ".db-shm")) and "/" not in n for n in names)
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")

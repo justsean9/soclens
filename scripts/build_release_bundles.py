@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
 import stat
 import subprocess
 import sys
@@ -45,6 +46,9 @@ REQUIRED_BUNDLE_MEMBERS: tuple[str, ...] = (
     "soclens/__main__.py",
     "soclens/research.py",
     "soclens/tui/logging_bridge.py",
+    "soclens/web/__init__.py",
+    "soclens/web/app.py",
+    "soclens/web/static/index.html",
     "install_offline.sh",
     "install_offline.ps1",
     "soclens.ps1",
@@ -73,13 +77,28 @@ FORBIDDEN_PREFIXES: tuple[str, ...] = (
     ".git/",
     ".venv/",
     "venv/",
+    ".soclens_cache/",
+    "cache/",
+    "knowledge/",
     "reports/",
     "logs/",
     "bundles/",
     "scratch/",
 )
 
-FORBIDDEN_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo", ".log", ".key")
+FORBIDDEN_SUFFIXES: tuple[str, ...] = (
+    ".pyc",
+    ".pyo",
+    ".log",
+    ".key",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".sqlite",
+    ".sqlite3",
+)
+
+_EXTERNAL_URL_RE = re.compile(r"(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
 
 
 def _load_build_wheelhouse_module() -> Any:
@@ -330,6 +349,19 @@ def verify_release_bundles(
                     raise RuntimeError(f"Forbidden directory entry '{member}' found inside {fname}")
                 if Path(member).suffix.lower() in FORBIDDEN_SUFFIXES:
                     raise RuntimeError(f"Forbidden suffix '{member}' found inside {fname}")
+                if member.startswith("soclens/web/static/") and Path(member).suffix.lower() in (
+                    ".html",
+                    ".css",
+                    ".js",
+                ):
+                    asset_text = zf.read(member).decode("utf-8")
+                    for match in _EXTERNAL_URL_RE.findall(asset_text):
+                        if not match.lower().startswith(
+                            ("http://127.0.0.1", "http://localhost", "https://127.0.0.1", "https://localhost")
+                        ):
+                            raise RuntimeError(
+                                f"External CDN/URL '{match}' found in offline web asset '{member}' inside {fname}"
+                            )
 
             bundle_manifest = json.loads(zf.read("BUNDLE_MANIFEST.json").decode("utf-8"))
             if bundle_manifest.get("package_version") != clean_ver:

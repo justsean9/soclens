@@ -1499,6 +1499,7 @@ class SocAgentOrchestrator:
         auto_triggered: bool = False,
         model: str | None = None,
         stream_callback: Callable[[str], None] | None = None,
+        tool_event_callback: Callable[[dict[str, Any]], None] | None = None,
         max_tool_steps_override: int | None = None,
     ) -> InvestigationResult:
         """Run a bounded, policy-gated read-only SOC investigation."""
@@ -1657,7 +1658,7 @@ class SocAgentOrchestrator:
             supplied_client=None,
             prompt_builder=_build_prompts,
             pass_initial_conversation_id=False,
-            tool_event_callback=None,
+            tool_event_callback=tool_event_callback,
             max_tool_steps_override=max_tool_steps_override,
         )
         return InvestigationResult(

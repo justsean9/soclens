@@ -2472,6 +2472,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Launch TUI in Admin view (all tabs visible)",
     )
 
+    # 6b. Standalone Zero-EXE Web UI subcommand
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Launch the zero-EXE standalone tiling Web UI (Edge --app / localhost)",
+    )
+    web_parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Localhost TCP port to bind (default: 0 for ephemeral port)",
+    )
+    web_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        default=False,
+        help="Start the localhost web server without auto-opening a browser window",
+    )
+    web_parser.add_argument(
+        "--admin",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable Admin views and endpoints in the Web UI",
+    )
+    web_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace directory override",
+    )
+    web_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Read-only dry-run mode",
+    )
+
     # 7. SentinelOne Management API v2.1 subcommands
     s1_parser = subparsers.add_parser(
         "s1",
@@ -9807,10 +9842,22 @@ def main() -> None:
             "splunk",
             "s1",
             "llm",
+            "web",
         ) and not is_interactive_wl:
             _maybe_hydrate_startup_secrets(args)
 
-        if args.command == "watchlist":
+        if args.command == "web":
+            from soclens.web import run_web_server
+
+            run_web_server(
+                port=int(getattr(args, "port", 0)),
+                open_browser=not bool(getattr(args, "no_browser", False)),
+                admin=bool(getattr(args, "admin", False)),
+                workspace_dir=getattr(args, "workspace", None),
+                dry_run=bool(global_dry_run or getattr(args, "dry_run", False)),
+            )
+            rc = 0
+        elif args.command == "watchlist":
             client = _build_rf_client(args)
             rc = _handle_watchlist(args, client, global_dry_run=global_dry_run, use_json=use_json)
         elif args.command == "rf":

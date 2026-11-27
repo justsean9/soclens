@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SOCLens — Standalone Tiling Workbench</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="sl-body">
+  <div id="sl-app" class="sl-app">
+    <header id="sl-topbar" class="sl-topbar">
+      <div class="sl-brand">
+        <span class="sl-brand-mark">&#9670;</span>
+        <span class="sl-brand-name">SOCLens</span>
+        <span id="sl-version-badge" class="sl-badge">v--</span>
+        <span id="sl-admin-badge" class="sl-badge sl-badge-warn sl-hidden">ADMIN</span>
+        <span id="sl-dialect-badge" class="sl-badge sl-badge-info">sqlite</span>
+        <span id="sl-lock-badge" class="sl-badge sl-hidden">LOCKED</span>
+      </div>
+
+      <div class="sl-workspaces" id="sl-workspace-bar" title="Workspaces (Alt+1..5)">
+        <button class="sl-ws-btn active" data-ws="1" title="Workspace 1 (Alt+1)">1</button>
+        <button class="sl-ws-btn" data-ws="2" title="Workspace 2 (Alt+2)">2</button>
+        <button class="sl-ws-btn" data-ws="3" title="Workspace 3 (Alt+3)">3</button>
+        <button class="sl-ws-btn" data-ws="4" title="Workspace 4 (Alt+4)">4</button>
+        <button class="sl-ws-btn" data-ws="5" title="Workspace 5 (Alt+5)">5</button>
+      </div>
+
+      <div class="sl-topbar-actions">
+        <button id="sl-btn-palette" class="sl-btn sl-btn-ghost" title="Command Palette (Ctrl+K)">Ctrl+K Palette</button>
+        <button id="sl-btn-split-v" class="sl-btn sl-btn-ghost" title="Split Right (Alt+v)">Split V</button>
+        <button id="sl-btn-split-s" class="sl-btn sl-btn-ghost" title="Split Down (Alt+s)">Split H</button>
+        <button id="sl-btn-zoom" class="sl-btn sl-btn-ghost" title="Zoom Tile (Alt+z)">Zoom</button>
+        <button id="sl-btn-killswitch" class="sl-btn sl-btn-warn" title="Toggle AI Kill Switch">AI: Active</button>
+        <button id="sl-btn-shutdown" class="sl-btn sl-btn-danger" title="Shutdown Local Server">Shutdown</button>
+      </div>
+    </header>
+
+    <div id="sl-tile-launcher" class="sl-tile-launcher">
+      <div id="sl-tile-pills" class="sl-tile-pills"></div>
+      <div class="sl-sse-indicator">
+        <span id="sl-sse-dot" class="sl-dot"></span>
+        <span id="sl-sse-label">SSE: connecting</span>
+      </div>
+    </div>
+
+    <main id="sl-workspace-root" class="sl-workspace-root" aria-label="BSP Tiling Workspace"></main>
+
+    <footer id="sl-statusbar" class="sl-statusbar">
+      <span id="sl-status-msg">Initializing SOCLens standalone workspace...</span>
+      <span class="sl-shortcuts-hint">
+        Alt+v Split Right | Alt+s Split Down | Alt+h/j/k/l Focus | Alt+z Zoom | Alt+q Close | Alt+1..5 Workspaces | Ctrl+K Palette
+      </span>
+    </footer>
+  </div>
+
+  <!-- Command Palette Modal -->
+  <div id="sl-palette-backdrop" class="sl-modal-backdrop sl-hidden">
+    <div class="sl-modal sl-palette-modal" role="dialog" aria-label="Command Palette">
+      <div class="sl-modal-header">
+        <span>Command Palette</span>
+        <button id="sl-palette-close" class="sl-btn-icon" aria-label="Close">&times;</button>
+      </div>
+      <input id="sl-palette-input" class="sl-input" type="text" placeholder="Type a tile, layout action, or workspace..." autocomplete="off" />
+      <div id="sl-palette-list" class="sl-palette-list"></div>
+    </div>
+  </div>
+
+  <!-- Double-Confirmation / Action Modal -->
+  <div id="sl-modal-backdrop" class="sl-modal-backdrop sl-hidden">
+    <div class="sl-modal" role="dialog" aria-modal="true">
+      <div class="sl-modal-header">
+        <span id="sl-modal-title">Confirm Action</span>
+        <button id="sl-modal-close" class="sl-btn-icon" aria-label="Close">&times;</button>
+      </div>
+      <div id="sl-modal-body" class="sl-modal-body"></div>
+      <div id="sl-modal-footer" class="sl-modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- Right-Click / Selection Cross-Tile Pivot Menu -->
+  <div id="sl-pivot-menu" class="sl-context-menu sl-hidden" role="menu"></div>
+
+  <script src="/static/api.js"></script>
+  <script src="/static/tiling.js"></script>
+  <script src="/static/tiles.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
