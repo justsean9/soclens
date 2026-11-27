@@ -33,6 +33,7 @@
       this.tileRegistry = tileRegistry;
       this.onStateChanged = (options && options.onStateChanged) || function () {};
       this.onOpenTile = (options && options.onOpenTile) || function () {};
+      this.persistEnabled = options && options.persistEnabled === false ? false : true;
       this.workspaces = makeDefaultWorkspaces();
       this.activeWorkspace = "1";
       this.focusedLeafId = this.workspaces["1"].id;
@@ -442,9 +443,11 @@
 
     schedulePersist() {
       this.onStateChanged(this.exportState());
+      if (this.persistEnabled === false) return;
       if (this._persistTimer) clearTimeout(this._persistTimer);
       const self = this;
       this._persistTimer = setTimeout(function () {
+        if (self.persistEnabled === false) return;
         if (window.SOCLensAPI && window.SOCLensAPI.isAuthenticated()) {
           window.SOCLensAPI
             .apiFetch("/api/workspace/layout", {

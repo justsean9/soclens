@@ -407,6 +407,7 @@ _QUOTED_ASSIGNMENT_START_RE = re.compile(
 _VENDOR_PREFIX_RE = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{10,}+|AIza[A-Za-z0-9_-]{20,}+|gh[pousr]_[A-Za-z0-9]{10,}+|"
     r"github_pat_[A-Za-z0-9_]{10,}+|"
+    r"(?-i:glpat-[A-Za-z0-9_-]{16,}+)|"
     r"AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{10,}+)\b"
 )
 _VAULT_URI_RE = re.compile(r"vault://[^\s\"'<>]+", re.IGNORECASE)

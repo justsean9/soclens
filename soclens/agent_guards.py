@@ -316,7 +316,8 @@ class PromptAndSecretGuard:
         """Apply SOCLens secret redaction (preserving env-var placeholders) plus token scrubbing."""
         if not text:
             return ""
-        redacted = str(redact_sensitive_data(text, preserve_env_var_refs=True))
+        folded = unicodedata.normalize("NFKC", str(text))
+        redacted = str(redact_sensitive_data(folded, preserve_env_var_refs=True))
         redacted = _GLPAT_SCRUB_RE.sub("<REDACTED>", redacted)
         return redacted
 

@@ -53,23 +53,16 @@ def _entry_to_dict(entry: Any) -> dict[str, Any]:
 async def ai_chat_stream_endpoint(request: Request) -> Any:
     runtime: WebRuntimeState = request.app.state.runtime
 
-    if request.method.upper() == "GET":
-        qp = request.query_params
-        body: dict[str, Any] = {
-            "prompt": qp.get("prompt", ""),
-            "session_id": qp.get("session_id", "chat-1"),
-            "mode": qp.get("mode", "full_investigation"),
-            "provider": qp.get("provider") or None,
-            "model": qp.get("model") or None,
-            "attached_context": qp.get("attached_context") or None,
-            "attached_title": qp.get("attached_title") or None,
-            "template": qp.get("template") or None,
-        }
-    else:
-        try:
-            body = await _parse_json_body(request)
-        except ValueError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    if request.method.upper() != "POST":
+        return JSONResponse(
+            {"ok": False, "error": "Method not allowed; use POST with X-SOCLens-Token."},
+            status_code=405,
+        )
+
+    try:
+        body = await _parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     user_prompt = str(body.get("prompt") or body.get("user_prompt") or "").strip()
     attached_context = str(body.get("attached_context") or "").strip() or None
@@ -710,7 +703,7 @@ async def knowledge_reload_base_endpoint(request: Request) -> JSONResponse:
 
 
 AI_ROUTES: list[Route] = [
-    Route("/api/ai/chat/stream", ai_chat_stream_endpoint, methods=["GET", "POST"]),
+    Route("/api/ai/chat/stream", ai_chat_stream_endpoint, methods=["POST"]),
     Route("/api/ai/investigate", ai_investigate_endpoint, methods=["POST"]),
     Route("/api/ai/panels", ai_panels_endpoint, methods=["GET"]),
     Route("/api/events/panels", ai_panels_endpoint, methods=["GET"]),

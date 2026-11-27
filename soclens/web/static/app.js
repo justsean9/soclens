@@ -284,12 +284,13 @@
       }
 
       const rootEl = document.getElementById("sl-workspace-root");
-      tilingManager = new Tiling.BSPTilingManager(rootEl, tileRegistry, {
-        onStateChanged: syncWorkspaceButtons,
-      });
-
       const params = new URLSearchParams(window.location.search);
       const tearoffTile = params.get("tearoff") ? params.get("tile") : "";
+      tilingManager = new Tiling.BSPTilingManager(rootEl, tileRegistry, {
+        onStateChanged: syncWorkspaceButtons,
+        persistEnabled: !tearoffTile,
+      });
+
       if (tearoffTile && tileRegistry.has(tearoffTile)) {
         tilingManager.workspaces["1"] = {
           type: "leaf",

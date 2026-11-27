@@ -99,6 +99,7 @@ _PILLAR_ENV_PREFIXES: tuple[str, ...] = (
 _PILLAR_ENV_KEYS: frozenset[str] = frozenset(
     {
         "DATABASE_URL",
+        "SOCLENS_AI_MAX_TOOL_STEPS",
         "SOCLENS_WORKSTATION_ID",
         "SOCLENS_PROFILE",
         "SOCLENS_ANALYST_ID",

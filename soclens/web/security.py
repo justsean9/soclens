@@ -27,7 +27,7 @@ SESSION_COOKIE_NAME = "soclens_session"
 CSRF_HEADER_NAME = "x-soclens-token"
 AUTH_EXCHANGE_PATH = "/api/auth/exchange"
 STATE_CHANGING_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-ALLOWED_SEC_FETCH_SITES: frozenset[str] = frozenset({"same-origin", "same-site", "none"})
+ALLOWED_SEC_FETCH_SITES: frozenset[str] = frozenset({"same-origin", "none"})
 ALLOWED_LOCAL_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _EXPLICIT_WEB_SECRET_KEYS: frozenset[str] = frozenset(

@@ -12,11 +12,13 @@ before persistence.
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import hashlib
 import json
 import logging
 import os
+import random
 import re
 import socket
 import ssl
@@ -28,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import quote, quote_plus
 
 from sqlalchemy import (
@@ -43,6 +45,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    bindparam,
     create_engine,
     delete,
     event,
@@ -53,13 +56,14 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import URL, CursorResult, Engine, RowMapping, make_url
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from soclens.agent_audit import VALID_AUDIT_EVENT_TYPES, AuditEntry, redact_sensitive_data
 from soclens.config import get_workspace_dir
 
 _PyList = list
+_T = TypeVar("_T")
 
 logger = logging.getLogger("soclens.storage")
 
@@ -350,6 +354,10 @@ def _escape_like_pattern(value: str, escape_char: str = "|") -> str:
 
 
 def _parse_timestamp_epoch(raw: Any, *, fallback: float) -> float:
+    if isinstance(raw, datetime):
+        dt = raw if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
+        ts_val = dt.timestamp()
+        return ts_val if ts_val > 0 else fallback
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         val = float(raw)
         if val > 1e12:
@@ -470,7 +478,7 @@ def _dedupe_iocs(pairs: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
 class DatabaseConfig:
     """Multi-dialect database configuration (credentials masked in ``repr``)."""
 
-    backend: str = "sqlite"
+    backend: str = ""
     sqlite_path: Path | str | None = None
     dsn: str | None = None
     host: str = ""
@@ -492,14 +500,28 @@ class DatabaseConfig:
     analyst_id: str = ""
 
     def __post_init__(self) -> None:
-        raw_backend = str(self.backend or "sqlite").strip().lower()
-        normalized_backend = _BACKEND_ALIASES.get(raw_backend)
-        if normalized_backend is None:
-            raise ValueError(
-                f"Unsupported database backend {raw_backend!r}. "
-                "Expected sqlite, postgres, mysql, or custom."
-            )
-        self.backend = normalized_backend
+        raw_backend_in = str(self.backend or "").strip().lower()
+        raw_dsn = str(self.dsn).strip() if self.dsn is not None else ""
+        if raw_backend_in:
+            normalized_backend = _BACKEND_ALIASES.get(raw_backend_in)
+            if normalized_backend is None:
+                raise ValueError(
+                    f"Unsupported database backend {raw_backend_in!r}. "
+                    "Expected sqlite, postgres, mysql, or custom."
+                )
+            self.backend = normalized_backend
+        elif raw_dsn:
+            low_dsn = raw_dsn.lower()
+            if low_dsn.startswith(("postgresql", "postgres")):
+                self.backend = "postgres"
+            elif low_dsn.startswith(("mysql", "mariadb")):
+                self.backend = "mysql"
+            elif low_dsn.startswith("sqlite"):
+                self.backend = "sqlite"
+            else:
+                self.backend = "custom"
+        else:
+            self.backend = "sqlite"
 
         if self.sqlite_path is None or not str(self.sqlite_path).strip():
             resolved_sqlite = get_workspace_dir() / ".soclens_cache" / "soclens.db"
@@ -551,13 +573,31 @@ class DatabaseConfig:
             or _safe_getuser()
         )
 
-        raw_dsn = str(self.dsn).strip() if self.dsn is not None else ""
         if self.backend == "custom":
             if not raw_dsn:
                 raise ValueError("Custom database backend requires a non-empty SQLAlchemy DSN.")
             self.dsn = raw_dsn
         elif raw_dsn:
             self.dsn = self._normalize_driver_dsn(raw_dsn)
+            if raw_backend_in:
+                try:
+                    dsn_backend = make_url(self.dsn).get_backend_name().strip().lower()
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid database DSN: {_sanitize_db_error(exc, self)}"
+                    ) from exc
+                if dsn_backend in {"postgresql", "postgres"}:
+                    dsn_dialect = "postgres"
+                elif dsn_backend in {"mysql", "mariadb"}:
+                    dsn_dialect = "mysql"
+                elif dsn_backend == "sqlite":
+                    dsn_dialect = "sqlite"
+                else:
+                    dsn_dialect = dsn_backend
+                if dsn_dialect != self.backend:
+                    raise ValueError(
+                        f"Database backend {self.backend!r} conflicts with DSN dialect {dsn_dialect!r}."
+                    )
         elif self.backend == "sqlite":
             if str(self.sqlite_path) == ":memory:":
                 self.dsn = "sqlite:///:memory:"
@@ -706,8 +746,17 @@ def _build_engine_for_config(cfg: DatabaseConfig) -> tuple[Engine, str]:
         def _configure_sqlite_pragmas(dbapi_conn: Any, _conn_record: Any) -> None:
             cursor = dbapi_conn.cursor()
             try:
-                cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA busy_timeout=5000")
+                for attempt in range(6):
+                    try:
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                        break
+                    except Exception as exc:
+                        msg = str(exc).lower()
+                        if ("locked" in msg or "busy" in msg) and attempt < 5:
+                            time.sleep(0.015 * (attempt + 1))
+                            continue
+                        raise
                 cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute("PRAGMA foreign_keys=ON")
             finally:
@@ -834,6 +883,54 @@ class _TestConnectionDescriptor:
 # ---------------------------------------------------------------------------
 
 
+_SQLITE_LOCKS_GUARD = threading.Lock()
+_SQLITE_FILE_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _get_sqlite_file_lock(dsn: str | None) -> threading.RLock | None:
+    """Return a process-wide reentrant lock for file-backed SQLite databases."""
+    if not dsn:
+        return None
+    low = dsn.lower()
+    if ":memory:" in low or "mode=memory" in low:
+        return None
+    try:
+        url_obj = make_url(dsn)
+        if url_obj.get_backend_name().lower() != "sqlite":
+            return None
+        db_name = (url_obj.database or "").strip()
+        if not db_name or db_name == ":memory:":
+            return None
+        key = str(Path(db_name).expanduser().resolve())
+    except Exception:
+        return None
+    with _SQLITE_LOCKS_GUARD:
+        lock = _SQLITE_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _SQLITE_FILE_LOCKS[key] = lock
+        return lock
+
+
+def _is_retryable_sqlite_exc(exc: BaseException) -> bool:
+    if not isinstance(exc, (OperationalError, IntegrityError)):
+        return False
+    msg = str(exc).lower()
+    if isinstance(exc, OperationalError):
+        return any(
+            tok in msg
+            for tok in (
+                "database is locked",
+                "database table is locked",
+                "table is locked",
+                "locked",
+                "busy",
+                "already exists",
+            )
+        )
+    return "unique constraint failed" in msg or "constraint failed" in msg
+
+
 class StorageManager:
     """Unified multi-dialect persistence manager for SOCLens."""
 
@@ -894,84 +991,144 @@ class StorageManager:
             if dsn_changed and self._engine is not None:
                 self.dispose()
 
+    def _sqlite_path_lock(self) -> contextlib.AbstractContextManager[Any]:
+        if self._dialect != "sqlite":
+            return contextlib.nullcontext()
+        lock = _get_sqlite_file_lock(self._config.dsn)
+        return lock if lock is not None else contextlib.nullcontext()
+
     @contextmanager
-    def session(self) -> Iterator[Session]:
+    def session(self, *, immediate: bool = False) -> Iterator[Session]:
         """Yield a transactional SQLAlchemy ``Session`` (commits on exit, rolls back on error)."""
         engine = self.get_engine()
         with self._lock:
             factory = self._session_factory
         assert factory is not None
-        sess = factory()
-        committed = False
-        try:
-            yield sess
-            sess.commit()
-            committed = True
-        except Exception:
-            sess.rollback()
-            raise
-        finally:
-            sess.close()
-        if committed and engine.dialect.name == "sqlite":
+        is_sqlite = engine.dialect.name == "sqlite"
+        path_ctx = self._sqlite_path_lock() if (immediate and is_sqlite) else contextlib.nullcontext()
+        with path_ctx:
+            sess = factory()
+            committed = False
             try:
-                with engine.connect() as ckpt_conn:
-                    ckpt_conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)")
-            except SQLAlchemyError:
-                pass
+                if immediate and is_sqlite:
+                    sess.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                yield sess
+                sess.commit()
+                committed = True
+            except Exception:
+                sess.rollback()
+                raise
+            finally:
+                sess.close()
+            if committed and is_sqlite:
+                try:
+                    with engine.connect() as ckpt_conn:
+                        ckpt_conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)")
+                except SQLAlchemyError:
+                    pass
+
+    def _run_write_tx(self, fn: Callable[[Session], _T]) -> _T:
+        """Execute a serialized write transaction (using ``BEGIN IMMEDIATE`` + retry on SQLite)."""
+        is_sqlite = self._dialect == "sqlite"
+        max_attempts = 6 if is_sqlite else 1
+        with self._sqlite_path_lock():
+            with self._lock:
+                for attempt in range(max_attempts):
+                    try:
+                        with self.session(immediate=is_sqlite) as sess:
+                            return fn(sess)
+                    except (OperationalError, IntegrityError) as exc:
+                        if is_sqlite and _is_retryable_sqlite_exc(exc) and attempt < max_attempts - 1:
+                            time.sleep(0.01 * (attempt + 1) + random.uniform(0.0, 0.015))
+                            continue
+                        raise
+        raise RuntimeError("Unreachable write transaction loop exit")
 
     def ensure_schema(self) -> None:
         """Idempotently create core tables, dialect FTS/FULLTEXT indexes, and migration row."""
-        with self._lock:
-            engine = self.get_engine()
-            METADATA.create_all(engine)
-            with engine.begin() as conn:
+        with self._sqlite_path_lock():
+            with self._lock:
+                engine = self.get_engine()
                 if self._dialect == "sqlite":
-                    conn.execute(
-                        text(
-                            "CREATE VIRTUAL TABLE IF NOT EXISTS alerts_history_fts USING fts5("
-                            "alert_row_id UNINDEXED, "
-                            "source UNINDEXED, "
-                            "alert_id UNINDEXED, "
-                            "title, "
-                            "search_text)"
-                        )
-                    )
-                    conn.execute(
-                        text(
-                            "CREATE VIRTUAL TABLE IF NOT EXISTS soc_learnings_fts USING fts5("
-                            "learning_id UNINDEXED, "
-                            "title, "
-                            "content, "
-                            "tags_text)"
-                        )
-                    )
-                elif self._dialect == "mysql":
-                    for ddl in (
-                        "CREATE FULLTEXT INDEX idx_alerts_history_ft ON alerts_history (title, search_text)",
-                        "CREATE FULLTEXT INDEX idx_soc_learnings_ft ON soc_learnings (title, content)",
-                    ):
+                    max_attempts = 6
+                    for attempt in range(max_attempts):
                         try:
-                            conn.execute(text(ddl))
-                        except SQLAlchemyError:
-                            pass
+                            with engine.connect() as conn:
+                                conn.exec_driver_sql("BEGIN IMMEDIATE")
+                                try:
+                                    METADATA.create_all(conn)
+                                    conn.execute(
+                                        text(
+                                            "CREATE VIRTUAL TABLE IF NOT EXISTS alerts_history_fts USING fts5("
+                                            "alert_row_id UNINDEXED, "
+                                            "source UNINDEXED, "
+                                            "alert_id UNINDEXED, "
+                                            "title, "
+                                            "search_text)"
+                                        )
+                                    )
+                                    conn.execute(
+                                        text(
+                                            "CREATE VIRTUAL TABLE IF NOT EXISTS soc_learnings_fts USING fts5("
+                                            "learning_id UNINDEXED, "
+                                            "title, "
+                                            "content, "
+                                            "tags_text)"
+                                        )
+                                    )
+                                    existing_ver = conn.execute(
+                                        select(schema_migrations_table.c.version).where(
+                                            schema_migrations_table.c.version == SCHEMA_VERSION
+                                        )
+                                    ).first()
+                                    if existing_ver is None:
+                                        conn.execute(
+                                            insert(schema_migrations_table).values(
+                                                version=SCHEMA_VERSION,
+                                                name="initial_schema_v1",
+                                                applied_at=time.time(),
+                                            )
+                                        )
+                                    conn.commit()
+                                except Exception:
+                                    conn.rollback()
+                                    raise
+                            break
+                        except (OperationalError, IntegrityError) as exc:
+                            if _is_retryable_sqlite_exc(exc) and attempt < max_attempts - 1:
+                                time.sleep(0.01 * (attempt + 1) + random.uniform(0.0, 0.015))
+                                continue
+                            raise
+                else:
+                    METADATA.create_all(engine)
+                    with engine.begin() as conn:
+                        if self._dialect == "mysql":
+                            for ddl in (
+                                "CREATE FULLTEXT INDEX idx_alerts_history_ft ON alerts_history (title, search_text)",
+                                "CREATE FULLTEXT INDEX idx_soc_learnings_ft ON soc_learnings (title, content)",
+                            ):
+                                try:
+                                    conn.execute(text(ddl))
+                                except SQLAlchemyError:
+                                    pass
 
-                existing_ver = conn.execute(
-                    select(schema_migrations_table.c.version).where(
-                        schema_migrations_table.c.version == SCHEMA_VERSION
-                    )
-                ).first()
-                if existing_ver is None:
-                    try:
-                        conn.execute(
-                            insert(schema_migrations_table).values(
-                                version=SCHEMA_VERSION,
-                                name="initial_schema_v1",
-                                applied_at=time.time(),
+                        existing_ver = conn.execute(
+                            select(schema_migrations_table.c.version).where(
+                                schema_migrations_table.c.version == SCHEMA_VERSION
                             )
-                        )
-                    except SQLAlchemyError:
-                        pass
-            self._schema_initialized = True
+                        ).first()
+                        if existing_ver is None:
+                            try:
+                                conn.execute(
+                                    insert(schema_migrations_table).values(
+                                        version=SCHEMA_VERSION,
+                                        name="initial_schema_v1",
+                                        applied_at=time.time(),
+                                    )
+                                )
+                            except SQLAlchemyError:
+                                pass
+                self._schema_initialized = True
 
     def _ensure_ready(self) -> None:
         if not self._schema_initialized:
@@ -1082,83 +1239,66 @@ class StorageManager:
         items_json = _json_dumps_safe(redacted_items)
         meta_json = _json_dumps_safe(redacted_meta)
 
-        extracted_iocs: list[tuple[str, str, str]] = []
-        with self._lock:
-            with self.session() as sess:
-                existing_snap = sess.execute(
-                    text("SELECT source, fetched_at FROM alert_snapshots WHERE source = :src"),
-                    {"src": clean_src},
-                ).first()
-                is_same_fetched_at = (
-                    existing_snap is not None
-                    and existing_snap[1] is not None
-                    and abs(float(existing_snap[1]) - ts) < 1e-6
+        def _tx(sess: Session) -> None:
+            extracted_iocs: list[tuple[str, str, str]] = []
+            existing_snap = sess.execute(
+                text("SELECT source, fetched_at FROM alert_snapshots WHERE source = :src"),
+                {"src": clean_src},
+            ).first()
+            snap_prev_ts = (
+                _parse_timestamp_epoch(existing_snap[1], fallback=-1.0)
+                if existing_snap is not None and existing_snap[1] is not None
+                else -1.0
+            )
+            is_same_fetched_at = snap_prev_ts > 0 and abs(snap_prev_ts - ts) < 1e-6
+            if existing_snap is None:
+                sess.execute(
+                    insert(alert_snapshots_table).values(
+                        source=clean_src,
+                        timeframe=str(timeframe or "last_24h"),
+                        fetched_at=ts,
+                        meta_json=meta_json,
+                        items_json=items_json,
+                        updated_at=now,
+                    )
                 )
-                if existing_snap is None:
-                    sess.execute(
-                        insert(alert_snapshots_table).values(
-                            source=clean_src,
-                            timeframe=str(timeframe or "last_24h"),
-                            fetched_at=ts,
-                            meta_json=meta_json,
-                            items_json=items_json,
-                            updated_at=now,
+            else:
+                sess.execute(
+                    update(alert_snapshots_table)
+                    .where(alert_snapshots_table.c.source == clean_src)
+                    .values(
+                        timeframe=str(timeframe or "last_24h"),
+                        fetched_at=ts,
+                        meta_json=meta_json,
+                        items_json=items_json,
+                        updated_at=now,
+                    )
+                )
+
+            for idx, item in enumerate(redacted_items):
+                alert_id = self._extract_alert_id(item, idx)
+                title = self._extract_alert_title(item)
+                severity = self._extract_alert_severity(item)
+                status = self._extract_alert_status(item)
+                occurred_at = self._extract_alert_occurred_at(item, fetched_at=ts)
+                payload_json = _json_dumps_safe(item)
+                search_text = " ".join(_flatten_search_strings(item))
+
+                existing_row = sess.execute(
+                    select(alerts_history_table.c.id).where(
+                        and_(
+                            alerts_history_table.c.source == clean_src,
+                            alerts_history_table.c.alert_id == alert_id,
                         )
                     )
-                else:
-                    sess.execute(
-                        update(alert_snapshots_table)
-                        .where(alert_snapshots_table.c.source == clean_src)
-                        .values(
-                            timeframe=str(timeframe or "last_24h"),
-                            fetched_at=ts,
-                            meta_json=meta_json,
-                            items_json=items_json,
-                            updated_at=now,
-                        )
-                    )
-
-                for idx, item in enumerate(redacted_items):
-                    alert_id = self._extract_alert_id(item, idx)
-                    title = self._extract_alert_title(item)
-                    severity = self._extract_alert_severity(item)
-                    status = self._extract_alert_status(item)
-                    occurred_at = self._extract_alert_occurred_at(item, fetched_at=ts)
-                    payload_json = _json_dumps_safe(item)
-                    search_text = " ".join(_flatten_search_strings(item))
-
-                    existing_row = sess.execute(
-                        select(alerts_history_table.c.id).where(
-                            and_(
-                                alerts_history_table.c.source == clean_src,
-                                alerts_history_table.c.alert_id == alert_id,
-                            )
-                        )
-                    ).first()
-                    if existing_row is None:
-                        res = cast(
-                            CursorResult[Any],
-                            sess.execute(
-                                insert(alerts_history_table).values(
-                                    source=clean_src,
-                                    alert_id=alert_id,
-                                    title=title,
-                                    severity=severity,
-                                    status=status,
-                                    occurred_at=occurred_at,
-                                    fetched_at=ts,
-                                    payload_json=payload_json,
-                                    search_text=search_text,
-                                )
-                            ),
-                        )
-                        row_id = int(res.inserted_primary_key[0]) if res.inserted_primary_key else 0
-                    else:
-                        row_id = int(existing_row[0])
+                ).first()
+                if existing_row is None:
+                    res = cast(
+                        CursorResult[Any],
                         sess.execute(
-                            update(alerts_history_table)
-                            .where(alerts_history_table.c.id == row_id)
-                            .values(
+                            insert(alerts_history_table).values(
+                                source=clean_src,
+                                alert_id=alert_id,
                                 title=title,
                                 severity=severity,
                                 status=status,
@@ -1167,142 +1307,151 @@ class StorageManager:
                                 payload_json=payload_json,
                                 search_text=search_text,
                             )
-                        )
-
-                    if self._dialect == "sqlite" and row_id:
-                        sess.execute(
-                            text("DELETE FROM alerts_history_fts WHERE alert_row_id = :rid"),
-                            {"rid": row_id},
-                        )
-                        sess.execute(
-                            text(
-                                "INSERT INTO alerts_history_fts "
-                                "(alert_row_id, source, alert_id, title, search_text) "
-                                "VALUES (:rid, :src, :aid, :title, :stext)"
-                            ),
-                            {
-                                "rid": row_id,
-                                "src": clean_src,
-                                "aid": alert_id,
-                                "title": title,
-                                "stext": search_text,
-                            },
-                        )
-
-                    ev_key = f"{clean_src}::{alert_id}"
-                    for ind_raw, ind_type in _dedupe_iocs(_extract_iocs_from_value(item)):
-                        extracted_iocs.append((ind_raw, ind_type, ev_key))
-
-                if extracted_iocs:
-                    deduped_iocs: list[tuple[str, str, str, str]] = []
-                    seen_ioc_keys: set[tuple[str, str]] = set()
-                    for ind_raw, ind_type, ev_key in extracted_iocs:
-                        raw_ind = str(ind_raw or "").strip()
-                        norm_ind = raw_ind.lower()
-                        if not norm_ind:
-                            continue
-                        dedup_key = (norm_ind, ev_key)
-                        if dedup_key in seen_ioc_keys:
-                            continue
-                        seen_ioc_keys.add(dedup_key)
-                        clean_type = str(ind_type or "").strip().lower() or "ioc"
-                        deduped_iocs.append((norm_ind, raw_ind, clean_type, ev_key))
-
-                    norm_inds = sorted({entry[0] for entry in deduped_iocs})
-                    existing_by_key: dict[tuple[str, str], RowMapping] = {}
-                    ioc_cols = (
-                        (
-                            ioc_sightings_table.c.id,
-                            ioc_sightings_table.c.indicator_norm,
-                            ioc_sightings_table.c.event_key,
-                            ioc_sightings_table.c.sighting_count,
-                        )
-                        if self._dialect == "postgres"
-                        else (
-                            ioc_sightings_table.c.id,
-                            ioc_sightings_table.c.indicator_norm,
-                            ioc_sightings_table.c.event_key,
-                            ioc_sightings_table.c.sighting_count,
-                            ioc_sightings_table.c.first_seen_at,
-                            ioc_sightings_table.c.last_seen_at,
+                        ),
+                    )
+                    row_id = int(res.inserted_primary_key[0]) if res.inserted_primary_key else 0
+                else:
+                    row_id = int(existing_row[0])
+                    sess.execute(
+                        update(alerts_history_table)
+                        .where(alerts_history_table.c.id == row_id)
+                        .values(
+                            title=title,
+                            severity=severity,
+                            status=status,
+                            occurred_at=occurred_at,
+                            fetched_at=ts,
+                            payload_json=payload_json,
+                            search_text=search_text,
                         )
                     )
-                    for chunk_start in range(0, len(norm_inds), 400):
-                        chunk = norm_inds[chunk_start : chunk_start + 400]
-                        existing_rows = sess.execute(
-                            select(*ioc_cols).where(
-                                and_(
-                                    ioc_sightings_table.c.source == clean_src,
-                                    ioc_sightings_table.c.indicator_norm.in_(chunk),
-                                )
-                            )
-                        ).mappings().all()
-                        for r in existing_rows:
-                            existing_by_key[(str(r["indicator_norm"]), str(r["event_key"]))] = r
 
-                    to_insert: list[dict[str, Any]] = []
-                    for norm_ind, raw_ind, clean_type, ev_key in deduped_iocs:
-                        existing_ioc = existing_by_key.get((norm_ind, ev_key))
-                        if existing_ioc is None:
-                            to_insert.append(
-                                {
-                                    "indicator_norm": norm_ind,
-                                    "indicator_raw": raw_ind,
-                                    "indicator_type": clean_type,
-                                    "source": clean_src,
-                                    "event_key": ev_key,
-                                    "sighting_count": 1,
-                                    "first_seen_at": ts,
-                                    "last_seen_at": ts,
-                                    "context_json": "{}",
-                                }
-                            )
-                        else:
-                            raw_prev_last = existing_ioc.get("last_seen_at")
-                            prev_last = float(raw_prev_last) if raw_prev_last is not None else ts
-                            if (
-                                is_same_fetched_at
-                                and raw_prev_last is not None
-                                and abs(prev_last - ts) < 1e-6
-                            ):
-                                continue
-                            new_count = int(existing_ioc["sighting_count"] or 0) + 1
-                            raw_first = existing_ioc.get("first_seen_at")
-                            first_seen = (
-                                min(float(raw_first), ts) if raw_first is not None else ts
-                            )
-                            last_seen = max(prev_last, ts)
-                            update_vals: dict[str, Any] = {
+                if self._dialect == "sqlite" and row_id:
+                    sess.execute(
+                        text("DELETE FROM alerts_history_fts WHERE alert_row_id = :rid"),
+                        {"rid": row_id},
+                    )
+                    sess.execute(
+                        text(
+                            "INSERT INTO alerts_history_fts "
+                            "(alert_row_id, source, alert_id, title, search_text) "
+                            "VALUES (:rid, :src, :aid, :title, :stext)"
+                        ),
+                        {
+                            "rid": row_id,
+                            "src": clean_src,
+                            "aid": alert_id,
+                            "title": title,
+                            "stext": search_text,
+                        },
+                    )
+
+                ev_key = f"{clean_src}::{alert_id}"
+                for ind_raw, ind_type in _dedupe_iocs(_extract_iocs_from_value(item)):
+                    extracted_iocs.append((ind_raw, ind_type, ev_key))
+
+            if extracted_iocs:
+                deduped_iocs: list[tuple[str, str, str, str]] = []
+                seen_ioc_keys: set[tuple[str, str]] = set()
+                for ind_raw, ind_type, ev_key in extracted_iocs:
+                    raw_ind = str(ind_raw or "").strip()
+                    norm_ind = raw_ind.lower()
+                    if not norm_ind:
+                        continue
+                    dedup_key = (norm_ind, ev_key)
+                    if dedup_key in seen_ioc_keys:
+                        continue
+                    seen_ioc_keys.add(dedup_key)
+                    clean_type = str(ind_type or "").strip().lower() or "ioc"
+                    deduped_iocs.append((norm_ind, raw_ind, clean_type, ev_key))
+
+                norm_inds = sorted({entry[0] for entry in deduped_iocs})
+                existing_by_key: dict[tuple[str, str], RowMapping] = {}
+                ioc_select_stmt = text(
+                    "SELECT id, indicator_norm, event_key, sighting_count, first_seen_at, last_seen_at "
+                    "FROM ioc_sightings WHERE source = :src AND indicator_norm IN :inds"
+                ).bindparams(bindparam("inds", expanding=True))
+                for chunk_start in range(0, len(norm_inds), 400):
+                    chunk = norm_inds[chunk_start : chunk_start + 400]
+                    existing_rows = sess.execute(
+                        ioc_select_stmt,
+                        {"src": clean_src, "inds": chunk},
+                    ).mappings().all()
+                    for r in existing_rows:
+                        existing_by_key[(str(r["indicator_norm"]), str(r["event_key"]))] = r
+
+                to_insert: list[dict[str, Any]] = []
+                for norm_ind, raw_ind, clean_type, ev_key in deduped_iocs:
+                    existing_ioc = existing_by_key.get((norm_ind, ev_key))
+                    if existing_ioc is None:
+                        to_insert.append(
+                            {
+                                "indicator_norm": norm_ind,
                                 "indicator_raw": raw_ind,
                                 "indicator_type": clean_type,
-                                "sighting_count": new_count,
-                                "last_seen_at": last_seen,
+                                "source": clean_src,
+                                "event_key": ev_key,
+                                "sighting_count": 1,
+                                "first_seen_at": ts,
+                                "last_seen_at": ts,
+                                "context_json": "{}",
                             }
-                            if raw_first is not None:
-                                update_vals["first_seen_at"] = first_seen
-                            sess.execute(
-                                update(ioc_sightings_table)
-                                .where(ioc_sightings_table.c.id == existing_ioc["id"])
-                                .values(**update_vals)
-                            )
-                    if to_insert:
-                        sess.execute(insert(ioc_sightings_table), to_insert)
+                        )
+                    else:
+                        raw_prev_last = existing_ioc.get("last_seen_at")
+                        prev_last = (
+                            _parse_timestamp_epoch(raw_prev_last, fallback=ts)
+                            if raw_prev_last is not None
+                            else ts
+                        )
+                        if (
+                            is_same_fetched_at
+                            and raw_prev_last is not None
+                            and abs(prev_last - ts) < 1e-6
+                        ):
+                            continue
+                        new_count = int(existing_ioc["sighting_count"] or 0) + 1
+                        raw_first = existing_ioc.get("first_seen_at")
+                        first_seen = (
+                            min(_parse_timestamp_epoch(raw_first, fallback=ts), ts)
+                            if raw_first is not None
+                            else ts
+                        )
+                        last_seen = max(prev_last, ts)
+                        update_vals: dict[str, Any] = {
+                            "indicator_raw": raw_ind,
+                            "indicator_type": clean_type,
+                            "sighting_count": new_count,
+                            "last_seen_at": last_seen,
+                        }
+                        if raw_first is not None:
+                            update_vals["first_seen_at"] = first_seen
+                        sess.execute(
+                            update(ioc_sightings_table)
+                            .where(ioc_sightings_table.c.id == existing_ioc["id"])
+                            .values(**update_vals)
+                        )
+                if to_insert:
+                    sess.execute(insert(ioc_sightings_table), to_insert)
+
+        self._run_write_tx(_tx)
 
         return len(redacted_items)
 
     def delete_alerts_snapshot(self, source: str | None = None) -> None:
         """Delete cached snapshot rows for ``source`` or all sources (history remains)."""
         self._ensure_ready()
-        with self._lock:
-            with self.session() as sess:
-                if source is None:
-                    sess.execute(delete(alert_snapshots_table))
-                else:
-                    sess.execute(
-                        delete(alert_snapshots_table).where(
-                            alert_snapshots_table.c.source == str(source).strip()
-                        )
+        def _tx(sess: Session) -> None:
+            if source is None:
+                sess.execute(delete(alert_snapshots_table))
+            else:
+                sess.execute(
+                    delete(alert_snapshots_table).where(
+                        alert_snapshots_table.c.source == str(source).strip()
                     )
+                )
+
+        self._run_write_tx(_tx)
 
     @staticmethod
     def _row_to_alert_result(row: Mapping[Any, Any]) -> dict[str, Any]:
@@ -1477,50 +1626,49 @@ class StorageManager:
         )
         ctx_json = _json_dumps_safe(redacted_ctx)
 
-        with self._lock:
-            with self.session() as sess:
-                existing = sess.execute(
-                    select(ioc_sightings_table).where(
-                        and_(
-                            ioc_sightings_table.c.indicator_norm == norm_ind,
-                            ioc_sightings_table.c.source == clean_src,
-                            ioc_sightings_table.c.event_key == clean_ev,
-                        )
+        def _tx(sess: Session) -> tuple[int, float, float]:
+            existing = sess.execute(
+                select(ioc_sightings_table).where(
+                    and_(
+                        ioc_sightings_table.c.indicator_norm == norm_ind,
+                        ioc_sightings_table.c.source == clean_src,
+                        ioc_sightings_table.c.event_key == clean_ev,
                     )
-                ).mappings().first()
-                if existing is None:
-                    sess.execute(
-                        insert(ioc_sightings_table).values(
-                            indicator_norm=norm_ind,
-                            indicator_raw=raw_ind,
-                            indicator_type=clean_type,
-                            source=clean_src,
-                            event_key=clean_ev,
-                            sighting_count=1,
-                            first_seen_at=ts,
-                            last_seen_at=ts,
-                            context_json=ctx_json,
-                        )
+                )
+            ).mappings().first()
+            if existing is None:
+                sess.execute(
+                    insert(ioc_sightings_table).values(
+                        indicator_norm=norm_ind,
+                        indicator_raw=raw_ind,
+                        indicator_type=clean_type,
+                        source=clean_src,
+                        event_key=clean_ev,
+                        sighting_count=1,
+                        first_seen_at=ts,
+                        last_seen_at=ts,
+                        context_json=ctx_json,
                     )
-                    count = 1
-                    first_seen = ts
-                    last_seen = ts
-                else:
-                    count = int(existing["sighting_count"] or 0) + 1
-                    first_seen = min(float(existing["first_seen_at"]), ts)
-                    last_seen = max(float(existing["last_seen_at"]), ts)
-                    sess.execute(
-                        update(ioc_sightings_table)
-                        .where(ioc_sightings_table.c.id == existing["id"])
-                        .values(
-                            indicator_raw=raw_ind,
-                            indicator_type=clean_type,
-                            sighting_count=count,
-                            first_seen_at=first_seen,
-                            last_seen_at=last_seen,
-                            context_json=ctx_json if redacted_ctx else existing["context_json"],
-                        )
-                    )
+                )
+                return 1, ts, ts
+            next_count = int(existing["sighting_count"] or 0) + 1
+            f_seen = min(_parse_timestamp_epoch(existing["first_seen_at"], fallback=ts), ts)
+            l_seen = max(_parse_timestamp_epoch(existing["last_seen_at"], fallback=ts), ts)
+            sess.execute(
+                update(ioc_sightings_table)
+                .where(ioc_sightings_table.c.id == existing["id"])
+                .values(
+                    indicator_raw=raw_ind,
+                    indicator_type=clean_type,
+                    sighting_count=next_count,
+                    first_seen_at=f_seen,
+                    last_seen_at=l_seen,
+                    context_json=ctx_json if redacted_ctx else existing["context_json"],
+                )
+            )
+            return next_count, f_seen, l_seen
+
+        count, first_seen, last_seen = self._run_write_tx(_tx)
         return {
             "indicator": raw_ind,
             "indicator_norm": norm_ind,
@@ -1604,35 +1752,35 @@ class StorageManager:
         meta = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
         meta.pop("images", None)
 
-        with self._lock:
-            with self.session() as sess:
-                existing = sess.execute(
-                    select(unique_events_table.c.event_key).where(
-                        unique_events_table.c.event_key == ev_key
-                    )
-                ).first()
-                values = {
-                    "source_kind": str(clean.get("source_kind") or "")[:64],
-                    "native_id": str(clean.get("native_id") or "")[:256],
-                    "scope": str(clean.get("scope") or "default")[:128],
-                    "title": str(clean.get("title") or ""),
-                    "severity": str(clean.get("severity") or "")[:64],
-                    "status": str(clean.get("status") or "")[:64],
-                    "event_timestamp": str(clean.get("timestamp") or "")[:64],
-                    "summary": str(clean.get("summary") or ""),
-                    "metadata_json": _json_dumps_safe(meta),
-                    "updated_at": now,
-                }
-                if existing is None:
-                    sess.execute(insert(unique_events_table).values(event_key=ev_key, **values))
-                    is_new = True
-                else:
-                    sess.execute(
-                        update(unique_events_table)
-                        .where(unique_events_table.c.event_key == ev_key)
-                        .values(**values)
-                    )
-                    is_new = False
+        def _tx(sess: Session) -> bool:
+            existing = sess.execute(
+                select(unique_events_table.c.event_key).where(
+                    unique_events_table.c.event_key == ev_key
+                )
+            ).first()
+            values = {
+                "source_kind": str(clean.get("source_kind") or "")[:64],
+                "native_id": str(clean.get("native_id") or "")[:256],
+                "scope": str(clean.get("scope") or "default")[:128],
+                "title": str(clean.get("title") or ""),
+                "severity": str(clean.get("severity") or "")[:64],
+                "status": str(clean.get("status") or "")[:64],
+                "event_timestamp": str(clean.get("timestamp") or "")[:64],
+                "summary": str(clean.get("summary") or ""),
+                "metadata_json": _json_dumps_safe(meta),
+                "updated_at": now,
+            }
+            if existing is None:
+                sess.execute(insert(unique_events_table).values(event_key=ev_key, **values))
+                return True
+            sess.execute(
+                update(unique_events_table)
+                .where(unique_events_table.c.event_key == ev_key)
+                .values(**values)
+            )
+            return False
+
+        is_new = self._run_write_tx(_tx)
 
         for ind_raw, ind_type in _dedupe_iocs(_extract_iocs_from_value(clean)):
             self.upsert_ioc_sighting(
@@ -1649,42 +1797,44 @@ class StorageManager:
         self._ensure_ready()
         if not events:
             return []
-        newly_seen: list[dict[str, Any]] = []
-        seen_in_batch: set[str] = set()
         now = time.time()
-        with self._lock:
-            with self.session() as sess:
-                existing_keys = {
-                    str(r[0])
-                    for r in sess.execute(select(unique_events_table.c.event_key)).all()
-                }
-                for raw_ev in events:
-                    clean = self._sanitize_event_payload(raw_ev)
-                    ev_key = str(clean.get("event_key") or "").strip()
-                    if not ev_key or ev_key in seen_in_batch or ev_key in existing_keys:
-                        continue
-                    seen_in_batch.add(ev_key)
-                    existing_keys.add(ev_key)
-                    meta_raw = clean.get("metadata")
-                    meta = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
-                    meta.pop("images", None)
-                    sess.execute(
-                        insert(unique_events_table).values(
-                            event_key=ev_key,
-                            source_kind=str(clean.get("source_kind") or "")[:64],
-                            native_id=str(clean.get("native_id") or "")[:256],
-                            scope=str(clean.get("scope") or "default")[:128],
-                            title=str(clean.get("title") or ""),
-                            severity=str(clean.get("severity") or "")[:64],
-                            status=str(clean.get("status") or "")[:64],
-                            event_timestamp=str(clean.get("timestamp") or "")[:64],
-                            summary=str(clean.get("summary") or ""),
-                            metadata_json=_json_dumps_safe(meta),
-                            updated_at=now,
-                        )
+
+        def _tx(sess: Session) -> list[dict[str, Any]]:
+            newly_seen: list[dict[str, Any]] = []
+            seen_in_batch: set[str] = set()
+            existing_keys = {
+                str(r[0])
+                for r in sess.execute(select(unique_events_table.c.event_key)).all()
+            }
+            for raw_ev in events:
+                clean = self._sanitize_event_payload(raw_ev)
+                ev_key = str(clean.get("event_key") or "").strip()
+                if not ev_key or ev_key in seen_in_batch or ev_key in existing_keys:
+                    continue
+                seen_in_batch.add(ev_key)
+                existing_keys.add(ev_key)
+                meta_raw = clean.get("metadata")
+                meta = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
+                meta.pop("images", None)
+                sess.execute(
+                    insert(unique_events_table).values(
+                        event_key=ev_key,
+                        source_kind=str(clean.get("source_kind") or "")[:64],
+                        native_id=str(clean.get("native_id") or "")[:256],
+                        scope=str(clean.get("scope") or "default")[:128],
+                        title=str(clean.get("title") or ""),
+                        severity=str(clean.get("severity") or "")[:64],
+                        status=str(clean.get("status") or "")[:64],
+                        event_timestamp=str(clean.get("timestamp") or "")[:64],
+                        summary=str(clean.get("summary") or ""),
+                        metadata_json=_json_dumps_safe(meta),
+                        updated_at=now,
                     )
-                    newly_seen.append(clean)
-        return newly_seen
+                )
+                newly_seen.append(clean)
+            return newly_seen
+
+        return self._run_write_tx(_tx)
 
     def add_event_panel(
         self,
@@ -1731,42 +1881,43 @@ class StorageManager:
             "auto_triggered": bool(clean.get("auto_triggered", False)),
             "error": str(clean.get("error") or ""),
         }
-        with self._lock:
-            with self.session() as sess:
-                existing = sess.execute(
-                    select(event_ai_panels_table.c.entry_id).where(
-                        event_ai_panels_table.c.entry_id == entry_id
+        def _tx(sess: Session) -> None:
+            existing = sess.execute(
+                select(event_ai_panels_table.c.entry_id).where(
+                    event_ai_panels_table.c.entry_id == entry_id
+                )
+            ).first()
+            if existing is None:
+                # Ensure deterministic insertion ordering when multiple panels are
+                # recorded within the same 1-second ISO timestamp window.
+                same_sec_rows = sess.execute(
+                    select(event_ai_panels_table.c.created_at)
+                    .where(
+                        and_(
+                            event_ai_panels_table.c.event_key == clean_key,
+                            event_ai_panels_table.c.created_at >= created_at,
+                            event_ai_panels_table.c.created_at < created_at + 0.999,
+                        )
                     )
+                    .order_by(event_ai_panels_table.c.created_at.desc())
+                    .limit(1)
                 ).first()
-                if existing is None:
-                    # Ensure deterministic insertion ordering when multiple panels are
-                    # recorded within the same 1-second ISO timestamp window.
-                    same_sec_rows = sess.execute(
-                        select(event_ai_panels_table.c.created_at)
-                        .where(
-                            and_(
-                                event_ai_panels_table.c.event_key == clean_key,
-                                event_ai_panels_table.c.created_at >= created_at,
-                                event_ai_panels_table.c.created_at < created_at + 0.999,
-                            )
-                        )
-                        .order_by(event_ai_panels_table.c.created_at.desc())
-                        .limit(1)
-                    ).first()
-                    if same_sec_rows is not None and same_sec_rows[0] is not None:
-                        row_values["created_at"] = min(
-                            created_at + 0.999,
-                            max(created_at, float(same_sec_rows[0]) + 1e-4),
-                        )
-                    sess.execute(
-                        insert(event_ai_panels_table).values(entry_id=entry_id, **row_values)
+                if same_sec_rows is not None and same_sec_rows[0] is not None:
+                    row_values["created_at"] = min(
+                        created_at + 0.999,
+                        max(created_at, float(same_sec_rows[0]) + 1e-4),
                     )
-                else:
-                    sess.execute(
-                        update(event_ai_panels_table)
-                        .where(event_ai_panels_table.c.entry_id == entry_id)
-                        .values(**row_values)
-                    )
+                sess.execute(
+                    insert(event_ai_panels_table).values(entry_id=entry_id, **row_values)
+                )
+            else:
+                sess.execute(
+                    update(event_ai_panels_table)
+                    .where(event_ai_panels_table.c.entry_id == entry_id)
+                    .values(**row_values)
+                )
+
+        self._run_write_tx(_tx)
         return {
             "entry_id": entry_id,
             "run_id": row_values["run_id"],
@@ -1900,42 +2051,45 @@ class StorageManager:
         if not clean_key:
             return False
         self._ensure_ready()
-        with self._lock:
-            with self.session() as sess:
-                has_panels = sess.execute(
-                    select(event_ai_panels_table.c.entry_id)
-                    .where(event_ai_panels_table.c.event_key == clean_key)
-                    .limit(1)
-                ).first()
-                if has_panels is not None:
-                    return False
-                res = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(unique_events_table).where(unique_events_table.c.event_key == clean_key)
-                    ),
-                )
-                return bool(res.rowcount and res.rowcount > 0)
+        def _tx(sess: Session) -> bool:
+            has_panels = sess.execute(
+                select(event_ai_panels_table.c.entry_id)
+                .where(event_ai_panels_table.c.event_key == clean_key)
+                .limit(1)
+            ).first()
+            if has_panels is not None:
+                return False
+            res = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(unique_events_table).where(unique_events_table.c.event_key == clean_key)
+                ),
+            )
+            return bool(res.rowcount and res.rowcount > 0)
+
+        return self._run_write_tx(_tx)
 
     def clear_events_and_panels(self, event_key: str | None = None) -> None:
         self._ensure_ready()
-        with self._lock:
-            with self.session() as sess:
-                if event_key is None:
-                    sess.execute(delete(event_ai_panels_table))
-                    sess.execute(delete(unique_events_table))
-                else:
-                    clean_key = str(event_key).strip()
-                    sess.execute(
-                        delete(event_ai_panels_table).where(
-                            event_ai_panels_table.c.event_key == clean_key
-                        )
+
+        def _tx(sess: Session) -> None:
+            if event_key is None:
+                sess.execute(delete(event_ai_panels_table))
+                sess.execute(delete(unique_events_table))
+            else:
+                clean_key = str(event_key).strip()
+                sess.execute(
+                    delete(event_ai_panels_table).where(
+                        event_ai_panels_table.c.event_key == clean_key
                     )
-                    sess.execute(
-                        delete(unique_events_table).where(
-                            unique_events_table.c.event_key == clean_key
-                        )
+                )
+                sess.execute(
+                    delete(unique_events_table).where(
+                        unique_events_table.c.event_key == clean_key
                     )
+                )
+
+        self._run_write_tx(_tx)
 
     # ------------------------------------------------------------------
     # Audit Log Persistence (Tagged with analyst_id & workstation_id)
@@ -1982,32 +2136,33 @@ class StorageManager:
             workstation_id=str(redact_sensitive_data(workstation_id)),
         )
 
-        with self._lock:
-            with self.session() as sess:
-                existing = sess.execute(
-                    select(audit_logs_table.c.entry_id).where(
-                        audit_logs_table.c.entry_id == sanitized.entry_id
+        def _tx(sess: Session) -> None:
+            existing = sess.execute(
+                select(audit_logs_table.c.entry_id).where(
+                    audit_logs_table.c.entry_id == sanitized.entry_id
+                )
+            ).first()
+            if existing is None:
+                sess.execute(
+                    insert(audit_logs_table).values(
+                        entry_id=sanitized.entry_id,
+                        timestamp=sanitized.timestamp,
+                        created_at=created_at,
+                        run_id=sanitized.run_id[:128],
+                        event_key=sanitized.event_key[:512],
+                        provider=sanitized.provider[:64],
+                        mode=sanitized.mode[:64],
+                        event_type=sanitized.event_type[:64],
+                        tool_name=sanitized.tool_name[:128],
+                        allowed=sanitized.allowed,
+                        reason=sanitized.reason,
+                        payload_json=_json_dumps_safe(sanitized.payload),
+                        analyst_id=sanitized.analyst_id[:128],
+                        workstation_id=sanitized.workstation_id[:128],
                     )
-                ).first()
-                if existing is None:
-                    sess.execute(
-                        insert(audit_logs_table).values(
-                            entry_id=sanitized.entry_id,
-                            timestamp=sanitized.timestamp,
-                            created_at=created_at,
-                            run_id=sanitized.run_id[:128],
-                            event_key=sanitized.event_key[:512],
-                            provider=sanitized.provider[:64],
-                            mode=sanitized.mode[:64],
-                            event_type=sanitized.event_type[:64],
-                            tool_name=sanitized.tool_name[:128],
-                            allowed=sanitized.allowed,
-                            reason=sanitized.reason,
-                            payload_json=_json_dumps_safe(sanitized.payload),
-                            analyst_id=sanitized.analyst_id[:128],
-                            workstation_id=sanitized.workstation_id[:128],
-                        )
-                    )
+                )
+
+        self._run_write_tx(_tx)
         return sanitized
 
     def query_audit_entries(
@@ -2124,31 +2279,32 @@ class StorageManager:
         policy_json = _json_dumps_safe(clean)
         now = time.time()
 
-        with self._lock:
-            with self.session() as sess:
-                existing = sess.execute(
-                    select(ai_policies_table.c.id).where(
-                        and_(
-                            ai_policies_table.c.workstation_id == ws,
-                            ai_policies_table.c.profile_name == prof,
-                        )
+        def _tx(sess: Session) -> None:
+            existing = sess.execute(
+                select(ai_policies_table.c.id).where(
+                    and_(
+                        ai_policies_table.c.workstation_id == ws,
+                        ai_policies_table.c.profile_name == prof,
                     )
-                ).first()
-                if existing is None:
-                    sess.execute(
-                        insert(ai_policies_table).values(
-                            workstation_id=ws,
-                            profile_name=prof,
-                            policy_json=policy_json,
-                            updated_at=now,
-                        )
+                )
+            ).first()
+            if existing is None:
+                sess.execute(
+                    insert(ai_policies_table).values(
+                        workstation_id=ws,
+                        profile_name=prof,
+                        policy_json=policy_json,
+                        updated_at=now,
                     )
-                else:
-                    sess.execute(
-                        update(ai_policies_table)
-                        .where(ai_policies_table.c.id == existing[0])
-                        .values(policy_json=policy_json, updated_at=now)
-                    )
+                )
+            else:
+                sess.execute(
+                    update(ai_policies_table)
+                    .where(ai_policies_table.c.id == existing[0])
+                    .values(policy_json=policy_json, updated_at=now)
+                )
+
+        self._run_write_tx(_tx)
 
     def save_workspace_layout(
         self,
@@ -2170,32 +2326,33 @@ class StorageManager:
         state_json = _json_dumps_safe(clean_state)
         now = time.time()
 
-        with self._lock:
-            with self.session() as sess:
-                existing = sess.execute(
-                    select(workspace_layouts_table.c.id).where(
-                        and_(
-                            workspace_layouts_table.c.workstation_id == ws,
-                            workspace_layouts_table.c.profile_name == prof,
-                        )
+        def _tx(sess: Session) -> None:
+            existing = sess.execute(
+                select(workspace_layouts_table.c.id).where(
+                    and_(
+                        workspace_layouts_table.c.workstation_id == ws,
+                        workspace_layouts_table.c.profile_name == prof,
                     )
-                ).first()
-                if existing is None:
-                    sess.execute(
-                        insert(workspace_layouts_table).values(
-                            workstation_id=ws,
-                            profile_name=prof,
-                            mode=clean_mode,
-                            state_json=state_json,
-                            updated_at=now,
-                        )
+                )
+            ).first()
+            if existing is None:
+                sess.execute(
+                    insert(workspace_layouts_table).values(
+                        workstation_id=ws,
+                        profile_name=prof,
+                        mode=clean_mode,
+                        state_json=state_json,
+                        updated_at=now,
                     )
-                else:
-                    sess.execute(
-                        update(workspace_layouts_table)
-                        .where(workspace_layouts_table.c.id == existing[0])
-                        .values(mode=clean_mode, state_json=state_json, updated_at=now)
-                    )
+                )
+            else:
+                sess.execute(
+                    update(workspace_layouts_table)
+                    .where(workspace_layouts_table.c.id == existing[0])
+                    .values(mode=clean_mode, state_json=state_json, updated_at=now)
+                )
+
+        self._run_write_tx(_tx)
         return {
             "mode": clean_mode,
             "state": clean_state,
@@ -2317,76 +2474,77 @@ class StorageManager:
         c_at = float(created_at) if created_at is not None else now
         u_at = float(updated_at) if updated_at is not None else now
 
-        with self._lock:
-            with self.session() as sess:
-                existing = None
-                eid = explicit_eid
-                if eid:
-                    existing = sess.execute(
-                        select(soc_learnings_table).where(soc_learnings_table.c.id == eid)
-                    ).mappings().first()
-                elif dedupe_by_fingerprint:
-                    existing = sess.execute(
-                        select(soc_learnings_table).where(
-                            soc_learnings_table.c.fingerprint == fp[:256]
-                        )
-                    ).mappings().first()
-                    if existing is not None:
-                        eid = str(existing["id"])
-                if not eid:
-                    eid = uuid.uuid4().hex[:16]
-                values = {
-                    "fingerprint": fp[:256],
-                    "category": str(category or "environment_fact")[:64],
-                    "title": clean_title,
-                    "content": clean_content,
-                    "source": str(source or "manual_learn")[:64],
-                    "status": str(status or "active")[:32],
-                    "confidence": float(confidence),
-                    "seen_count": max(1, int(seen_count)),
-                    "use_count": max(0, int(use_count)),
-                    "pinned": bool(pinned),
-                    "tags_json": _json_dumps_safe(clean_tags),
-                    "tags_text": tags_text,
-                    "created_by": str(redact_sensitive_data(created_by or self._config.analyst_id))[:128],
-                    "updated_at": u_at,
-                }
-                if existing is None:
-                    sess.execute(
-                        insert(soc_learnings_table).values(
-                            id=eid,
-                            created_at=c_at,
-                            **values,
-                        )
-                    )
-                else:
-                    sess.execute(
-                        update(soc_learnings_table)
-                        .where(soc_learnings_table.c.id == eid)
-                        .values(**values)
-                    )
-
-                if self._dialect == "sqlite":
-                    sess.execute(
-                        text("DELETE FROM soc_learnings_fts WHERE learning_id = :lid"),
-                        {"lid": eid},
-                    )
-                    sess.execute(
-                        text(
-                            "INSERT INTO soc_learnings_fts (learning_id, title, content, tags_text) "
-                            "VALUES (:lid, :title, :content, :tags)"
-                        ),
-                        {
-                            "lid": eid,
-                            "title": clean_title,
-                            "content": clean_content,
-                            "tags": tags_text,
-                        },
-                    )
-                saved = sess.execute(
+        def _tx(sess: Session) -> dict[str, Any]:
+            existing = None
+            eid = explicit_eid
+            if eid:
+                existing = sess.execute(
                     select(soc_learnings_table).where(soc_learnings_table.c.id == eid)
-                ).mappings().one()
-        return self._row_to_learning_dict(saved)
+                ).mappings().first()
+            elif dedupe_by_fingerprint:
+                existing = sess.execute(
+                    select(soc_learnings_table).where(
+                        soc_learnings_table.c.fingerprint == fp[:256]
+                    )
+                ).mappings().first()
+                if existing is not None:
+                    eid = str(existing["id"])
+            if not eid:
+                eid = uuid.uuid4().hex[:16]
+            values = {
+                "fingerprint": fp[:256],
+                "category": str(category or "environment_fact")[:64],
+                "title": clean_title,
+                "content": clean_content,
+                "source": str(source or "manual_learn")[:64],
+                "status": str(status or "active")[:32],
+                "confidence": float(confidence),
+                "seen_count": max(1, int(seen_count)),
+                "use_count": max(0, int(use_count)),
+                "pinned": bool(pinned),
+                "tags_json": _json_dumps_safe(clean_tags),
+                "tags_text": tags_text,
+                "created_by": str(redact_sensitive_data(created_by or self._config.analyst_id))[:128],
+                "updated_at": u_at,
+            }
+            if existing is None:
+                sess.execute(
+                    insert(soc_learnings_table).values(
+                        id=eid,
+                        created_at=c_at,
+                        **values,
+                    )
+                )
+            else:
+                sess.execute(
+                    update(soc_learnings_table)
+                    .where(soc_learnings_table.c.id == eid)
+                    .values(**values)
+                )
+
+            if self._dialect == "sqlite":
+                sess.execute(
+                    text("DELETE FROM soc_learnings_fts WHERE learning_id = :lid"),
+                    {"lid": eid},
+                )
+                sess.execute(
+                    text(
+                        "INSERT INTO soc_learnings_fts (learning_id, title, content, tags_text) "
+                        "VALUES (:lid, :title, :content, :tags)"
+                    ),
+                    {
+                        "lid": eid,
+                        "title": clean_title,
+                        "content": clean_content,
+                        "tags": tags_text,
+                    },
+                )
+            saved = sess.execute(
+                select(soc_learnings_table).where(soc_learnings_table.c.id == eid)
+            ).mappings().one()
+            return self._row_to_learning_dict(saved)
+
+        return self._run_write_tx(_tx)
 
     def get_learning(self, learning_id: str) -> dict[str, Any] | None:
         clean_id = str(learning_id or "").strip()
@@ -2576,37 +2734,40 @@ class StorageManager:
         if not clean_id:
             return False
         self._ensure_ready()
-        with self._lock:
-            with self.session() as sess:
-                res = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        update(soc_learnings_table)
-                        .where(soc_learnings_table.c.id == clean_id)
-                        .values(use_count=soc_learnings_table.c.use_count + step)
-                    ),
-                )
-                return bool(res.rowcount and res.rowcount > 0)
+        def _tx(sess: Session) -> bool:
+            res = cast(
+                CursorResult[Any],
+                sess.execute(
+                    update(soc_learnings_table)
+                    .where(soc_learnings_table.c.id == clean_id)
+                    .values(use_count=soc_learnings_table.c.use_count + step)
+                ),
+            )
+            return bool(res.rowcount and res.rowcount > 0)
+
+        return self._run_write_tx(_tx)
 
     def delete_learning(self, learning_id: str) -> bool:
         clean_id = str(learning_id or "").strip()
         if not clean_id:
             return False
         self._ensure_ready()
-        with self._lock:
-            with self.session() as sess:
-                res = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(soc_learnings_table).where(soc_learnings_table.c.id == clean_id)
-                    ),
+
+        def _tx(sess: Session) -> bool:
+            res = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(soc_learnings_table).where(soc_learnings_table.c.id == clean_id)
+                ),
+            )
+            if self._dialect == "sqlite":
+                sess.execute(
+                    text("DELETE FROM soc_learnings_fts WHERE learning_id = :lid"),
+                    {"lid": clean_id},
                 )
-                if self._dialect == "sqlite":
-                    sess.execute(
-                        text("DELETE FROM soc_learnings_fts WHERE learning_id = :lid"),
-                        {"lid": clean_id},
-                    )
-                return bool(res.rowcount and res.rowcount > 0)
+            return bool(res.rowcount and res.rowcount > 0)
+
+        return self._run_write_tx(_tx)
 
     def record_learning_revision(
         self,
@@ -2629,33 +2790,36 @@ class StorageManager:
             preserve_env_var_refs=True,
         )
         redacted_snap = dict(redacted_snap_raw) if isinstance(redacted_snap_raw, Mapping) else {}
-        with self._lock:
-            with self.session() as sess:
-                prev_rev = sess.execute(
-                    select(soc_learning_revisions_table.c.revision_no)
-                    .where(soc_learning_revisions_table.c.learning_id == clean_id)
-                    .order_by(soc_learning_revisions_table.c.revision_no.desc())
-                    .limit(1)
-                ).first()
-                next_rev = int(prev_rev[0]) + 1 if prev_rev is not None else 1
-                sess.execute(
-                    insert(soc_learning_revisions_table).values(
-                        learning_id=clean_id,
-                        revision_no=next_rev,
-                        action=str(action or "edit")[:64],
-                        actor=str(redact_sensitive_data(actor or self._config.analyst_id))[:128],
-                        previous_content=str(
-                            redact_sensitive_data(previous_content or "", preserve_env_var_refs=True)
-                        ),
-                        new_content=str(
-                            redact_sensitive_data(new_content or "", preserve_env_var_refs=True)
-                        ),
-                        previous_status=str(previous_status or "")[:32],
-                        new_status=str(new_status or "")[:32],
-                        snapshot_json=_json_dumps_safe(redacted_snap),
-                        created_at=now,
-                    )
+
+        def _tx(sess: Session) -> int:
+            prev_rev = sess.execute(
+                select(soc_learning_revisions_table.c.revision_no)
+                .where(soc_learning_revisions_table.c.learning_id == clean_id)
+                .order_by(soc_learning_revisions_table.c.revision_no.desc())
+                .limit(1)
+            ).first()
+            n_rev = int(prev_rev[0]) + 1 if prev_rev is not None else 1
+            sess.execute(
+                insert(soc_learning_revisions_table).values(
+                    learning_id=clean_id,
+                    revision_no=n_rev,
+                    action=str(action or "edit")[:64],
+                    actor=str(redact_sensitive_data(actor or self._config.analyst_id))[:128],
+                    previous_content=str(
+                        redact_sensitive_data(previous_content or "", preserve_env_var_refs=True)
+                    ),
+                    new_content=str(
+                        redact_sensitive_data(new_content or "", preserve_env_var_refs=True)
+                    ),
+                    previous_status=str(previous_status or "")[:32],
+                    new_status=str(new_status or "")[:32],
+                    snapshot_json=_json_dumps_safe(redacted_snap),
+                    created_at=now,
                 )
+            )
+            return n_rev
+
+        next_rev = self._run_write_tx(_tx)
         return {
             "learning_id": clean_id,
             "revision_no": next_rev,
@@ -2856,71 +3020,72 @@ class StorageManager:
                     )
                 )
             if parsed_entries:
-                with self._lock:
-                    with self.session() as sess:
-                        existing_audit_ids = {
-                            str(r[0])
-                            for r in sess.execute(select(audit_logs_table.c.entry_id)).all()
-                        }
-                        audit_rows: list[dict[str, Any]] = []
-                        for entry in parsed_entries:
-                            if entry.entry_id in existing_audit_ids:
-                                continue
-                            existing_audit_ids.add(entry.entry_id)
-                            ts_str = (
-                                entry.timestamp.strip()
-                                if isinstance(entry.timestamp, str)
-                                else ""
-                            )
-                            if not ts_str:
-                                ts_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-                            created_at = _parse_timestamp_epoch(ts_str, fallback=time.time())
-                            raw_payload = (
-                                dict(entry.payload)
-                                if isinstance(entry.payload, Mapping)
-                                else {}
-                            )
-                            redacted_payload_obj = redact_sensitive_data(raw_payload)
-                            redacted_payload: dict[str, Any] = (
-                                dict(redacted_payload_obj)
-                                if isinstance(redacted_payload_obj, Mapping)
-                                else {}
-                            )
-                            analyst_id = (
-                                getattr(entry, "analyst_id", "") or ""
-                            ).strip() or self._config.analyst_id
-                            workstation_id = (
-                                getattr(entry, "workstation_id", "") or ""
-                            ).strip() or self._config.workstation_id
-                            audit_rows.append(
-                                {
-                                    "entry_id": entry.entry_id,
-                                    "timestamp": ts_str,
-                                    "created_at": created_at,
-                                    "run_id": str(entry.run_id or "")[:128],
-                                    "event_key": str(
-                                        redact_sensitive_data(entry.event_key or "")
-                                    )[:512],
-                                    "provider": str(
-                                        redact_sensitive_data(entry.provider or "")
-                                    )[:64],
-                                    "mode": str(entry.mode or "")[:64],
-                                    "event_type": entry.event_type[:64],
-                                    "tool_name": str(
-                                        redact_sensitive_data(entry.tool_name or "")
-                                    )[:128],
-                                    "allowed": entry.allowed,
-                                    "reason": str(redact_sensitive_data(entry.reason or "")),
-                                    "payload_json": _json_dumps_safe(redacted_payload),
-                                    "analyst_id": str(redact_sensitive_data(analyst_id))[:128],
-                                    "workstation_id": str(
-                                        redact_sensitive_data(workstation_id)
-                                    )[:128],
-                                }
-                            )
-                        if audit_rows:
-                            sess.execute(insert(audit_logs_table), audit_rows)
-                            counts["audits"] += len(audit_rows)
+                def _audit_tx(sess: Session) -> int:
+                    existing_audit_ids = {
+                        str(r[0])
+                        for r in sess.execute(select(audit_logs_table.c.entry_id)).all()
+                    }
+                    audit_rows: list[dict[str, Any]] = []
+                    for entry in parsed_entries:
+                        if entry.entry_id in existing_audit_ids:
+                            continue
+                        existing_audit_ids.add(entry.entry_id)
+                        ts_str = (
+                            entry.timestamp.strip()
+                            if isinstance(entry.timestamp, str)
+                            else ""
+                        )
+                        if not ts_str:
+                            ts_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        created_at = _parse_timestamp_epoch(ts_str, fallback=time.time())
+                        raw_payload = (
+                            dict(entry.payload)
+                            if isinstance(entry.payload, Mapping)
+                            else {}
+                        )
+                        redacted_payload_obj = redact_sensitive_data(raw_payload)
+                        redacted_payload: dict[str, Any] = (
+                            dict(redacted_payload_obj)
+                            if isinstance(redacted_payload_obj, Mapping)
+                            else {}
+                        )
+                        analyst_id = (
+                            getattr(entry, "analyst_id", "") or ""
+                        ).strip() or self._config.analyst_id
+                        workstation_id = (
+                            getattr(entry, "workstation_id", "") or ""
+                        ).strip() or self._config.workstation_id
+                        audit_rows.append(
+                            {
+                                "entry_id": entry.entry_id,
+                                "timestamp": ts_str,
+                                "created_at": created_at,
+                                "run_id": str(entry.run_id or "")[:128],
+                                "event_key": str(
+                                    redact_sensitive_data(entry.event_key or "")
+                                )[:512],
+                                "provider": str(
+                                    redact_sensitive_data(entry.provider or "")
+                                )[:64],
+                                "mode": str(entry.mode or "")[:64],
+                                "event_type": entry.event_type[:64],
+                                "tool_name": str(
+                                    redact_sensitive_data(entry.tool_name or "")
+                                )[:128],
+                                "allowed": entry.allowed,
+                                "reason": str(redact_sensitive_data(entry.reason or "")),
+                                "payload_json": _json_dumps_safe(redacted_payload),
+                                "analyst_id": str(redact_sensitive_data(analyst_id))[:128],
+                                "workstation_id": str(
+                                    redact_sensitive_data(workstation_id)
+                                )[:128],
+                            }
+                        )
+                    if audit_rows:
+                        sess.execute(insert(audit_logs_table), audit_rows)
+                    return len(audit_rows)
+
+                counts["audits"] += self._run_write_tx(_audit_tx)
 
         return counts
 
@@ -2940,72 +3105,71 @@ class StorageManager:
             }
         self._ensure_ready()
         cutoff = time.time() - (eff_days * 86400.0)
-        deleted_counts: dict[str, int] = {}
-
-        with self._lock:
-            with self.session() as sess:
-                if self._dialect == "sqlite":
-                    expired_alert_ids = [
-                        int(r[0])
-                        for r in sess.execute(
-                            select(alerts_history_table.c.id).where(
-                                alerts_history_table.c.fetched_at < cutoff
-                            )
-                        ).all()
-                    ]
-                    if expired_alert_ids:
-                        for rid in expired_alert_ids:
-                            sess.execute(
-                                text("DELETE FROM alerts_history_fts WHERE alert_row_id = :rid"),
-                                {"rid": rid},
-                            )
-                res_alerts = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(alerts_history_table).where(alerts_history_table.c.fetched_at < cutoff)
-                    ),
-                )
-                deleted_counts["alerts_history"] = int(res_alerts.rowcount or 0)
-
-                res_iocs = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(ioc_sightings_table).where(ioc_sightings_table.c.last_seen_at < cutoff)
-                    ),
-                )
-                deleted_counts["ioc_sightings"] = int(res_iocs.rowcount or 0)
-
-                res_panels = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(event_ai_panels_table).where(event_ai_panels_table.c.created_at < cutoff)
-                    ),
-                )
-                deleted_counts["event_ai_panels"] = int(res_panels.rowcount or 0)
-
-                remaining_panel_keys = select(event_ai_panels_table.c.event_key).distinct()
-                res_events = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(unique_events_table).where(
-                            and_(
-                                unique_events_table.c.updated_at < cutoff,
-                                ~unique_events_table.c.event_key.in_(remaining_panel_keys),
-                            )
+        def _tx(sess: Session) -> dict[str, int]:
+            counts_out: dict[str, int] = {}
+            if self._dialect == "sqlite":
+                expired_alert_ids = [
+                    int(r[0])
+                    for r in sess.execute(
+                        select(alerts_history_table.c.id).where(
+                            alerts_history_table.c.fetched_at < cutoff
                         )
-                    ),
-                )
-                deleted_counts["unique_events"] = int(res_events.rowcount or 0)
+                    ).all()
+                ]
+                if expired_alert_ids:
+                    for rid in expired_alert_ids:
+                        sess.execute(
+                            text("DELETE FROM alerts_history_fts WHERE alert_row_id = :rid"),
+                            {"rid": rid},
+                        )
+            res_alerts = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(alerts_history_table).where(alerts_history_table.c.fetched_at < cutoff)
+                ),
+            )
+            counts_out["alerts_history"] = int(res_alerts.rowcount or 0)
 
-                res_audits = cast(
-                    CursorResult[Any],
-                    sess.execute(
-                        delete(audit_logs_table).where(audit_logs_table.c.created_at < cutoff)
-                    ),
-                )
-                deleted_counts["audit_logs"] = int(res_audits.rowcount or 0)
+            res_iocs = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(ioc_sightings_table).where(ioc_sightings_table.c.last_seen_at < cutoff)
+                ),
+            )
+            counts_out["ioc_sightings"] = int(res_iocs.rowcount or 0)
 
-        return deleted_counts
+            res_panels = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(event_ai_panels_table).where(event_ai_panels_table.c.created_at < cutoff)
+                ),
+            )
+            counts_out["event_ai_panels"] = int(res_panels.rowcount or 0)
+
+            remaining_panel_keys = select(event_ai_panels_table.c.event_key).distinct()
+            res_events = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(unique_events_table).where(
+                        and_(
+                            unique_events_table.c.updated_at < cutoff,
+                            ~unique_events_table.c.event_key.in_(remaining_panel_keys),
+                        )
+                    )
+                ),
+            )
+            counts_out["unique_events"] = int(res_events.rowcount or 0)
+
+            res_audits = cast(
+                CursorResult[Any],
+                sess.execute(
+                    delete(audit_logs_table).where(audit_logs_table.c.created_at < cutoff)
+                ),
+            )
+            counts_out["audit_logs"] = int(res_audits.rowcount or 0)
+            return counts_out
+
+        return self._run_write_tx(_tx)
 
 
 class SOCLearningStore:

@@ -508,6 +508,13 @@ class SplunkESPane(BaseSocPane):
         width: 58% !important;
         min-height: 4 !important;
     }
+    .tile-leaf.-compact-narrow SplunkESPane.es-compact #es-workspace > #es-master-pane,
+    .tile-leaf.-compact-narrow SplunkESPane.es-compact #es-workspace > #es-detail-pane,
+    .tile-leaf.tile-narrow SplunkESPane.es-compact #es-workspace > #es-master-pane,
+    .tile-leaf.tile-narrow SplunkESPane.es-compact #es-workspace > #es-detail-pane {
+        width: 1fr !important;
+        margin-right: 0 !important;
+    }
     SplunkESPane.es-compact #es-table {
         min-height: 3 !important;
         border: none !important;
@@ -1030,6 +1037,7 @@ class SplunkESPane(BaseSocPane):
             search_inp.styles.margin = (0, 1, 0, 0)
             master = self.query_one("#es-master-pane")
             master.styles.width = "42%" if split_horizontal else "1fr"
+            master.styles.margin = (0, 1, 0, 0) if split_horizontal else (0, 0, 0, 0)
             master.styles.min_height = 4
             detail_pane = self.query_one("#es-detail-pane")
             detail_pane.styles.width = "58%" if split_horizontal else "1fr"
@@ -1098,9 +1106,18 @@ class SplunkESPane(BaseSocPane):
             h = int(self.size.height if height is None else height)
             compact_small = w < 100 or h <= 26
             narrow = w < 96
-            split_horizontal = w >= 110 or (
-                compact_small and w >= 76
-            )
+            in_narrow_tile = False
+            for anc in self.ancestors:
+                if anc.has_class("tile-leaf"):
+                    anc_size = getattr(anc, "size", None)
+                    leaf_w = int(getattr(anc_size, "width", 0) or 0)
+                    in_narrow_tile = (
+                        anc.has_class("-compact-narrow")
+                        or anc.has_class("tile-narrow")
+                        or (0 < leaf_w < 96)
+                    )
+                    break
+            split_horizontal = w >= 96 or (h <= 26 and w >= 76 and not in_narrow_tile)
             self.set_class(compact_small, "es-compact")
             self._sync_compact_labels(compact_small)
             self._apply_compact_inline_styles(

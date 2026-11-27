@@ -491,6 +491,11 @@ class ReadOnlyToolSpec:
     underlying_methods: tuple[str, ...] = ()
 
 
+_FORBIDDEN_MUTATING_LOWER: frozenset[str] = frozenset(
+    name.strip().lower() for name in FORBIDDEN_MUTATING_METHOD_NAMES
+)
+
+
 class ReadOnlyToolRegistry:
     """Fail-closed registry executing only verified read-only SOC tools."""
 
@@ -504,19 +509,20 @@ class ReadOnlyToolRegistry:
         clean_name = spec.name.strip() if isinstance(spec.name, str) else ""
         if not clean_name:
             raise ValueError("Tool name must be a non-empty string.")
-        if clean_name in FORBIDDEN_MUTATING_METHOD_NAMES:
+        if clean_name.lower() in _FORBIDDEN_MUTATING_LOWER:
             raise ValueError(f"Forbidden mutating tool name cannot be registered: {clean_name}")
         if not isinstance(spec.source_category, str) or not spec.source_category.strip():
             raise ValueError(f"Tool '{clean_name}' must specify a valid source_category.")
-        handler_name = getattr(spec.handler, "__name__", "")
-        if handler_name in FORBIDDEN_MUTATING_METHOD_NAMES:
+        handler_name = str(getattr(spec.handler, "__name__", "") or "").strip()
+        if handler_name.lower() in _FORBIDDEN_MUTATING_LOWER:
             raise ValueError(
                 f"Forbidden mutating handler cannot be registered: {handler_name}"
             )
         for method_name in spec.underlying_methods:
-            if method_name in FORBIDDEN_MUTATING_METHOD_NAMES:
+            clean_method = str(method_name).strip()
+            if clean_method.lower() in _FORBIDDEN_MUTATING_LOWER:
                 raise ValueError(
-                    f"Tool '{clean_name}' references forbidden mutating method '{method_name}'."
+                    f"Tool '{clean_name}' references forbidden mutating method '{clean_method}'."
                 )
 
         self._tools[clean_name] = spec

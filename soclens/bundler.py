@@ -605,24 +605,43 @@ def _iter_workspace_files(
     dest: Path,
     warnings: list[str],
 ) -> list[tuple[Path, str]]:
+    workspace_resolved = workspace.resolve()
     entries: list[tuple[Path, str]] = []
     for item_name in WORKSPACE_INCLUDE_ITEMS:
         item_path = workspace / item_name
+        if item_path.is_symlink():
+            logger.warning("Skipping symlinked workspace item: %s", item_path)
+            continue
         if not item_path.exists():
             msg = f"Optional workspace item not found, skipping: {item_name}"
             logger.debug(msg)
             warnings.append(msg)
             continue
+        try:
+            item_resolved = item_path.resolve()
+        except OSError:
+            continue
+        if not item_resolved.is_relative_to(workspace_resolved):
+            logger.warning("Skipping workspace item outside workspace root: %s", item_path)
+            continue
 
         if item_path.is_dir():
-            for root, dirs, files in os.walk(item_path):
-                dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIR_NAMES)
+            for root, dirs, files in os.walk(item_path, followlinks=False):
                 root_path = Path(root)
+                dirs[:] = sorted(
+                    d
+                    for d in dirs
+                    if d not in EXCLUDED_DIR_NAMES and not (root_path / d).is_symlink()
+                )
                 for fname in sorted(files):
                     file_path = root_path / fname
+                    if file_path.is_symlink():
+                        continue
                     try:
                         resolved = file_path.resolve()
                     except OSError:
+                        continue
+                    if not resolved.is_relative_to(workspace_resolved):
                         continue
                     if resolved == dest:
                         continue
@@ -631,7 +650,7 @@ def _iter_workspace_files(
                         continue
                     entries.append((resolved, rel.as_posix()))
         elif item_path.is_file():
-            resolved = item_path.resolve()
+            resolved = item_resolved
             if resolved == dest:
                 continue
             if item_path.name in EXCLUDED_FILE_NAMES or item_path.suffix.lower() in EXCLUDED_SUFFIXES:

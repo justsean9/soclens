@@ -507,8 +507,7 @@ class WebRuntimeState:
     def _on_log_entry(self, entry: LogEntry) -> None:
         if self.shutdown_event.is_set():
             return
-        self.sse_bus.publish(
-            "log",
+        safe_payload = redact_web_payload(
             {
                 "timestamp": entry.timestamp,
                 "level": entry.level,
@@ -516,7 +515,11 @@ class WebRuntimeState:
                 "logger_name": entry.logger_name,
                 "message": entry.message,
                 "created_utc": entry.created_utc.isoformat() if entry.created_utc else None,
-            },
+            }
+        )
+        self.sse_bus.publish(
+            "log",
+            dict(safe_payload) if isinstance(safe_payload, dict) else {"message": str(safe_payload)},
         )
 
     def _on_background_triage_complete(
@@ -526,8 +529,7 @@ class WebRuntimeState:
     ) -> None:
         if self.shutdown_event.is_set():
             return
-        self.sse_bus.publish(
-            "triage_update",
+        safe_payload = redact_web_payload(
             {
                 "event_key": event.event_key,
                 "source_kind": event.source_kind,
@@ -537,7 +539,11 @@ class WebRuntimeState:
                 "provider": result.provider,
                 "model": result.model,
                 "timestamp": result.timestamp,
-            },
+            }
+        )
+        self.sse_bus.publish(
+            "triage_update",
+            dict(safe_payload) if isinstance(safe_payload, dict) else {},
         )
 
     def get_status_payload(self) -> dict[str, Any]:
