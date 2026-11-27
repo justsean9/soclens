@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from soclens.bundler import create_bundle
+from soclens.client import RF_ID_PREFIXES, _is_rf_entity_id
 from soclens.config import (
     format_ssl_verify_status,
     get_local_llm_config,
@@ -27,6 +28,7 @@ from soclens.logos.brand_sync import (
     load_brand_sync_state,
     validate_domain_brand_sync,
 )
+from soclens.research import classify_research_target
 from soclens.settings import get_settings_storage_info
 from soclens.sigma import (
     SIGMA_PIPELINES,
@@ -189,13 +191,33 @@ async def admin_watchlists_endpoint(request: Request) -> JSONResponse:
                 return {"ok": True, "result": redact_web_payload(res)}, 200
             list_id = str(body.get("list_id") or "").strip()
             entity = str(body.get("entity") or "").strip()
+            entity_type = str(body.get("entity_type") or "").strip()
             if not list_id or not entity:
                 return {"ok": False, "error": "list_id and entity are required."}, 400
+
+            resolved_type: str | None = entity_type or None
+            use_id: bool | None = None
+            if resolved_type is None:
+                low_ent = entity.lower()
+                if not low_ent.startswith(("http://", "https://")) and low_ent.startswith(
+                    RF_ID_PREFIXES
+                ):
+                    use_id = True
+                else:
+                    target_info = classify_research_target(entity)
+                    if target_info.rf_type:
+                        resolved_type = target_info.rf_type
+                        use_id = False
+                    elif _is_rf_entity_id("", entity):
+                        use_id = True
+                    else:
+                        resolved_type = "InternetDomainName"
+
             if action == "add_entity":
-                res = rf.add_entity(list_id, entity)
+                res = rf.add_entity(list_id, resolved_type or "", entity, is_id=use_id)
                 return {"ok": True, "result": redact_web_payload(res)}, 200
             if action == "remove_entity":
-                res = rf.remove_entity(list_id, entity)
+                res = rf.remove_entity(list_id, entity, resolved_type, is_id=use_id)
                 return {"ok": True, "result": redact_web_payload(res)}, 200
             return {"ok": False, "error": f"Unknown watchlist action: {action}"}, 400
         except Exception as exc:
@@ -384,7 +406,11 @@ async def admin_splunk_bundle_endpoint(request: Request) -> JSONResponse:
                 return {"ok": True, "bundle_path": str(created), "size_bytes": created.stat().st_size}, 200
 
             conf_pattern = str(body.get("conf_path") or "savedsearches.conf").strip()
-            searches = parse_savedsearches_files(str(runtime.workspace_dir / conf_pattern))
+            ws_root = runtime.workspace_dir.resolve()
+            candidate_conf = (ws_root / conf_pattern).resolve()
+            if not candidate_conf.is_relative_to(ws_root):
+                return {"ok": False, "error": "conf_path must stay within workspace directory."}, 400
+            searches = parse_savedsearches_files(str(candidate_conf))
             dry_run = bool(body.get("dry_run", True)) or runtime.dry_run
             if dry_run:
                 return {"ok": True, "dry_run": True, "searches": redact_web_payload(searches)}, 200

@@ -745,3 +745,33 @@ def test_mysql_boolean_mode_cve_tokenization_and_snapshot_ioc_and_audit_idempote
     assert len(s_newer) == 1
     assert s_newer[0]["sighting_count"] == 2
     stor.dispose()
+
+
+def test_database_url_dialect_inference_without_explicit_backend(
+    isolated_db_ws: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soclens.config import get_database_config
+
+    drivers = install_mock_db_drivers(monkeypatch)
+
+    pg_direct = DatabaseConfig(dsn="postgresql+pg8000://soc:pw@pg.internal:5432/soclens")
+    assert pg_direct.effective_dialect() == "postgres"
+    pg_res = test_db_connection(pg_direct)
+    assert pg_res["ok"] is True
+    assert pg_res["dialect"] == "postgres"
+    assert "check_same_thread" not in drivers["postgres"].connect_calls[-1]
+
+    my_direct = DatabaseConfig(dsn="mysql+pymysql://soc:pw@mysql.internal:3306/soclens")
+    assert my_direct.effective_dialect() == "mysql"
+    my_res = test_db_connection(my_direct)
+    assert my_res["ok"] is True
+    assert my_res["dialect"] == "mysql"
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+pg8000://soc:pw@pg.internal:5432/soclens")
+    env_cfg = get_database_config(workspace_dir=isolated_db_ws)
+    assert env_cfg.backend == "postgres"
+    assert env_cfg.effective_dialect() == "postgres"
+    env_res = test_db_connection(env_cfg)
+    assert env_res["ok"] is True
+    assert env_res["dialect"] == "postgres"

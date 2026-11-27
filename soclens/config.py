@@ -2183,8 +2183,22 @@ def get_database_config(
         except ValueError as exc:
             raise ConfigurationError(f"Invalid integer for {key}: {raw!r}") from exc
 
-    resolved_backend = _opt_str(backend, "db_backend", include_default=True) or "sqlite"
+    explicit_backend = _opt_str(backend, "db_backend", include_default=False)
     resolved_dsn = _opt_str(dsn, "db_dsn")
+    if explicit_backend is not None:
+        resolved_backend = explicit_backend
+    elif resolved_dsn:
+        low_dsn = resolved_dsn.strip().lower()
+        if low_dsn.startswith(("postgresql", "postgres")):
+            resolved_backend = "postgres"
+        elif low_dsn.startswith(("mysql", "mariadb")):
+            resolved_backend = "mysql"
+        elif low_dsn.startswith("sqlite"):
+            resolved_backend = "sqlite"
+        else:
+            resolved_backend = "custom"
+    else:
+        resolved_backend = _opt_str(None, "db_backend", include_default=True) or "sqlite"
     if sqlite_path is not None and str(sqlite_path).strip():
         resolved_sqlite: Path | str | None = sqlite_path
     else:

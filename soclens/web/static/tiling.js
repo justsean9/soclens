@@ -152,14 +152,30 @@
     }
 
     splitLeaf(leafId, direction, tileId) {
-      const targetTile = this.tileRegistry.has(tileId) ? tileId : "research";
+      let targetTile = this.tileRegistry.has(tileId) ? tileId : "research";
       const existing = this.findLeafWithTile(targetTile);
-      if (existing && existing.id !== leafId && existing.tabs.length > 1) {
-        existing.tabs = existing.tabs.filter(function (t) {
-          return t !== targetTile;
-        });
-        if (existing.activeTab === targetTile) {
-          existing.activeTab = existing.tabs[0];
+      if (existing) {
+        if (existing.tabs.length > 1) {
+          existing.tabs = existing.tabs.filter(function (t) {
+            return t !== targetTile;
+          });
+          if (existing.activeTab === targetTile) {
+            existing.activeTab = existing.tabs[0];
+          }
+        } else if (existing.id === leafId) {
+          const unopened = this._pickUnopenedTile(null);
+          if (!unopened || this.findLeafWithTile(unopened)) {
+            return;
+          }
+          targetTile = unopened;
+        } else {
+          const pruned = this._removeLeafNode(this.tree, existing.id);
+          if (pruned) {
+            this.tree = pruned;
+          } else {
+            this.focusLeaf(existing.id);
+            return;
+          }
         }
       }
       const newLeaf = makeLeaf([targetTile], targetTile);
@@ -411,9 +427,14 @@
           }, this)
         : [];
       const tabs = validTabs.length ? validTabs : ["research"];
+      const resolvedId = String(node.id || nextLeafId());
+      const idMatch = /^leaf-(\d+)$/.exec(resolvedId);
+      if (idMatch) {
+        leafCounter = Math.max(leafCounter, Number(idMatch[1]));
+      }
       return {
         type: "leaf",
-        id: String(node.id || nextLeafId()),
+        id: resolvedId,
         tabs: tabs,
         activeTab: tabs.includes(node.activeTab) ? node.activeTab : tabs[0],
       };

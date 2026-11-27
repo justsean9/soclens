@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
+import uvicorn.lifespan.on as _uvicorn_lifespan_on  # noqa: F401
+import uvicorn.loops.asyncio as _uvicorn_loops_asyncio  # noqa: F401
+import uvicorn.protocols.http.h11_impl as _uvicorn_h11_impl  # noqa: F401
 
 from soclens.web.app import create_app
 from soclens.web.state import WebRuntimeState
@@ -175,10 +178,10 @@ def run_web_server(
     launch_url = f"http://{validated_host}:{actual_port}/#token={token}"
 
     def _post_start_notifier() -> None:
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 10.0
         while not server.started and not server.should_exit and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if server.should_exit:
+            time.sleep(0.005)
+        if server.should_exit or not server.started:
             return
         if callable(on_ready):
             try:

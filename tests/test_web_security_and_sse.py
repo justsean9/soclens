@@ -21,8 +21,15 @@ from tests.test_web_server import _auth_headers, _call_asgi
 def test_host_origin_sec_fetch_and_csrf_guards(tmp_path: Path) -> None:
     app = create_app(workspace_dir=tmp_path, bootstrap_token="sec-tok", bound_port=8765)
     try:
-        # Missing / invalid / foreign Host headers rejected
-        for bad_host in ("evil.example:8765", "127.0.0.1.evil.example:8765", "192.168.1.50:8765", "127.0.0.1:9999"):
+        # Missing / invalid / foreign / portless Host headers rejected when bound_port=8765
+        for bad_host in (
+            "evil.example:8765",
+            "127.0.0.1.evil.example:8765",
+            "192.168.1.50:8765",
+            "127.0.0.1:9999",
+            "127.0.0.1",
+            "localhost",
+        ):
             res = asyncio.run(_call_asgi(app, "GET", "/", headers={"Host": bad_host}))
             assert res.status in (400, 403), f"Expected rejection for Host={bad_host}, got {res.status}"
 
@@ -37,8 +44,14 @@ def test_host_origin_sec_fetch_and_csrf_guards(tmp_path: Path) -> None:
         )
         assert no_host.status == 400
 
-        # Origin & Sec-Fetch-Site checks
-        for bad_origin in ("null", "https://attacker.example", "http://evil.local:8765", "http://127.0.0.1:9999"):
+        # Origin & Sec-Fetch-Site checks (including portless Origin mismatch)
+        for bad_origin in (
+            "null",
+            "https://attacker.example",
+            "http://evil.local:8765",
+            "http://127.0.0.1:9999",
+            "http://127.0.0.1",
+        ):
             res = asyncio.run(
                 _call_asgi(app, "GET", "/", headers={"Host": "127.0.0.1:8765", "Origin": bad_origin})
             )

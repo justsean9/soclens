@@ -415,3 +415,268 @@ def test_settings_test_db_and_live_uvicorn_shutdown(tmp_path: Path) -> None:
     server_thread.join(timeout=5.0)
     assert not server_thread.is_alive()
     time.sleep(0.05)
+
+
+def test_create_app_and_unlock_survive_unreachable_external_db(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    from soclens.settings import (
+        encrypt_settings_store,
+        invalidate_settings_cache,
+        lock_settings,
+        save_profile_settings,
+    )
+
+    db_pw = "UnreachableDbSecret99!"
+    monkeypatch.setenv("SOCLENS_HOME", str(tmp_path))
+    monkeypatch.setenv("SOCLENS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    invalidate_settings_cache()
+
+    save_profile_settings(
+        {
+            "db_backend": "postgres",
+            "db_dsn": f"postgresql+pg8000://soc:{db_pw}@127.0.0.1:1/soclens",
+            "rf_api_token": "rf-vault-secret-123",
+        }
+    )
+    encrypt_settings_store(mode="passphrase", passphrase="VaultPass!23")
+    lock_settings()
+
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        f"postgresql+pg8000://soc:{db_pw}@127.0.0.1:1/soclens",
+    )
+    app = create_app(workspace_dir=tmp_path, bootstrap_token="degraded-tok")
+    try:
+        runtime = app.state.runtime
+        assert runtime.storage_error is not None
+        assert db_pw not in runtime.storage_error
+
+        hdrs = _auth_headers(app, "degraded-tok")
+        status_res = asyncio.run(_call_asgi(app, "GET", "/api/status", headers=hdrs))
+        assert status_res.status == 200
+        status_json = status_res.json()
+        assert status_json["ok"] is True
+        assert status_json["storage_ok"] is False
+        assert db_pw not in status_res.text
+
+        unlock_res = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/settings/unlock",
+                headers=hdrs,
+                json_body={"passphrase": "VaultPass!23"},
+            )
+        )
+        assert unlock_res.status == 200
+        unlock_json = unlock_res.json()
+        assert unlock_json["locked"] is False
+        assert unlock_json["storage_ok"] is False
+        assert db_pw not in unlock_res.text
+        assert "rf-vault-secret-123" not in unlock_res.text
+    finally:
+        app.state.runtime.cleanup()
+
+
+def test_test_db_endpoint_maps_name_and_user_and_handles_invalid_config(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    from tests.db_test_helpers import install_mock_db_drivers
+
+    install_mock_db_drivers(monkeypatch)
+    app = create_app(workspace_dir=tmp_path, bootstrap_token="testdb-tok")
+    try:
+        hdrs = _auth_headers(app, "testdb-tok")
+
+        captured_cfgs: list[Any] = []
+        import soclens.web.api_settings as api_settings_mod
+
+        orig_test_db = api_settings_mod.test_db_connection
+
+        def _spy_test_db(cfg: Any) -> dict[str, Any]:
+            captured_cfgs.append(cfg)
+            return orig_test_db(cfg)
+
+        monkeypatch.setattr(api_settings_mod, "test_db_connection", _spy_test_db)
+
+        pg_res = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/settings/test-db",
+                headers=hdrs,
+                json_body={
+                    "backend": "postgres",
+                    "host": "127.0.0.1",
+                    "port": 5432,
+                    "name": "soclens",
+                    "user": "soc",
+                    "password": "pw",
+                },
+            )
+        )
+        assert pg_res.status == 200
+        pg_json = pg_res.json()
+        assert pg_json["ok"] is True
+        assert pg_json["dialect"] == "postgres"
+        assert captured_cfgs[-1].database == "soclens"
+        assert captured_cfgs[-1].username == "soc"
+
+        for bad_body in (
+            {"backend": "postgres", "port": 0},
+            {"backend": "oracle", "host": "127.0.0.1"},
+            {"backend": "postgres", "port": True},
+        ):
+            bad_res = asyncio.run(
+                _call_asgi(
+                    app,
+                    "POST",
+                    "/api/settings/test-db",
+                    headers=hdrs,
+                    json_body=bad_body,
+                )
+            )
+            assert bad_res.status == 200
+            assert bad_res.json()["ok"] is False
+            assert bad_res.json()["error"]
+    finally:
+        app.state.runtime.cleanup()
+
+
+def test_admin_watchlists_add_remove_and_es_bundle_validation(tmp_path: Path) -> None:
+    class _SpyRF(RecordedFutureClient):
+        def __init__(self) -> None:
+            super().__init__(api_token="rf-spy-tok")
+            self.calls: list[tuple[str, str, Any]] = []
+
+        def _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
+            self.calls.append((method, endpoint, kwargs.get("json_data")))
+
+            class _Resp:
+                status_code = 200
+
+                def json(self) -> dict[str, Any]:
+                    return {"result": "ok"}
+
+            return _Resp()
+
+    class _SpyES:
+        def __init__(self) -> None:
+            self.toggles: list[tuple[str, bool]] = []
+
+        def set_correlation_search_enabled(self, name: str, *, enabled: bool) -> dict[str, Any]:
+            self.toggles.append((name, enabled))
+            return {"name": name, "enabled": enabled}
+
+    spy_rf = _SpyRF()
+    spy_es = _SpyES()
+    app = create_app(
+        workspace_dir=tmp_path,
+        admin_enabled=True,
+        bootstrap_token="wl-tok",
+        session_state={"rf_client": spy_rf, "splunk_es_client": spy_es},
+    )
+    try:
+        hdrs = _auth_headers(app, "wl-tok")
+
+        add_dom = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/admin/watchlists",
+                headers=hdrs,
+                json_body={
+                    "action": "add_entity",
+                    "list_id": "wl-123",
+                    "entity": "evil.example",
+                    "double_confirmed": True,
+                },
+            )
+        )
+        assert add_dom.status == 200
+        assert spy_rf.calls[-1][1] == "/list/wl-123/entity/add"
+        assert spy_rf.calls[-1][2] == {
+            "entity": {"type": "InternetDomainName", "name": "evil.example"}
+        }
+
+        add_ip = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/admin/watchlists",
+                headers=hdrs,
+                json_body={
+                    "action": "add_entity",
+                    "list_id": "wl-123",
+                    "entity": "198.51.100.10",
+                    "double_confirmed": True,
+                },
+            )
+        )
+        assert add_ip.status == 200
+        assert spy_rf.calls[-1][2] == {"entity": {"type": "IpAddress", "name": "198.51.100.10"}}
+
+        add_id = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/admin/watchlists",
+                headers=hdrs,
+                json_body={
+                    "action": "add_entity",
+                    "list_id": "wl-123",
+                    "entity": "idn:evil.example",
+                    "double_confirmed": True,
+                },
+            )
+        )
+        assert add_id.status == 200
+        assert spy_rf.calls[-1][2] == {"entity": {"id": "idn:evil.example"}}
+
+        rem_dom = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/admin/watchlists",
+                headers=hdrs,
+                json_body={
+                    "action": "remove_entity",
+                    "list_id": "wl-123",
+                    "entity": "evil.example",
+                    "double_confirmed": True,
+                },
+            )
+        )
+        assert rem_dom.status == 200
+        assert spy_rf.calls[-1][1] == "/list/wl-123/entity/remove"
+        assert spy_rf.calls[-1][2] == {
+            "entity": {"type": "InternetDomainName", "name": "evil.example"}
+        }
+
+        bad_corr = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/splunk-es/correlation-toggle",
+                headers=hdrs,
+                json_body={"name": "   ", "enabled": True, "double_confirmed": True},
+            )
+        )
+        assert bad_corr.status == 400
+        assert spy_es.toggles == []
+
+        bad_conf = asyncio.run(
+            _call_asgi(
+                app,
+                "POST",
+                "/api/admin/splunk-bundle",
+                headers=hdrs,
+                json_body={"action": "validate", "conf_path": "../../etc/passwd"},
+            )
+        )
+        assert bad_conf.status == 400
+    finally:
+        app.state.runtime.cleanup()

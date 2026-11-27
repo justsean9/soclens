@@ -11,7 +11,7 @@ from soclens import __version__
 from soclens.agent_audit import AuditLogStore
 from soclens.agent_learning import SOCLearningManager
 from soclens.agent_orchestrator import SocAgentOrchestrator
-from soclens.agent_policy import AIPolicyStore
+from soclens.agent_policy import AIPolicyConfig, AIPolicyStore
 from soclens.agent_tools import ReadOnlyToolRegistry, build_default_readonly_registry
 from soclens.alert_cache import AlertCacheStore
 from soclens.api_access import ApiAccessRegistry
@@ -42,9 +42,9 @@ from soclens.settings import (
 )
 from soclens.splunk import SplunkClient
 from soclens.splunk_es import SPLUNK_ES_APP, SplunkESClient
-from soclens.storage import StorageManager
+from soclens.storage import DatabaseConfig, StorageManager, _sanitize_db_error
 from soclens.tui.logging_bridge import AppLogStore, LogEntry, TuiLogHandler
-from soclens.web.security import WebAuthManager
+from soclens.web.security import WebAuthManager, redact_web_payload
 from soclens.web.sse import SSEEventBus
 
 logger = logging.getLogger("soclens.web")
@@ -106,18 +106,44 @@ class WebRuntimeState:
         )
 
         ai_cache_root = self.workspace_dir / ".soclens_cache"
+        self.storage_error: str | None = None
         injected_storage = _get_session_override_obj(session_state, "storage")
         if isinstance(injected_storage, StorageManager):
             self.storage = injected_storage
         else:
-            db_cfg = get_database_config(workspace_dir=self.workspace_dir)
-            self.storage = StorageManager(db_cfg)
+            db_cfg: DatabaseConfig | None = None
             try:
-                self.storage.ensure_schema()
-                self.storage.migrate_legacy_files(ai_cache_root)
-                self.storage.prune_expired(retention_days=db_cfg.retention_days)
+                db_cfg = get_database_config(workspace_dir=self.workspace_dir)
+                self.storage = StorageManager(db_cfg)
             except Exception as exc:
-                logger.warning("Storage initialization warning: %s", exc)
+                self.storage_error = str(redact_web_payload(_sanitize_db_error(exc)))
+                logger.warning("Database config warning: %s", self.storage_error)
+                self.storage = StorageManager(
+                    DatabaseConfig(sqlite_path=ai_cache_root / "soclens.db")
+                )
+            else:
+                db_existed_before = (
+                    db_cfg.effective_dialect() == "sqlite"
+                    and db_cfg.sqlite_path is not None
+                    and str(db_cfg.sqlite_path) != ":memory:"
+                    and Path(db_cfg.sqlite_path).is_file()
+                )
+                has_cache_dir = ai_cache_root.is_dir()
+                try:
+                    self.storage.ensure_schema()
+                    migrated_any = False
+                    if has_cache_dir:
+                        mig_counts = self.storage.migrate_legacy_files(ai_cache_root)
+                        migrated_any = any(v > 0 for v in mig_counts.values())
+                    if db_existed_before or migrated_any or db_cfg.effective_dialect() != "sqlite":
+                        self.storage.prune_expired(retention_days=db_cfg.retention_days)
+                except Exception as exc:
+                    self.storage_error = str(
+                        redact_web_payload(_sanitize_db_error(exc, db_cfg))
+                    )
+                    logger.warning("Storage initialization warning: %s", self.storage_error)
+
+        active_storage: StorageManager | None = None if self.storage_error is not None else self.storage
 
         injected_alert_cache = _get_session_override_obj(session_state, "alert_cache")
         if isinstance(injected_alert_cache, AlertCacheStore):
@@ -126,7 +152,7 @@ class WebRuntimeState:
             self.alert_cache = AlertCacheStore(
                 cache_dir=ai_cache_root / "alerts",
                 load_on_init=False,
-                storage=self.storage,
+                storage=active_storage,
             )
             try:
                 self.alert_cache.load_from_disk_sources()
@@ -136,24 +162,37 @@ class WebRuntimeState:
         self.api_access = ApiAccessRegistry(state_path=ai_cache_root / "api_access.json")
         self.ai_policy_store = AIPolicyStore(
             path=ai_cache_root / "ai_policy.json",
-            storage=self.storage,
+            storage=active_storage,
         )
         self.ai_audit_store = AuditLogStore(
             path=ai_cache_root / "ai_audit.jsonl",
-            storage=self.storage,
+            storage=active_storage,
         )
         self.event_ai_store = EventAIStore(
             path=ai_cache_root / "event_ai_panels.json",
-            storage=self.storage,
+            storage=active_storage,
         )
 
         self._ai_kill_event = threading.Event()
-        initial_policy = self.ai_policy_store.load()
+        try:
+            initial_policy = self.ai_policy_store.load()
+        except Exception as exc:
+            self.storage_error = self.storage_error or str(
+                redact_web_payload(_sanitize_db_error(exc, self.storage.config))
+            )
+            self.ai_policy_store.rebind_storage(None)
+            try:
+                initial_policy = self.ai_policy_store.load()
+            except Exception:
+                initial_policy = AIPolicyConfig()
         if initial_policy.ai_kill_switch_active:
             if initial_policy.kill_switch_persist_across_restarts:
                 self._ai_kill_event.set()
             else:
-                self.ai_policy_store.update(ai_kill_switch_active=False)
+                try:
+                    self.ai_policy_store.update(ai_kill_switch_active=False)
+                except Exception:
+                    pass
 
         injected_lm = _get_session_override_obj(session_state, "learning_manager")
         if isinstance(injected_lm, SOCLearningManager):
@@ -165,10 +204,11 @@ class WebRuntimeState:
                 policy_store=self.ai_policy_store,
                 audit_store=self.ai_audit_store,
             )
-        try:
-            self.learning_manager.load_base_knowledge(self.workspace_dir)
-        except Exception:
-            pass
+        if self.storage_error is None:
+            try:
+                self.learning_manager.load_base_knowledge(self.workspace_dir)
+            except Exception:
+                pass
 
         self.ai_tool_registry: ReadOnlyToolRegistry = build_default_readonly_registry(
             rf_client=self.get_rf_client,
@@ -341,12 +381,28 @@ class WebRuntimeState:
         with self._lock:
             db_cfg = get_database_config(workspace_dir=self.workspace_dir)
             self.storage.rebind_config(db_cfg)
-            self.storage.ensure_schema()
-            self.storage.prune_expired(retention_days=db_cfg.retention_days)
+            try:
+                self.storage.ensure_schema()
+                self.storage.prune_expired(retention_days=db_cfg.retention_days)
+                self.storage_error = None
+            except Exception as exc:
+                self.storage_error = str(
+                    redact_web_payload(_sanitize_db_error(exc, db_cfg))
+                )
+                self.alert_cache.rebind_storage(None)
+                self.ai_policy_store.rebind_storage(None)
+                self.ai_audit_store.rebind_storage(None)
+                self.event_ai_store.rebind_storage(None)
+                self.sse_bus.publish("status", self.get_status_payload())
+                raise
             self.alert_cache.rebind_storage(self.storage)
             self.ai_policy_store.rebind_storage(self.storage)
             self.ai_audit_store.rebind_storage(self.storage)
             self.event_ai_store.rebind_storage(self.storage)
+            try:
+                self.learning_manager.load_base_knowledge(self.workspace_dir)
+            except Exception:
+                pass
             self.sse_bus.publish("status", self.get_status_payload())
             return self.storage
 
@@ -402,6 +458,8 @@ class WebRuntimeState:
             "profile_name": self.storage.config.profile_name,
             "web_layout_profile": self.web_layout_profile,
             "dialect": self.storage.dialect,
+            "storage_ok": self.storage_error is None,
+            "storage_error": self.storage_error,
             "ai_kill_switch_active": self.is_ai_killed(),
             "learning_mode": learning_mode,
             "settings_locked": is_settings_locked(),

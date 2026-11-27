@@ -160,6 +160,8 @@ def parse_validated_local_host(
             return False, 400, "Out-of-range port in Host header."
         if bound_port is not None and port_num != bound_port:
             return False, 403, f"Host port {port_num} does not match bound port {bound_port}."
+    elif bound_port is not None and bound_port != 80:
+        return False, 403, f"Host header missing port; expected bound port {bound_port}."
 
     return True, 200, "ok"
 
@@ -187,8 +189,10 @@ def validate_origin_header(
         origin_port = parsed.port
     except ValueError:
         return False, "Invalid port in Origin header."
-    if bound_port is not None and origin_port is not None and origin_port != bound_port:
-        return False, f"Origin port {origin_port} does not match bound port {bound_port}."
+    if bound_port is not None:
+        effective_origin_port = origin_port if origin_port is not None else 80
+        if effective_origin_port != bound_port:
+            return False, f"Origin port {effective_origin_port} does not match bound port {bound_port}."
     return True, "ok"
 
 

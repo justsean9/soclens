@@ -114,6 +114,11 @@ def test_static_assets_are_100_percent_offline_and_secret_free(tmp_path: Path) -
     assert "EventSource" in combined_js
     assert "Raw JSON" in combined_js
     assert "Double Confirmation" in combined_js
+    assert "unified_verdict" in combined_js
+    assert "Object.entries(sectionsObj)" in combined_js
+    assert "threatInfo" in combined_js
+    assert "agentRealtimeInfo" in combined_js
+    assert "payload.mode" in combined_js
     for key in ('"v"', '"s"', '"z"', '"q"', '"h"', '"j"', '"k"', '"l"', '"1"', '"5"', '"k"'):
         assert key in combined_js
 

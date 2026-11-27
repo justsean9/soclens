@@ -599,13 +599,15 @@ class DatabaseConfig:
 
     def effective_dialect(self) -> str:
         """Return normalized logical dialect: ``sqlite``, ``postgres``, or ``mysql``."""
-        if self.backend in {"sqlite", "postgres", "mysql"}:
-            return self.backend
-        low = (self.dsn or "").lower()
+        low = (self.dsn or "").strip().lower()
         if low.startswith(("postgresql", "postgres")):
             return "postgres"
         if low.startswith(("mysql", "mariadb")):
             return "mysql"
+        if low.startswith("sqlite"):
+            return "sqlite"
+        if self.backend in {"sqlite", "postgres", "mysql"}:
+            return self.backend
         return "sqlite"
 
     def __repr__(self) -> str:

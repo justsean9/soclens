@@ -360,6 +360,8 @@ async def splunk_es_action_endpoint(request: Request) -> JSONResponse:
                 if not bool(body.get("double_confirmed")):
                     return {"ok": False, "error": "Double confirmation required."}, 400
                 name = str(body.get("name") or "").strip()
+                if not name:
+                    return {"ok": False, "error": "Correlation search name is required."}, 400
                 enabled = bool(body.get("enabled", True))
                 res = es.set_correlation_search_enabled(name, enabled=enabled)
                 return {"ok": True, "result": redact_web_payload(res)}, 200

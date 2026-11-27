@@ -44,7 +44,7 @@ from soclens.settings import (
     validate_settings_values,
 )
 from soclens.splunk import SplunkValidator
-from soclens.storage import test_db_connection
+from soclens.storage import _sanitize_db_error, test_db_connection
 from soclens.web.security import (
     is_sensitive_setting_key,
     redact_web_payload,
@@ -127,11 +127,15 @@ def _build_sanitized_settings_snapshot(
         "workstation_id": db_cfg.workstation_id,
         "profile_name": db_cfg.profile_name,
         "analyst_id": db_cfg.analyst_id,
+        "storage_ok": runtime.storage_error is None,
+        "storage_error": runtime.storage_error,
     }
     return redact_web_payload(
         {
             "ok": True,
             "locked": locked,
+            "storage_ok": runtime.storage_error is None,
+            "storage_error": runtime.storage_error,
             "encryption": {
                 "encrypted": bool(encryption.get("encrypted", False)),
                 "mode": encryption.get("mode"),
@@ -183,7 +187,10 @@ async def post_settings_endpoint(request: Request) -> JSONResponse:
                 unlock_settings(passphrase)
             except Exception as exc:
                 return {"ok": False, "error": str(redact_web_payload(str(exc)))}, 400
-            runtime.rebind_storage_from_settings()
+            try:
+                runtime.rebind_storage_from_settings()
+            except Exception:
+                pass
             snap = _build_sanitized_settings_snapshot(runtime)
             snap["message"] = "Settings unlocked in process memory."
             return snap, 200
@@ -199,7 +206,10 @@ async def post_settings_endpoint(request: Request) -> JSONResponse:
             if cleaned_sess:
                 set_session_overrides(cleaned_sess, vault_hydrated=False)
                 if any(k in _DB_REBIND_KEYS for k in cleaned_sess):
-                    runtime.rebind_storage_from_settings()
+                    try:
+                        runtime.rebind_storage_from_settings()
+                    except Exception:
+                        pass
             snap = _build_sanitized_settings_snapshot(runtime)
             snap["message"] = "Session overrides updated in process memory."
             return snap, 200
@@ -265,9 +275,12 @@ async def unlock_settings_endpoint(request: Request) -> JSONResponse:
             passphrase = body.get("unlock_passphrase")
         try:
             unlock_settings(str(passphrase) if passphrase is not None else None)
-            runtime.rebind_storage_from_settings()
         except Exception as exc:
             return {"ok": False, "error": str(redact_web_payload(str(exc)))}, 400
+        try:
+            runtime.rebind_storage_from_settings()
+        except Exception:
+            pass
         return _build_sanitized_settings_snapshot(runtime), 200
 
     payload, status = await anyio.to_thread.run_sync(_run)
@@ -306,12 +319,12 @@ async def test_db_endpoint(request: Request) -> JSONResponse:
             "db_host": "host",
             "port": "port",
             "db_port": "port",
-            "name": "name",
-            "database": "name",
-            "db_name": "name",
-            "user": "user",
-            "username": "user",
-            "db_user": "user",
+            "name": "database",
+            "database": "database",
+            "db_name": "database",
+            "user": "username",
+            "username": "username",
+            "db_user": "username",
             "password": "password",
             "db_password": "password",
             "ssl_mode": "ssl_mode",
@@ -339,6 +352,8 @@ async def test_db_endpoint(request: Request) -> JSONResponse:
                 continue
             if dst_key in ("port", "pool_size", "max_overflow", "retention_days"):
                 try:
+                    if isinstance(val, bool):
+                        raise ValueError("Boolean is not a valid integer")
                     overrides[dst_key] = int(val)
                 except (TypeError, ValueError):
                     return {
@@ -350,7 +365,23 @@ async def test_db_endpoint(request: Request) -> JSONResponse:
             else:
                 overrides[dst_key] = str(val).strip()
 
-        cfg = get_database_config(**overrides)
+        try:
+            cfg = get_database_config(**overrides)
+        except (ConfigurationError, ValueError) as exc:
+            err_text = _sanitize_db_error(exc)
+            pw_val = str(overrides.get("password") or "")
+            if pw_val:
+                err_text = err_text.replace(pw_val, "<REDACTED>")
+            return dict(
+                redact_web_payload(
+                    {
+                        "ok": False,
+                        "dialect": str(overrides.get("backend") or body.get("backend") or "sqlite"),
+                        "version": "",
+                        "error": err_text,
+                    }
+                )
+            )
         res = test_db_connection(cfg)
         return dict(redact_web_payload(res))
 

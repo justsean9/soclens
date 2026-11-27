@@ -393,26 +393,106 @@
               },
             });
             const dossier = data.dossier || {};
-            statusBadge.textContent = "Target: " + (dossier.target || target);
+            const tgtObj = dossier.target && typeof dossier.target === "object" ? dossier.target : null;
+            const tgtDisplay = tgtObj
+              ? (tgtObj.raw_query || tgtObj.canonical_name || target)
+              : (dossier.target || target);
+            statusBadge.textContent = "Target: " + tgtDisplay;
             wrapper.setData(dossier, function (host, d) {
+              const tObj = d.target && typeof d.target === "object" ? d.target : null;
+              const tDisplay = tObj
+                ? (tObj.raw_query || tObj.canonical_name || target)
+                : (d.target || target);
+              const tType = (tObj && (tObj.detected_kind || tObj.rf_type)) || d.entity_type || "-";
+              const verdict = d.unified_verdict && typeof d.unified_verdict === "object" ? d.unified_verdict : {};
+              const riskDisplay = d.risk_score !== null && d.risk_score !== undefined
+                ? String(d.risk_score) + (d.criticality_label ? " (" + d.criticality_label + ")" : "")
+                : (d.risk_string || "-");
               const cards = el("div", { className: "sl-card-grid" });
-              cards.appendChild(
-                el("div", { className: "sl-card" }, [
-                  el("div", { className: "sl-card-title", textContent: "Indicator Summary" }),
-                  el("div", { textContent: "Target: " + (d.target || target) }),
-                  el("div", { textContent: "Type: " + (d.entity_type || "-") }),
-                  el("div", { textContent: "Risk Score: " + (d.risk_score !== undefined ? d.risk_score : "-") }),
-                ])
-              );
-              const findings = d.findings || d.osint_results || [];
-              if (Array.isArray(findings)) {
-                for (const f of findings.slice(0, 12)) {
+              const summaryNodes = [
+                el("div", { className: "sl-card-title", textContent: "Indicator Summary" }),
+                el("div", { textContent: "Target: " + tDisplay }),
+                el("div", { textContent: "Type: " + tType }),
+                el("div", { textContent: "Risk Score: " + riskDisplay }),
+                el("div", {
+                  textContent:
+                    "Verdict: " +
+                    (verdict.label || verdict.level || "-") +
+                    (verdict.summary ? " — " + verdict.summary : ""),
+                }),
+              ];
+              if (verdict.rf_sources_ok !== undefined || verdict.osint_sources_ok !== undefined) {
+                summaryNodes.push(
+                  el("div", {
+                    textContent:
+                      "Sources OK: RF=" +
+                      (verdict.rf_sources_ok ?? 0) +
+                      " | OSINT=" +
+                      (verdict.osint_sources_ok ?? 0) +
+                      (verdict.osint_sources_total ? "/" + verdict.osint_sources_total : ""),
+                  })
+                );
+              }
+              if (d.ai_summary) {
+                summaryNodes.push(el("div", { textContent: "Summary: " + String(d.ai_summary).slice(0, 240) }));
+              }
+              cards.appendChild(el("div", { className: "sl-card" }, summaryNodes));
+
+              function formatSectionBody(sec) {
+                if (!sec || typeof sec !== "object") return String(sec || "-");
+                const parts = [];
+                if (sec.message) parts.push(String(sec.message));
+                if (sec.data !== null && sec.data !== undefined) {
+                  if (typeof sec.data === "string") {
+                    parts.push(sec.data);
+                  } else if (Array.isArray(sec.data)) {
+                    parts.push(sec.data.length + " item(s): " + JSON.stringify(sec.data.slice(0, 3)));
+                  } else if (typeof sec.data === "object") {
+                    const kv = Object.entries(sec.data)
+                      .slice(0, 6)
+                      .map(function (entry) {
+                        const v = entry[1];
+                        const s = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+                        return entry[0] + "=" + s;
+                      })
+                      .join(", ");
+                    if (kv) parts.push(kv);
+                  } else {
+                    parts.push(String(sec.data));
+                  }
+                }
+                const combined = parts.join(" — ").trim();
+                return combined ? combined.slice(0, 260) : "Status: " + (sec.status || "ok");
+              }
+
+              const sectionsObj = d.sections && typeof d.sections === "object" ? d.sections : null;
+              if (sectionsObj) {
+                for (const [secKey, sec] of Object.entries(sectionsObj)) {
+                  if (!sec || typeof sec !== "object") continue;
+                  const grp = sec.source_group ? "[" + String(sec.source_group).toUpperCase() + "] " : "";
+                  const cnt = sec.count ? " (" + sec.count + ")" : "";
+                  const st = sec.status ? " · " + sec.status : "";
                   cards.appendChild(
                     el("div", { className: "sl-card" }, [
-                      el("div", { className: "sl-card-title", textContent: f.source || f.module || "Source" }),
-                      el("div", { textContent: f.summary || JSON.stringify(f).slice(0, 220) }),
+                      el("div", {
+                        className: "sl-card-title",
+                        textContent: grp + (sec.title || secKey) + cnt + st,
+                      }),
+                      el("div", { textContent: formatSectionBody(sec) }),
                     ])
                   );
+                }
+              } else {
+                const findings = d.findings || d.osint_results || [];
+                if (Array.isArray(findings)) {
+                  for (const f of findings.slice(0, 12)) {
+                    cards.appendChild(
+                      el("div", { className: "sl-card" }, [
+                        el("div", { className: "sl-card-title", textContent: f.source || f.module || "Source" }),
+                        el("div", { textContent: f.summary || JSON.stringify(f).slice(0, 220) }),
+                      ])
+                    );
+                  }
                 }
               }
               host.appendChild(cards);
@@ -563,16 +643,77 @@
                 renderFormattedTable(
                   d.items || [],
                   [
-                    { key: "id", label: "ID", get: function (r) { return r.id || "-"; } },
-                    { key: "name", label: "Threat / Host", pivot: true, get: function (r) { return r.threatName || r.computerName || r.name || r.value || "-"; } },
-                    { key: "site", label: "Site", get: function (r) { return r.siteName || r.siteId || "-"; } },
-                    { key: "verdict", label: "Verdict / Status", get: function (r) { return r.analystVerdict || r.incidentStatus || r.networkStatus || "-"; } },
-                    { key: "hash", label: "SHA1 / IP", pivot: true, get: function (r) { return r.sha1 || r.lastIpToMgmt || "-"; } },
+                    { key: "id", label: "ID", get: function (r) { return r.id || (r.threatInfo && r.threatInfo.threatId) || (r.alertInfo && r.alertInfo.alertId) || "-"; } },
+                    {
+                      key: "name",
+                      label: "Threat / Host",
+                      pivot: true,
+                      get: function (r) {
+                        return (
+                          r.threatName ||
+                          (r.threatInfo && r.threatInfo.threatName) ||
+                          (r.ruleInfo && r.ruleInfo.name) ||
+                          r.computerName ||
+                          (r.agentRealtimeInfo && r.agentRealtimeInfo.agentComputerName) ||
+                          (r.agentDetectionInfo && r.agentDetectionInfo.agentDomain) ||
+                          r.name ||
+                          r.value ||
+                          "-"
+                        );
+                      },
+                    },
+                    {
+                      key: "site",
+                      label: "Site",
+                      get: function (r) {
+                        return (
+                          r.siteName ||
+                          (r.agentRealtimeInfo && r.agentRealtimeInfo.siteName) ||
+                          (r.agentDetectionInfo && r.agentDetectionInfo.siteName) ||
+                          r.siteId ||
+                          (r.agentRealtimeInfo && r.agentRealtimeInfo.siteId) ||
+                          "-"
+                        );
+                      },
+                    },
+                    {
+                      key: "verdict",
+                      label: "Verdict / Status",
+                      get: function (r) {
+                        return (
+                          r.analystVerdict ||
+                          (r.threatInfo && r.threatInfo.analystVerdict) ||
+                          (r.alertInfo && r.alertInfo.analystVerdict) ||
+                          r.incidentStatus ||
+                          (r.threatInfo && r.threatInfo.incidentStatus) ||
+                          r.mitigationStatus ||
+                          (r.threatInfo && r.threatInfo.mitigationStatus) ||
+                          r.networkStatus ||
+                          "-"
+                        );
+                      },
+                    },
+                    {
+                      key: "hash",
+                      label: "SHA1 / IP",
+                      pivot: true,
+                      get: function (r) {
+                        return (
+                          r.sha1 ||
+                          (r.threatInfo && (r.threatInfo.sha1 || r.threatInfo.sha256)) ||
+                          r.lastIpToMgmt ||
+                          (r.agentRealtimeInfo && r.agentRealtimeInfo.agentIpV4) ||
+                          (r.agentDetectionInfo && r.agentDetectionInfo.agentIpV4) ||
+                          "-"
+                        );
+                      },
+                    },
                   ],
                   {
                     actions: function (row) {
                       const btns = [];
                       if (view === "agents" && row.id) {
+                        const compName = row.computerName || (row.agentRealtimeInfo && row.agentRealtimeInfo.agentComputerName) || row.id;
                         btns.push(
                           el("button", {
                             className: "sl-btn sl-btn-danger",
@@ -581,7 +722,7 @@
                               ev.stopPropagation();
                               showDoubleConfirmModal(
                                 "SentinelOne Isolate Endpoint",
-                                "Disconnect endpoint " + (row.computerName || row.id) + " from network?",
+                                "Disconnect endpoint " + compName + " from network?",
                                 async function () {
                                   await API.apiFetch("/api/sentinelone/action", {
                                     method: "POST",
@@ -681,6 +822,7 @@
       admin: false,
       mount: function (root) {
         let activeSub = "chat";
+        let activeMode = "full_investigation";
         const sessions = new Map([["chat-1", []]]);
         let currentSessionId = "chat-1";
         let attachedContext = "";
@@ -740,6 +882,10 @@
             el("option", { value: "full_investigation", textContent: "Full Investigation (Tools ON)" }),
             el("option", { value: "ask_only", textContent: "Ask About Event Only (No Tools)" }),
           ]);
+          modeSel.value = activeMode;
+          modeSel.addEventListener("change", function () {
+            activeMode = modeSel.value;
+          });
           const providerSel = el("select", { className: "sl-select" }, [
             el("option", { value: "", textContent: "Provider: Default" }),
             el("option", { value: "ollama", textContent: "Ollama" }),
@@ -1040,9 +1186,15 @@
           if (payload.openTeach) {
             showTeachModal(payload.title || "Learned Pivot", payload.indicator || "", function () {
               activeSub = "knowledge";
+              for (const k of Object.keys(subBtns)) {
+                subBtns[k].classList.toggle("active", k === activeSub);
+              }
               renderSub();
             });
             return;
+          }
+          if (payload.mode === "ask_only" || payload.mode === "full_investigation") {
+            activeMode = payload.mode;
           }
           if (payload.event || payload.indicator) {
             attachedTitle = payload.title || payload.indicator || "Pivot Context";
@@ -1050,6 +1202,11 @@
               ? JSON.stringify(payload.event, null, 2)
               : "Investigate indicator: " + payload.indicator;
             activeSub = "chat";
+            for (const k of Object.keys(subBtns)) {
+              subBtns[k].classList.toggle("active", k === activeSub);
+            }
+            renderSub();
+          } else if (payload.mode === "ask_only" || payload.mode === "full_investigation") {
             renderSub();
           }
         };
