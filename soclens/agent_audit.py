@@ -322,16 +322,30 @@ _ENV_VAR_REF_RE = re.compile(
     r"^(?:\$[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|\$\{[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\}|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)$"
 )
 _ENV_VAR_BRACED_AT_START_RE = re.compile(
-    r"\$\{[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\}(?=$|[\s,;\"'<>}\])&.])"
+    r"\$\{[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\}(?=[\])](?:$|\s|[,;\"'})\]&<]))"
+)
+_AUTH_SCHEME_ENV_VAR_REF_RE = re.compile(
+    r"^(?i:"
+    + _AUTH_SINGLE_TOKEN_SCHEMES
+    + r")[ \t]+(?:\$[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|\$\{[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\})$"
 )
 
 
-def _is_env_var_reference(val: str, *, allow_trailing_dot: bool = False) -> bool:
+def _is_env_var_reference(
+    val: str,
+    *,
+    allow_trailing_dot: bool = False,
+    allow_auth_scheme: bool = False,
+) -> bool:
     if not val:
         return False
     if allow_trailing_dot and val.startswith("$") and val.endswith("."):
         return bool(_ENV_VAR_REF_RE.fullmatch(val[:-1]))
-    return bool(_ENV_VAR_REF_RE.fullmatch(val))
+    if _ENV_VAR_REF_RE.fullmatch(val):
+        return True
+    if allow_auth_scheme and _AUTH_SCHEME_ENV_VAR_REF_RE.fullmatch(val):
+        return True
+    return False
 
 
 _QUOTED_START_RE = re.compile(r"(\\*+)([\"'])")
@@ -343,7 +357,7 @@ _AUTH_UNKNOWN_SCHEME_RE = re.compile(
 )
 _BS_RUN_RE = re.compile(r"\\++")
 _CLOSING_TAG_RE = re.compile(r"</[A-Za-z][A-Za-z0-9:-]{0,31}>")
-_KV_STOP_SCAN_RE = re.compile(r"[&\s,;\"'<>}\])\\]")
+_KV_STOP_SCAN_RE = re.compile(r"[&\s,;\"'<>{}\])\\]")
 _KV_NEXT_KEY_RE = re.compile(
     rf"(?:[A-Za-z0-9_][A-Za-z0-9_-]*+|{_REDACTED_PLACEHOLDER_PAT})="
 )
@@ -362,9 +376,7 @@ _QUOTE_NO_NL_RE = re.compile(r"[\"'\\]")
 _BEARER_SCHEME_START_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_-])(?:(token_type)[ \t]*+[:=][ \t]*+)?(Bearer|ApiToken)[ \t]++"
 )
-_BEARER_UNQUOTED_VAL_RE = re.compile(
-    rf"(?:{_REDACTED_PLACEHOLDER_PAT}|[A-Za-z0-9._~+/=-])++"
-)
+_BEARER_PLAIN_RUN_RE = re.compile(r"[A-Za-z0-9._~+/=$-]++")
 _KV_SEP_AHEAD_RE = re.compile(r"[ \t]*+[=:]")
 _SPACE_EQ_RE = re.compile(r"[ \t]*+=[ \t]*+")
 _IDENT_FULL_RE = re.compile(r"[A-Za-z0-9_-]++")
@@ -379,7 +391,7 @@ _URL_QUERY_KEY_RE = re.compile(
     r"([?&;])([A-Za-z0-9_][A-Za-z0-9_-]*+)=",
     re.IGNORECASE,
 )
-_URL_QUERY_SCAN_RE = re.compile(r"[?&#;\s\"'<>}\]),]")
+_URL_QUERY_SCAN_RE = re.compile(r"[?&#;\s\"'<>{}\]),]")
 
 # 6. Quoted JSON/Python-repr/escaped-JSON secret fields (start anchor; closing quote scanned).
 _QUOTED_FIELD_START_RE = re.compile(
@@ -875,7 +887,7 @@ def _redact_quoted_fields(text: str, *, preserve_env_var_refs: bool = False) -> 
             if (
                 not val
                 or _is_redacted_placeholder(val)
-                or (preserve_env_var_refs and _is_env_var_reference(val))
+                or (preserve_env_var_refs and _is_env_var_reference(val, allow_auth_scheme=True))
             ):
                 parts.append(text[pos:end_idx])
                 pos = end_idx
@@ -890,7 +902,7 @@ def _redact_quoted_fields(text: str, *, preserve_env_var_refs: bool = False) -> 
         if (
             not val
             or _is_redacted_placeholder(val)
-            or (preserve_env_var_refs and _is_env_var_reference(val))
+            or (preserve_env_var_refs and _is_env_var_reference(val, allow_auth_scheme=True))
         ):
             parts.append(text[pos:close_end])
             pos = close_end
@@ -948,7 +960,7 @@ def _redact_quoted_assignments(text: str, *, preserve_env_var_refs: bool = False
             if (
                 not val
                 or _is_redacted_placeholder(val)
-                or (preserve_env_var_refs and _is_env_var_reference(val))
+                or (preserve_env_var_refs and _is_env_var_reference(val, allow_auth_scheme=True))
             ):
                 parts.append(text[pos:end_idx])
                 pos = end_idx
@@ -963,7 +975,7 @@ def _redact_quoted_assignments(text: str, *, preserve_env_var_refs: bool = False
         if (
             not val
             or _is_redacted_placeholder(val)
-            or (preserve_env_var_refs and _is_env_var_reference(val))
+            or (preserve_env_var_refs and _is_env_var_reference(val, allow_auth_scheme=True))
         ):
             parts.append(text[pos:close_end])
             pos = close_end
@@ -1013,6 +1025,7 @@ def _scan_url_query_value_end(text: str, start: int) -> int | None:
     n = len(text)
     cur = start
     angle_depth = 0
+    brace_depth = 0
     while cur < n:
         m = _URL_QUERY_SCAN_RE.search(text, cur)
         if m is None:
@@ -1028,6 +1041,18 @@ def _scan_url_query_value_end(text: str, start: int) -> int | None:
                 break
             cur = bs_end
             continue
+        if ch == "{":
+            if (pos_ch > start and text[pos_ch - 1] == "$") or brace_depth > 0:
+                brace_depth += 1
+            cur = pos_ch + 1
+            continue
+        if ch == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+                cur = pos_ch + 1
+                continue
+            end = pos_ch
+            break
         if ch == "<":
             ph_m = _REDACTED_PLACEHOLDER_RE.match(text, pos_ch)
             if ph_m is not None:
@@ -1058,6 +1083,7 @@ def _scan_kv_value_end(text: str, start: int, *, multi_param: bool = False) -> i
     n = len(text)
     cur = start
     angle_depth = 0
+    brace_depth = 0
     while cur < n:
         m = _KV_STOP_SCAN_RE.search(text, cur)
         if m is None:
@@ -1085,6 +1111,18 @@ def _scan_kv_value_end(text: str, start: int, *, multi_param: bool = False) -> i
                 break
             cur = bs_end
             continue
+        if ch == "{":
+            if (pos_ch > start and text[pos_ch - 1] == "$") or brace_depth > 0:
+                brace_depth += 1
+            cur = pos_ch + 1
+            continue
+        if ch == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+                cur = pos_ch + 1
+                continue
+            end = pos_ch
+            break
         if ch == "<":
             ph_m = _REDACTED_PLACEHOLDER_RE.match(text, pos_ch)
             if ph_m is not None:
@@ -1224,13 +1262,6 @@ def _redact_url_query_secrets(text: str, *, preserve_env_var_refs: bool = False)
             parts.append(text[pos : match.start()])
             parts.append(f"{match.group(1)}{param}={q}<REDACTED>{q}")
             pos = close_end
-            continue
-
-        if preserve_env_var_refs and (
-            braced_m := _ENV_VAR_BRACED_AT_START_RE.match(text, val_start)
-        ) is not None:
-            parts.append(text[pos : braced_m.end()])
-            pos = braced_m.end()
             continue
 
         val_end = _scan_url_query_value_end(text, val_start)
@@ -2430,6 +2461,39 @@ def _redact_header_kvs(text: str, *, preserve_env_var_refs: bool = False) -> str
     return "".join(parts)
 
 
+def _scan_bearer_unquoted_end(text: str, start: int) -> int | None:
+    """Monotonic O(N) scan for an unquoted Bearer/ApiToken value ending."""
+    n = len(text)
+    cur = start
+    brace_depth = 0
+    while cur < n:
+        m = _BEARER_PLAIN_RUN_RE.match(text, cur)
+        if m is not None:
+            cur = m.end()
+            continue
+        ch = text[cur]
+        if ch == "<":
+            ph_m = _REDACTED_PLACEHOLDER_RE.match(text, cur)
+            if ph_m is not None:
+                cur = ph_m.end()
+                continue
+            break
+        if ch == "{":
+            if (cur > start and text[cur - 1] == "$") or brace_depth > 0:
+                brace_depth += 1
+                cur += 1
+                continue
+            break
+        if ch == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+                cur += 1
+                continue
+            break
+        break
+    return cur if cur > start else None
+
+
 def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) -> str:
     parts: list[str] = []
     pos = 0
@@ -2594,40 +2658,40 @@ def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) ->
                 pos = close_end
                 continue
 
-        val_m = _BEARER_UNQUOTED_VAL_RE.match(text, val_start)
-        if val_m is None:
+        val_end = _scan_bearer_unquoted_end(text, val_start)
+        if val_end is None:
             parts.append(text[pos:val_start])
             pos = val_start
             continue
-        val = val_m.group(0)
+        val = text[val_start:val_end]
         if _is_redacted_placeholder(val) or (
             preserve_env_var_refs and _is_env_var_reference(val, allow_trailing_dot=True)
         ):
-            parts.append(text[pos : val_m.end()])
-            pos = val_m.end()
+            parts.append(text[pos:val_end])
+            pos = val_end
             continue
         if (
             val.lower() in _NON_SECRET_METADATA_KEYS
-            and _KV_SEP_AHEAD_RE.match(text, val_m.end()) is not None
+            and _KV_SEP_AHEAD_RE.match(text, val_end) is not None
         ):
-            parts.append(text[pos : val_m.end()])
-            pos = val_m.end()
+            parts.append(text[pos:val_end])
+            pos = val_end
             continue
         if (
             _IDENT_FULL_RE.fullmatch(val) is not None
-            and (sp_eq := _SPACE_EQ_RE.match(text, val_m.end())) is not None
+            and (sp_eq := _SPACE_EQ_RE.match(text, val_end)) is not None
         ):
             val_low = val.lower()
             if val_low in _NON_AUTH_LOG_KEYS or val_low in _NON_AUTH_SPACE_LOG_KEYS:
-                parts.append(text[pos : val_m.end()])
-                pos = val_m.end()
+                parts.append(text[pos:val_end])
+                pos = val_end
                 continue
-            rhs_m = _BEARER_UNQUOTED_VAL_RE.match(text, sp_eq.end())
-            if rhs_m is not None:
-                rhs = rhs_m.group(0)
+            rhs_end = _scan_bearer_unquoted_end(text, sp_eq.end())
+            if rhs_end is not None:
+                rhs = text[sp_eq.end() : rhs_end]
                 if _is_redacted_placeholder(rhs):
-                    parts.append(text[pos : rhs_m.end()])
-                    pos = rhs_m.end()
+                    parts.append(text[pos:rhs_end])
+                    pos = rhs_end
                     continue
                 rhs_has_ph = (
                     "<REDACTED" in rhs and _REDACTED_PLACEHOLDER_RE.search(rhs) is not None
@@ -2635,10 +2699,10 @@ def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) ->
                 if rhs_has_ph or len(rhs) >= 6 or len(val) >= 6:
                     parts.append(text[pos : match.start()])
                     parts.append(f"{match.group(2)} <REDACTED>")
-                    pos = rhs_m.end()
+                    pos = rhs_end
                     continue
-                parts.append(text[pos : rhs_m.end()])
-                pos = rhs_m.end()
+                parts.append(text[pos:rhs_end])
+                pos = rhs_end
                 continue
         if (kv_p := _AUTH_KV_PREFIX_RE.match(val)) is not None and kv_p.group(2) == "=":
             k_low = kv_p.group(1).lower()
@@ -2646,21 +2710,21 @@ def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) ->
                 not _is_sensitive_key(k_low)
                 and (k_low in _NON_AUTH_LOG_KEYS or k_low in _NON_AUTH_SPACE_LOG_KEYS)
             ):
-                parts.append(text[pos : val_m.end()])
-                pos = val_m.end()
+                parts.append(text[pos:val_end])
+                pos = val_end
                 continue
             if _AUTH_REDACTED_KV_RE.fullmatch(val) is not None:
-                parts.append(text[pos : val_m.end()])
-                pos = val_m.end()
+                parts.append(text[pos:val_end])
+                pos = val_end
                 continue
         has_placeholder = "<REDACTED" in val and _REDACTED_PLACEHOLDER_RE.search(val) is not None
         if has_placeholder or len(val) >= 6:
             parts.append(text[pos : match.start()])
             parts.append(f"{match.group(2)} <REDACTED>")
-            pos = val_m.end()
+            pos = val_end
             continue
-        parts.append(text[pos : val_m.end()])
-        pos = val_m.end()
+        parts.append(text[pos:val_end])
+        pos = val_end
     if pos == 0:
         return text
     parts.append(text[pos:])
@@ -2708,7 +2772,7 @@ def _redact_recursive(
                 elif (
                     preserve_env_var_refs
                     and isinstance(raw_v, str)
-                    and _is_env_var_reference(raw_v)
+                    and _is_env_var_reference(raw_v, allow_auth_scheme=True)
                 ):
                     redacted[key_str] = raw_v
                 elif isinstance(raw_v, Mapping):

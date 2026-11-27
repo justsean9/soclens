@@ -3383,6 +3383,99 @@ def test_ai_policy_learning_mode_defaults_manual_and_persists(tmp_path: Path) ->
     assert store.load().learning_mode == "auto"
 
 
+def test_redact_sensitive_data_braced_env_prefixed_unquoted_secrets_and_audit_store(
+    tmp_path: Path,
+) -> None:
+    scrubbed_cases = [
+        ("API_KEY=${SPLUNK_API_TOKEN}_real_secret_suffix", "API_KEY=<REDACTED>"),
+        ("API_KEY=${FAKE}real_secret_suffix", "API_KEY=<REDACTED>"),
+        (
+            "Authorization: Bearer ${SPLUNK_API_TOKEN}extra_secret",
+            "Authorization: Bearer <REDACTED>",
+        ),
+        (
+            "https://splunk.corp/api?token=${SPLUNK_API_TOKEN}secret",
+            "https://splunk.corp/api?token=<REDACTED>",
+        ),
+        ("Bearer ${SPLUNK_API_TOKEN}extra_secret", "Bearer <REDACTED>"),
+        ("Bearer ${FAKE}secret", "Bearer <REDACTED>"),
+        ("API_KEY=${SPLUNK_API_TOKEN}.real_secret_suffix", "API_KEY=<REDACTED>"),
+        ("API_KEY=${SPLUNK_API_TOKEN}&real_secret_suffix", "API_KEY=<REDACTED>"),
+        ("API_KEY=${SPLUNK_API_TOKEN}<real_secret_suffix", "API_KEY=<REDACTED>"),
+        (
+            "https://splunk.corp/api?token=${SPLUNK_API_TOKEN}.secret&mode=ro",
+            "https://splunk.corp/api?token=<REDACTED>&mode=ro",
+        ),
+        ("API_KEY=${OUTER_${INNER}}_suffix", "API_KEY=<REDACTED>"),
+        ("{api_key=${SPLUNK_API_TOKEN}_real_secret_suffix}", "{api_key=<REDACTED>}"),
+        ("{api_key=secret}", "{api_key=<REDACTED>}"),
+        ("{api_key=sec{ret}", "{api_key=<REDACTED>}"),
+    ]
+    for raw, expected in scrubbed_cases:
+        out_strict = redact_sensitive_data(raw, preserve_env_var_refs=False)
+        out_guard = redact_sensitive_data(raw, preserve_env_var_refs=True)
+        assert out_strict == expected
+        assert out_guard == expected
+        assert "secret" not in out_strict
+        assert "secret" not in out_guard
+        assert redact_sensitive_data(out_strict, preserve_env_var_refs=False) == out_strict
+        assert redact_sensitive_data(out_guard, preserve_env_var_refs=True) == out_guard
+
+    standalone_cases = [
+        ("API_KEY=${SPLUNK_API_TOKEN}", "API_KEY=<REDACTED>"),
+        ("Authorization: Bearer ${SPLUNK_API_TOKEN}", "Authorization: Bearer <REDACTED>"),
+        ("Bearer ${SPLUNK_API_TOKEN}", "Bearer <REDACTED>"),
+        (
+            "https://splunk.corp/api?token=${SPLUNK_API_TOKEN}&mode=ro",
+            "https://splunk.corp/api?token=<REDACTED>&mode=ro",
+        ),
+        ('{"Authorization": "Bearer ${SPLUNK_API_TOKEN}"}', '{"Authorization": "<REDACTED>"}'),
+        ("{Authorization: Bearer ${SPLUNK_API_TOKEN}}", "{Authorization: Bearer <REDACTED>}"),
+    ]
+    for raw, strict_expected in standalone_cases:
+        assert redact_sensitive_data(raw, preserve_env_var_refs=True) == raw
+        out_strict = redact_sensitive_data(raw, preserve_env_var_refs=False)
+        assert out_strict == strict_expected
+        assert redact_sensitive_data(out_strict, preserve_env_var_refs=False) == out_strict
+
+    assert redact_sensitive_data(
+        {"Authorization": "Bearer ${SPLUNK_API_TOKEN}"},
+        preserve_env_var_refs=True,
+    ) == {"Authorization": "Bearer ${SPLUNK_API_TOKEN}"}
+    assert redact_sensitive_data(
+        {"Authorization": "Bearer ${SPLUNK_API_TOKEN}"},
+        preserve_env_var_refs=False,
+    ) == {"Authorization": "<REDACTED>"}
+    assert redact_sensitive_data(
+        {"Authorization": "Bearer ${SPLUNK_API_TOKEN}extra_secret"},
+        preserve_env_var_refs=True,
+    ) == {"Authorization": "<REDACTED>"}
+
+    audit_store = AuditLogStore(tmp_path / "ai_audit.jsonl")
+    for idx, (raw, expected) in enumerate(scrubbed_cases[:4] + standalone_cases[:4]):
+        entry = audit_store.append(
+            AuditEntry(
+                entry_id="",
+                timestamp="",
+                run_id=f"run-braced-{idx}",
+                event_key="splunk:default:1",
+                provider="openai",
+                mode="full_investigation",
+                event_type="prompt",
+                reason=raw,
+                payload={"raw": raw},
+            )
+        )
+        assert entry.reason == expected
+        assert entry.payload["raw"] == expected
+        assert "secret" not in entry.reason
+        assert "SPLUNK_API_TOKEN" not in entry.reason
+    audit_raw = (tmp_path / "ai_audit.jsonl").read_text(encoding="utf-8")
+    assert "real_secret_suffix" not in audit_raw
+    assert "extra_secret" not in audit_raw
+    assert "SPLUNK_API_TOKEN" not in audit_raw
+
+
 
 
 

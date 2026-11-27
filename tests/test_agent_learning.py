@@ -409,3 +409,65 @@ def test_passive_discovery_supports_s1_get_agent_flat_and_wrapped_outputs(tmp_pa
     assert len(wrapped) == 1
     assert "EMEA-DC" in wrapped[0].title
     assert "linux" in wrapped[0].title
+
+
+def test_secret_guard_scrubs_braced_env_prefixed_unquoted_secret_suffixes(tmp_path: Path) -> None:
+    storage, manager = _make_manager(tmp_path)
+
+    bypass_payloads = [
+        ("API_KEY=${SPLUNK_API_TOKEN}_real_secret_suffix", "API_KEY=<REDACTED>"),
+        ("API_KEY=${FAKE}real_secret_suffix", "API_KEY=<REDACTED>"),
+        (
+            "Authorization: Bearer ${SPLUNK_API_TOKEN}extra_secret",
+            "Authorization: Bearer <REDACTED>",
+        ),
+        (
+            "https://splunk.corp/api?token=${SPLUNK_API_TOKEN}secret",
+            "https://splunk.corp/api?token=<REDACTED>",
+        ),
+        ("Bearer ${SPLUNK_API_TOKEN}extra_secret", "Bearer <REDACTED>"),
+        ("API_KEY=${SPLUNK_API_TOKEN}.real_secret_suffix", "API_KEY=<REDACTED>"),
+        ("API_KEY=${SPLUNK_API_TOKEN}&real_secret_suffix", "API_KEY=<REDACTED>"),
+        ("{api_key=${SPLUNK_API_TOKEN}_real_secret_suffix}", "{api_key=<REDACTED>}"),
+        ("{api_key=secret}", "{api_key=<REDACTED>}"),
+    ]
+    for idx, (payload, expected) in enumerate(bypass_payloads):
+        res = manager.scan_candidate(payload)
+        assert res.allowed is True
+        assert res.redacted_content == expected
+        assert "secret" not in res.redacted_content
+
+        persisted = manager.submit_manual_learn(
+            title=f"Braced Suffix Scrub {idx}",
+            content=payload,
+            category="environment_fact",
+            actor="analyst-1",
+        )
+        assert persisted.content == expected
+        assert "secret" not in persisted.content
+        reloaded = storage.get_learning(persisted.id)
+        assert reloaded is not None and reloaded["content"] == expected
+
+    db_raw = (tmp_path / ".soclens_cache" / "soclens.db").read_bytes().decode("latin-1", errors="ignore")
+    assert "real_secret_suffix" not in db_raw
+    assert "extra_secret" not in db_raw
+    assert "}secret" not in db_raw
+
+    preserved_placeholders = [
+        "API_KEY=${SPLUNK_API_TOKEN}",
+        "Authorization: Bearer ${SPLUNK_API_TOKEN}",
+        "Bearer ${SPLUNK_API_TOKEN}",
+        "https://splunk.corp/api?token=${SPLUNK_API_TOKEN}&mode=ro",
+        '{"Authorization": "Bearer ${SPLUNK_API_TOKEN}"}',
+    ]
+    for idx, placeholder in enumerate(preserved_placeholders):
+        res = manager.scan_candidate(placeholder)
+        assert res.allowed is True
+        assert res.redacted_content == placeholder
+        saved = manager.submit_manual_learn(
+            title=f"Braced Env Ref Preserved {idx}",
+            content=placeholder,
+            category="environment_fact",
+            actor="analyst-1",
+        )
+        assert saved.content == placeholder
