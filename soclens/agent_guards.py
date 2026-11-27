@@ -252,10 +252,28 @@ _SECRET_PATTERN_SPECS: list[tuple[str, str, str]] = [
     ),
 ]
 
-INVISIBLE_CHARS: frozenset[str] = frozenset(
-    "\u200b\u200c\u200d\u2060\u2062\u2063\u2064\ufeff"
-    "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
-) | frozenset(map(chr, range(0xE0000, 0xE0080)))
+INVISIBLE_CHARS: frozenset[str] = (
+    frozenset(
+        "\u00ad\u061c\u180e\u034f"
+        "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff"
+        "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+        "\u206a\u206b\u206c\u206d\u206e\u206f\ufff9\ufffa\ufffb"
+    )
+    | frozenset(map(chr, range(0xFE00, 0xFE10)))
+    | frozenset(map(chr, range(0xE0000, 0xE0080)))
+    | frozenset(map(chr, range(0xE0100, 0xE01F0)))
+)
+
+
+def _canonical_scan_text(text: str) -> str:
+    """Normalize with NFKD and strip Cf format chars, invisible chars, and Mn combining marks."""
+    nfkc = unicodedata.normalize("NFKC", text)
+    nfkd = unicodedata.normalize("NFKD", nfkc)
+    return "".join(
+        ch
+        for ch in nfkd
+        if ch not in INVISIBLE_CHARS and unicodedata.category(ch) not in ("Cf", "Mn")
+    )
 
 _RGI_SUBDIVISION_FLAGS: tuple[str, ...] = ("gbeng", "gbsct", "gbwls")
 EMOJI_TAG_SEQUENCE_RE: re.Pattern[str] = re.compile(
@@ -330,9 +348,16 @@ class PromptAndSecretGuard:
         blocked_reasons: list[str] = []
         findings: list[dict[str, Any]] = []
 
-        # 1. Raw invisible / bidi / Unicode TAG check BEFORE NFKC normalization.
+        # 1. Raw invisible / Cf / bidi / variation-selector / TAG check BEFORE normalization.
         stripped_flags = EMOJI_TAG_SEQUENCE_RE.sub(lambda m: " " * len(m.group(0)), raw)
-        bad_chars = sorted(set(stripped_flags) & INVISIBLE_CHARS, key=ord)
+        bad_chars = sorted(
+            {
+                ch
+                for ch in stripped_flags
+                if ch in INVISIBLE_CHARS or unicodedata.category(ch) == "Cf"
+            },
+            key=ord,
+        )
         for ch in bad_chars:
             pid = f"invisible_unicode_U+{ord(ch):04X}"
             blocked_reasons.append(
@@ -347,8 +372,8 @@ class PromptAndSecretGuard:
                 }
             )
 
-        # 2. NFKC folding + whitespace collapse + negated-prose masking.
-        folded = unicodedata.normalize("NFKC", raw)
+        # 2. Canonical NFKD + Cf/Mn stripping + whitespace collapse + negated-prose masking.
+        folded = _canonical_scan_text(raw)
         normalised = _WS_RUN.sub(_collapse_ws, folded)
         masked = _WS_RUN.sub(_collapse_ws, mask_negated_injection_verbs(folded))
 

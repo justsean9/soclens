@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from soclens.agent_audit import redact_sensitive_data
+
 MAX_LOG_ENTRIES = 5000
 
 LOG_SOURCE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -60,7 +62,9 @@ _SECRET_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 
 def _redact_log_text(text: str) -> str:
-    out = text
+    if not text:
+        return ""
+    out = str(redact_sensitive_data(text, preserve_env_var_refs=True))
     for pat, repl in _SECRET_REDACT_PATTERNS:
         out = pat.sub(repl, out)
     return out
@@ -277,12 +281,13 @@ class AppLogStore:
         """Append a ``LogEntry`` and notify any listener outside the store lock."""
         norm_level = _canonical_level(entry.level)
         created_utc = entry.created_utc or datetime.now(UTC)
+        safe_message = _redact_log_text(entry.message)
         normalized = LogEntry(
             timestamp=entry.timestamp or created_utc.strftime("%H:%M:%S"),
             level=norm_level,
             source=entry.source or "system",
             logger_name=entry.logger_name or "app",
-            message=entry.message,
+            message=safe_message,
             created_utc=created_utc,
         )
         with self._lock:

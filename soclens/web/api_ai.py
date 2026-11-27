@@ -117,33 +117,45 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
                     yield format_sse("learn_saved", {"ok": True, "entry": entry_dict})
                     yield format_sse(
                         "done",
-                        {
-                            "ok": True,
-                            "status": "completed",
-                            "session_id": session_id,
-                            "content": f"Saved learning: {entry_dict.get('title', first_line)}",
-                        },
+                        dict(
+                            redact_web_payload(
+                                {
+                                    "ok": True,
+                                    "status": "completed",
+                                    "session_id": session_id,
+                                    "content": f"Saved learning: {entry_dict.get('title', first_line)}",
+                                }
+                            )
+                        ),
                     )
                 except ValueError as exc:
-                    yield format_sse("error", {"ok": False, "error": str(exc)})
+                    yield format_sse("error", {"ok": False, "error": str(redact_web_payload(str(exc)))})
             else:
                 yield format_sse(
                     "learn_preview",
-                    {
-                        "title": first_line,
-                        "content": lesson,
-                        "category": "environment_fact",
-                        "session_id": session_id,
-                    },
+                    dict(
+                        redact_web_payload(
+                            {
+                                "title": first_line,
+                                "content": lesson,
+                                "category": "environment_fact",
+                                "session_id": session_id,
+                            }
+                        )
+                    ),
                 )
                 yield format_sse(
                     "done",
-                    {
-                        "ok": True,
-                        "status": "learn_preview",
-                        "session_id": session_id,
-                        "content": f"Ready to teach: {first_line}",
-                    },
+                    dict(
+                        redact_web_payload(
+                            {
+                                "ok": True,
+                                "status": "learn_preview",
+                                "session_id": session_id,
+                                "content": f"Ready to teach: {first_line}",
+                            }
+                        )
+                    ),
                 )
 
         return StreamingResponse(
@@ -153,12 +165,20 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
             headers={"Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no"},
         )
 
-    template_key = str(body.get("template") or "").strip()
+    template_key = str(body.get("template") or "").strip().lower()
     effective_prompt = user_prompt
+    template_system_prompt: str | None = None
     if template_key and template_key in SOC_PROMPT_TEMPLATES and template_key != "freeform":
         tmpl = SOC_PROMPT_TEMPLATES[template_key]
-        if isinstance(tmpl, dict) and tmpl.get("prompt"):
-            effective_prompt = f"{tmpl['prompt']}\n\n{user_prompt}" if user_prompt else str(tmpl["prompt"])
+        if isinstance(tmpl, dict):
+            user_prefix = str(tmpl.get("user_prefix") or "")
+            if user_prefix:
+                effective_prompt = (
+                    f"{user_prefix}{user_prompt}" if user_prompt else user_prefix.strip()
+                )
+            sys_override = str(tmpl.get("system_prompt") or "").strip()
+            if sys_override:
+                template_system_prompt = sys_override
 
     async def _chat_event_generator() -> AsyncIterator[str]:
         loop = asyncio.get_running_loop()
@@ -169,13 +189,12 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
                 loop.call_soon_threadsafe(queue.put_nowait, (ev_type, data))
 
         def _on_token(tok: str) -> None:
-            payload = {"token": tok, "session_id": session_id}
+            payload = dict(redact_web_payload({"token": tok, "session_id": session_id}))
             _push("token", payload)
             runtime.sse_bus.publish("ai_token", payload)
 
         def _on_tool(ev: dict[str, Any]) -> None:
-            safe_ev = dict(redact_web_payload(ev))
-            safe_ev["session_id"] = session_id
+            safe_ev = dict(redact_web_payload({**ev, "session_id": session_id}))
             _push("tool", safe_ev)
             runtime.sse_bus.publish("tool_event", safe_ev)
 
@@ -189,6 +208,7 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
                     session_id=session_id,
                     provider=provider,
                     model=model,
+                    system_prompt_override=template_system_prompt,
                     enable_tools=enable_tools,
                     stop_event=runtime.shutdown_event,
                     stream_callback=_on_token,
@@ -197,7 +217,10 @@ async def ai_chat_stream_endpoint(request: Request) -> Any:
                 done_payload = _entry_to_dict(res)
                 done_payload["ok"] = res.status != "error"
                 if res.status == "error" and res.error:
-                    _push("error", {"ok": False, "error": res.error, **done_payload})
+                    _push(
+                        "error",
+                        {**done_payload, "ok": False, "error": str(redact_web_payload(res.error))},
+                    )
                 else:
                     _push("done", done_payload)
             except Exception as exc:
@@ -254,8 +277,7 @@ async def ai_investigate_endpoint(request: Request) -> JSONResponse:
 
     def _run() -> dict[str, Any]:
         def _on_tool(ev: dict[str, Any]) -> None:
-            safe_ev = dict(redact_web_payload(ev))
-            safe_ev["event_key"] = event_key
+            safe_ev = dict(redact_web_payload({**ev, "event_key": event_key}))
             runtime.sse_bus.publish("tool_event", safe_ev)
 
         res = runtime.ai_orchestrator.investigate(
@@ -287,8 +309,7 @@ async def ai_investigate_endpoint(request: Request) -> JSONResponse:
         except Exception:
             pass
         res_dict = _entry_to_dict(res)
-        runtime.sse_bus.publish(
-            "triage_update",
+        triage_payload = redact_web_payload(
             {
                 "event_key": event_key,
                 "run_id": res.run_id,
@@ -296,7 +317,11 @@ async def ai_investigate_endpoint(request: Request) -> JSONResponse:
                 "mode": res.mode,
                 "provider": res.provider,
                 "model": res.model,
-            },
+            }
+        )
+        runtime.sse_bus.publish(
+            "triage_update",
+            dict(triage_payload) if isinstance(triage_payload, dict) else {},
         )
         return {"ok": res.status != "error", "result": res_dict}
 

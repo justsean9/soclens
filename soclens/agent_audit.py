@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -2732,6 +2733,67 @@ def _redact_bearer_schemes(text: str, *, preserve_env_var_refs: bool = False) ->
     return "".join(parts)
 
 
+def _redact_unicode_obfuscated_tokens(text: str) -> str:
+    """Scrub fullwidth/NFKD-equivalent and invisible/combining-split secret tokens."""
+    if not text or text.isascii():
+        return text
+
+    shadow_chars: list[str] = []
+    orig_spans: list[tuple[int, int]] = []
+    for idx, ch in enumerate(text):
+        cp = ord(ch)
+        if unicodedata.category(ch) in ("Cf", "Mn") or (0xE0000 <= cp <= 0xE007F):
+            continue
+        decomposed = unicodedata.normalize("NFKD", ch)
+        for sub_ch in decomposed:
+            sub_cp = ord(sub_ch)
+            if unicodedata.category(sub_ch) in ("Cf", "Mn") or (0xE0000 <= sub_cp <= 0xE007F):
+                continue
+            shadow_chars.append(sub_ch)
+            orig_spans.append((idx, idx + 1))
+
+    if not shadow_chars:
+        return text
+
+    shadow = "".join(shadow_chars)
+    replacements: list[tuple[int, int, str]] = []
+
+    for m in _URL_USERINFO_RE.finditer(shadow):
+        pw = m.group(3)
+        if pw and not _is_redacted_placeholder(pw):
+            s_idx, e_idx = m.start(3), m.end(3)
+            if s_idx < e_idx:
+                replacements.append((orig_spans[s_idx][0], orig_spans[e_idx - 1][1], "<REDACTED>"))
+
+    for pat, repl in (
+        (_JWT_RE, "<REDACTED_JWT>"),
+        (_VENDOR_PREFIX_RE, "<REDACTED>"),
+        (_VAULT_URI_RE, "<REDACTED>"),
+        (_VAULT_TOKEN_RE, "<REDACTED>"),
+    ):
+        for m in pat.finditer(shadow):
+            s_idx, e_idx = m.start(), m.end()
+            if s_idx < e_idx:
+                replacements.append((orig_spans[s_idx][0], orig_spans[e_idx - 1][1], repl))
+
+    if not replacements:
+        return text
+
+    replacements.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    out_parts: list[str] = []
+    cursor = 0
+    for r_start, r_end, repl in replacements:
+        if r_start < cursor:
+            continue
+        if r_start > cursor:
+            out_parts.append(text[cursor:r_start])
+        out_parts.append(repl)
+        cursor = r_end
+    if cursor < len(text):
+        out_parts.append(text[cursor:])
+    return "".join(out_parts)
+
+
 def _redact_string(text: str, *, preserve_env_var_refs: bool = False) -> str:
     if not text:
         return text
@@ -2746,6 +2808,7 @@ def _redact_string(text: str, *, preserve_env_var_refs: bool = False) -> str:
     out = _VENDOR_PREFIX_RE.sub("<REDACTED>", out)
     out = _VAULT_URI_RE.sub("<REDACTED>", out)
     out = _VAULT_TOKEN_RE.sub("<REDACTED>", out)
+    out = _redact_unicode_obfuscated_tokens(out)
     return out
 
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+import inspect
 import json
 import re
 import time
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -494,6 +497,27 @@ class ReadOnlyToolSpec:
 _FORBIDDEN_MUTATING_LOWER: frozenset[str] = frozenset(
     name.strip().lower() for name in FORBIDDEN_MUTATING_METHOD_NAMES
 )
+_VALID_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_TOOL_SEP_RE = re.compile(r"[\s-]+")
+
+
+def _has_invisible_or_combining_unicode(text: str) -> bool:
+    for ch in text:
+        cp = ord(ch)
+        if unicodedata.category(ch) in ("Cf", "Mn") or (0xE0000 <= cp <= 0xE007F):
+            return True
+    return False
+
+
+def _is_forbidden_tool_identifier(raw_name: str) -> bool:
+    clean = unicodedata.normalize("NFKC", raw_name).strip()
+    if not clean:
+        return False
+    low = clean.lower()
+    if low in _FORBIDDEN_MUTATING_LOWER:
+        return True
+    canonical = _TOOL_SEP_RE.sub("_", low)
+    return canonical in _FORBIDDEN_MUTATING_LOWER
 
 
 class ReadOnlyToolRegistry:
@@ -502,25 +526,88 @@ class ReadOnlyToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ReadOnlyToolSpec] = {}
 
+    @staticmethod
+    def _validate_handler(handler: Any, *, tool_name: str) -> None:
+        if not callable(handler):
+            raise ValueError(f"Tool '{tool_name}' handler must be callable.")
+        seen_ids: set[int] = set()
+        current: Any = handler
+        while id(current) not in seen_ids:
+            seen_ids.add(id(current))
+            raw_name = getattr(current, "__name__", None)
+            if isinstance(raw_name, str) and raw_name.strip():
+                if _has_invisible_or_combining_unicode(raw_name):
+                    raise ValueError(
+                        f"Forbidden obfuscated handler name on tool '{tool_name}'."
+                    )
+                if _is_forbidden_tool_identifier(raw_name):
+                    raise ValueError(
+                        f"Forbidden mutating handler cannot be registered: {raw_name.strip()}"
+                    )
+            if isinstance(current, functools.partial):
+                current = current.func
+                continue
+            wrapped = getattr(current, "__wrapped__", None)
+            if wrapped is not None and wrapped is not current and callable(wrapped):
+                current = wrapped
+                continue
+            break
+
+        unwrapped_name = getattr(current, "__name__", None)
+        if isinstance(unwrapped_name, str) and unwrapped_name.strip():
+            if _has_invisible_or_combining_unicode(unwrapped_name):
+                raise ValueError(
+                    f"Forbidden obfuscated handler name on tool '{tool_name}'."
+                )
+            if _is_forbidden_tool_identifier(unwrapped_name):
+                raise ValueError(
+                    f"Forbidden mutating handler cannot be registered: {unwrapped_name.strip()}"
+                )
+
+        if not (
+            inspect.isfunction(current)
+            or inspect.ismethod(current)
+            or inspect.isbuiltin(current)
+        ):
+            cls_name = type(current).__name__
+            if _has_invisible_or_combining_unicode(cls_name) or _is_forbidden_tool_identifier(
+                cls_name
+            ):
+                raise ValueError(
+                    f"Forbidden mutating callable handler cannot be registered: {cls_name}"
+                )
+            raise ValueError(
+                f"Opaque callable instance '{cls_name}' cannot be registered for tool '{tool_name}'."
+            )
+
     def register(self, spec: ReadOnlyToolSpec) -> None:
         """Register a strictly read-only tool specification."""
         if spec.readonly is not True:
             raise ValueError(f"Tool '{spec.name}' must set readonly=True.")
-        clean_name = spec.name.strip() if isinstance(spec.name, str) else ""
+        if not isinstance(spec.name, str):
+            raise ValueError("Tool name must be a non-empty string.")
+        if _has_invisible_or_combining_unicode(spec.name):
+            raise ValueError("Tool name contains disallowed invisible or combining Unicode characters.")
+        clean_name = unicodedata.normalize("NFKC", spec.name).strip()
         if not clean_name:
             raise ValueError("Tool name must be a non-empty string.")
-        if clean_name.lower() in _FORBIDDEN_MUTATING_LOWER:
+        if _is_forbidden_tool_identifier(clean_name):
             raise ValueError(f"Forbidden mutating tool name cannot be registered: {clean_name}")
+        if _VALID_TOOL_NAME_RE.fullmatch(clean_name) is None:
+            raise ValueError(
+                f"Tool name '{clean_name}' must contain only ASCII letters, digits, and underscores."
+            )
         if not isinstance(spec.source_category, str) or not spec.source_category.strip():
             raise ValueError(f"Tool '{clean_name}' must specify a valid source_category.")
-        handler_name = str(getattr(spec.handler, "__name__", "") or "").strip()
-        if handler_name.lower() in _FORBIDDEN_MUTATING_LOWER:
-            raise ValueError(
-                f"Forbidden mutating handler cannot be registered: {handler_name}"
-            )
+        self._validate_handler(spec.handler, tool_name=clean_name)
         for method_name in spec.underlying_methods:
-            clean_method = str(method_name).strip()
-            if clean_method.lower() in _FORBIDDEN_MUTATING_LOWER:
+            raw_method = str(method_name)
+            if _has_invisible_or_combining_unicode(raw_method):
+                raise ValueError(
+                    f"Tool '{clean_name}' references obfuscated underlying method."
+                )
+            clean_method = unicodedata.normalize("NFKC", raw_method).strip()
+            if _is_forbidden_tool_identifier(clean_method):
                 raise ValueError(
                     f"Tool '{clean_name}' references forbidden mutating method '{clean_method}'."
                 )
