@@ -1264,12 +1264,101 @@ class SocLensApp(App[None]):
         border-title-style: bold;
     }
     .tile-leaf.-compact-narrow Button.-textual-compact,
-    .tile-leaf.-compact-narrow Select.-textual-compact > SelectCurrent,
-    .tile-leaf.-compact-narrow Input.-textual-compact {
+    .tile-leaf.tile-narrow Button.-textual-compact {
         border-left: none !important;
         border-right: none !important;
         padding: 0;
         min-width: 4;
+    }
+    .tile-leaf.-compact-narrow Select.-textual-compact > SelectCurrent,
+    .tile-leaf.-compact-narrow Input.-textual-compact,
+    .tile-leaf.tile-narrow Select.-textual-compact > SelectCurrent,
+    .tile-leaf.tile-narrow Input.-textual-compact {
+        border-left: none !important;
+        border-right: none !important;
+        padding: 0;
+        min-width: 4;
+    }
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal,
+    .tile-leaf.tile-narrow .split-workspace.split-horizontal {
+        layout: vertical;
+    }
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #wl-lists-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #wl-entities-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #rf-results-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #rf-detail-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #brand-domains-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #brand-results-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #res-master-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #res-detail-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #s1-results-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #s1-detail-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #splunk-search-master-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #splunk-search-detail-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #es-master-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #es-detail-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #dash-errors-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #dash-apis-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #settings-nav-pane,
+    .tile-leaf.-compact-narrow .split-workspace.split-horizontal > #settings-form-pane {
+        width: 1fr;
+        height: 1fr;
+        margin-right: 0;
+    }
+    .tile-leaf.-compact-narrow #rf-detail-toolbar,
+    .tile-leaf.tile-narrow #rf-detail-toolbar {
+        layout: grid;
+        grid-size: 4;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .tile-leaf.-compact-narrow #es-mc-toolbar,
+    .tile-leaf.tile-narrow #es-mc-toolbar {
+        layout: grid;
+        grid-size: 4;
+        grid-rows: 2;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .tile-leaf.-compact-narrow #es-mc-actions-row,
+    .tile-leaf.tile-narrow #es-mc-actions-row,
+    .tile-leaf.-compact-narrow #es-rf-controls-row,
+    .tile-leaf.tile-narrow #es-rf-controls-row,
+    .tile-leaf.-compact-narrow #es-bulk-bar,
+    .tile-leaf.tile-narrow #es-bulk-bar {
+        layout: grid;
+        grid-size: 3;
+        grid-rows: 2;
+        grid-gutter: 0 1;
+        height: auto;
+        padding: 0;
+    }
+    .tile-leaf.-compact-narrow #rf-detail-toolbar Button,
+    .tile-leaf.tile-narrow #rf-detail-toolbar Button,
+    .tile-leaf.-compact-narrow #es-inspector-tabs Button,
+    .tile-leaf.tile-narrow #es-inspector-tabs Button,
+    .tile-leaf.-compact-narrow #es-inspector-actions Button,
+    .tile-leaf.tile-narrow #es-inspector-actions Button,
+    .tile-leaf.-compact-narrow #es-mc-toolbar Button,
+    .tile-leaf.tile-narrow #es-mc-toolbar Button,
+    .tile-leaf.-compact-narrow #es-mc-actions-row Button,
+    .tile-leaf.tile-narrow #es-mc-actions-row Button,
+    .tile-leaf.-compact-narrow #es-rf-controls-row Button,
+    .tile-leaf.tile-narrow #es-rf-controls-row Button,
+    .tile-leaf.-compact-narrow #es-rf-controls-row Checkbox,
+    .tile-leaf.tile-narrow #es-rf-controls-row Checkbox,
+    .tile-leaf.-compact-narrow #es-bulk-bar Button,
+    .tile-leaf.tile-narrow #es-bulk-bar Button {
+        width: 1fr;
+        min-width: 6;
+        height: 1;
+        margin-left: 0;
+        margin-right: 0;
+        padding: 0;
+        border-left: none !important;
+        border-right: none !important;
     }
     .tile-leaf.-compact-narrow .toolbar-row,
     .tile-leaf.-compact-narrow .filter-bar,
@@ -1301,9 +1390,10 @@ class SocLensApp(App[None]):
     .tile-leaf.-compact-narrow #res-toolbar Button,
     .tile-leaf.-compact-narrow #logs-toolbar Button {
         width: 1fr;
-        min-width: 5;
+        min-width: 4;
         height: 1;
         margin-right: 0;
+        padding: 0;
     }
     .tile-leaf.-compact-narrow #wl-ent-type,
     .tile-leaf.-compact-narrow #wl-entity-sort-select,
@@ -2397,6 +2487,7 @@ class SocLensApp(App[None]):
             self._verify_ssl_override = None
         if not self._custom_s1_client_injected:
             self.s1_client = None
+        storage_rebound = False
         if not self._custom_workspace_injected:
             old_workspace = self.workspace_dir
             new_workspace = get_workspace_dir()
@@ -2413,6 +2504,7 @@ class SocLensApp(App[None]):
                     or new_db_cfg.profile_name != cur_cfg.profile_name
                 ):
                     self.storage.rebind_config(new_db_cfg)
+                    storage_rebound = True
                     try:
                         self.storage.ensure_schema()
                         self.storage.migrate_legacy_files(new_cache_root)
@@ -2435,11 +2527,31 @@ class SocLensApp(App[None]):
                         self.learning_manager.load_base_knowledge(new_workspace)
                     except Exception:
                         pass
+        elif self.storage is self._default_storage:
+            new_db_cfg = get_database_config(workspace_dir=self.workspace_dir)
+            cur_cfg = self.storage.config
+            if (
+                new_db_cfg.workstation_id != cur_cfg.workstation_id
+                or new_db_cfg.profile_name != cur_cfg.profile_name
+            ):
+                self.storage.rebind_config(
+                    replace(
+                        cur_cfg,
+                        workstation_id=new_db_cfg.workstation_id,
+                        profile_name=new_db_cfg.profile_name,
+                    )
+                )
+                storage_rebound = True
         for attr in ("splunk_client", "splunk_es_client", "llm_client"):
             if hasattr(self, attr) and not getattr(self, f"_custom_{attr}_injected", False):
                 setattr(self, attr, None)
         self._update_subtitle()
         if self._ui_mounted:
+            if storage_rebound:
+                with contextlib.suppress(Exception):
+                    self.workspace_host.load_persisted_state()
+                with contextlib.suppress(Exception):
+                    self._apply_view_mode_to_ui()
             self.sync_ai_kill_switch_ui()
             for pane in self.query(BaseSocPane):
                 try:

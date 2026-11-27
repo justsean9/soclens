@@ -827,22 +827,38 @@ class RFIntelPane(BaseSocPane):
             self.hydrate_from_alert_cache(force=False)
             self._update_responsive_layout()
 
-    def _update_responsive_layout(self) -> None:
-        compact = self.size.width < 110 or self.size.height <= 26
-        split_horizontal = self.size.width >= 130
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self._update_responsive_layout(width=width, height=height, schedule_refresh=False)
+
+    def _update_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+        *,
+        schedule_refresh: bool = True,
+    ) -> None:
+        w = int(self.size.width if width is None else width)
+        h = int(self.size.height if height is None else height)
+        compact = w < 110 or h <= 26
+        split_horizontal = w >= 130
         self.set_class(compact, "rf-compact")
         self.set_class(
-            compact or (split_horizontal and self.size.width < 225),
+            compact or (split_horizontal and w < 225),
             "rf-detail-compact",
         )
-        workspace = self.query_one("#rf-workspace", Container)
-        if split_horizontal:
-            workspace.add_class("split-horizontal")
-        else:
-            workspace.remove_class("split-horizontal")
+        with contextlib.suppress(Exception):
+            workspace = self.query_one("#rf-workspace", Container)
+            if split_horizontal:
+                workspace.add_class("split-horizontal")
+            else:
+                workspace.remove_class("split-horizontal")
         try:
             lookup_bar = self.query_one("#rf-lookup-bar", Container)
-            if self.size.width >= 135:
+            if w >= 135:
                 lookup_bar.add_class("lookup-inline")
             else:
                 lookup_bar.remove_class("lookup-inline")
@@ -850,12 +866,13 @@ class RFIntelPane(BaseSocPane):
             pass
         with contextlib.suppress(Exception):
             ai_panel = self.query_one("#rf-ai-panel", EventAIPanelWidget)
-            ai_panel.display = self.size.height > 26
+            ai_panel.display = h > 26
             ai_panel.set_class(
-                not split_horizontal and self.size.height < 40,
+                not split_horizontal and h < 40,
                 "ai-panel-compact",
             )
-        self.call_after_refresh(self._refresh_after_layout)
+        if schedule_refresh:
+            self.call_after_refresh(self._refresh_after_layout)
 
     def _refresh_after_layout(self) -> None:
         self._fit_results_table()

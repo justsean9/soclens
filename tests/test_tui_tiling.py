@@ -747,3 +747,214 @@ def test_dashboard_pane_split_uses_tile_width_and_switch_to_pane(tmp_path: Path)
             assert app.query_one(WorkspaceHost).active_pane_id == "tab-settings"
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# 7. Real-Compositor Wide-to-Narrow Reflow, Profile Reload & Focus Restore
+# ---------------------------------------------------------------------------
+
+
+def _restore_real_compositor(monkeypatch: pytest.MonkeyPatch) -> None:
+    import textual.screen
+
+    cur = textual.screen.Screen._compositor_refresh
+    if cur.__name__ != "_compositor_refresh":
+        for cell in cur.__closure__ or ():
+            val = cell.cell_contents
+            if callable(val) and getattr(val, "__name__", "") == "_compositor_refresh":
+                monkeypatch.setattr(textual.screen.Screen, "_compositor_refresh", val)
+                break
+
+
+def test_real_compositor_wide_to_narrow_drag_and_4tile_shrink_no_chop_cells_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _restore_real_compositor(monkeypatch)
+
+    async def _run_drag_case(case_dir: Path, initial_tab: str) -> None:
+        case_dir.mkdir(parents=True, exist_ok=True)
+        app = create_app(
+            client=_make_rf_client(),
+            dry_run=True,
+            initial_tab=initial_tab,
+            workspace_dir=case_dir,
+            no_secret_store=True,
+        )
+        async with app.run_test(size=(160, 46)) as pilot:
+            await pilot.pause()
+            await pilot.press("alt+t")
+            await pilot.pause()
+            await pilot.press("alt+v")
+            await pilot.pause()
+
+            divider = app.query_one(SplitDivider)
+            parent_split = app.query_one(TileSplit)
+            await pilot.mouse_down(divider)
+            await pilot.hover(parent_split, offset=(0, 5))
+            await pilot.mouse_up(parent_split, offset=(0, 5))
+            await pilot.pause()
+            assert app._exception is None
+
+            divider = app.query_one(SplitDivider)
+            parent_split = app.query_one(TileSplit)
+            await pilot.mouse_down(divider)
+            await pilot.hover(parent_split, offset=(159, 5))
+            await pilot.mouse_up(parent_split, offset=(159, 5))
+            await pilot.pause()
+            assert app._exception is None
+
+            app.screen._compositor.render_update(screen_stack=app._background_screens)
+            assert app._exception is None
+
+    async def _run_es_4tile(case_dir: Path) -> None:
+        case_dir.mkdir(parents=True, exist_ok=True)
+        app = create_app(
+            client=_make_rf_client(),
+            dry_run=True,
+            initial_tab="tab-splunk-es",
+            workspace_dir=case_dir,
+            no_secret_store=True,
+        )
+        async with app.run_test(size=(150, 44)) as pilot:
+            await pilot.pause()
+            await pilot.press("alt+t")
+            await pilot.pause()
+            await pilot.press("alt+v")
+            await pilot.pause()
+            await pilot.press("alt+h")
+            await pilot.pause()
+            await pilot.press("alt+s")
+            await pilot.pause()
+            await pilot.press("alt+l")
+            await pilot.pause()
+            await pilot.press("alt+s")
+            await pilot.pause()
+            for _ in range(9):
+                await pilot.press("alt+ctrl+left")
+            await pilot.pause()
+            assert len(app.query(TileLeaf)) == 4
+            assert app._exception is None
+            app.screen._compositor.render_update(screen_stack=app._background_screens)
+            assert app._exception is None
+
+    async def _run_all() -> None:
+        # RFIntelPane starts on the right side when initial_tab="tab-research"
+        await _run_drag_case(tmp_path / "rf_drag", "tab-research")
+        await _run_drag_case(tmp_path / "es_drag", "tab-splunk-es")
+        await _run_drag_case(tmp_path / "logs_drag", "tab-logs")
+        await _run_es_4tile(tmp_path / "es_4tile")
+
+    asyncio.run(_run_all())
+
+
+def test_reload_settings_reloads_workspace_host_for_switched_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOCLENS_PROFILE", "prof-b")
+    storage_b = StorageManager(get_database_config(workspace_dir=tmp_path))
+    storage_b.ensure_schema()
+    storage_b.save_workspace_layout(
+        mode="tabbed",
+        state={
+            "mode": "tabbed",
+            "active_workspace": 1,
+            "active_pane_id": "tab-logs",
+            "workspaces": {},
+        },
+    )
+    storage_b.dispose()
+
+    monkeypatch.setenv("SOCLENS_PROFILE", "prof-a")
+    app = create_app(
+        client=_make_rf_client(),
+        dry_run=True,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+    )
+
+    async def _run() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            host = app.query_one(WorkspaceHost)
+            assert host.mode == "tabbed"
+
+            await pilot.press("alt+t")
+            await pilot.pause()
+            await pilot.press("alt+v")
+            await pilot.pause()
+            assert host.mode == "tiling"
+            assert len(app.query(TileLeaf)) == 2
+
+            # Switch to prof-b via reload_settings -> switches to tabbed without clobbering prof-b
+            monkeypatch.setenv("SOCLENS_PROFILE", "prof-b")
+            app.reload_settings()
+            await pilot.pause()
+            assert app.storage.config.profile_name == "prof-b"
+            assert host.mode == "tabbed"
+            assert app.query_one("#main-tabs", TabbedContent).display is True
+            assert app.query_one("#tiling-root").display is False
+
+            saved_b = app.storage.load_workspace_layout(profile_name="prof-b")
+            assert saved_b["mode"] == "tabbed"
+
+            # Switch back to prof-a -> restores prof-a tiling layout
+            monkeypatch.setenv("SOCLENS_PROFILE", "prof-a")
+            app.reload_settings()
+            await pilot.pause()
+            assert app.storage.config.profile_name == "prof-a"
+            assert host.mode == "tiling"
+            assert len(app.query(TileLeaf)) == 2
+
+    asyncio.run(_run())
+
+
+def test_restart_preserves_persisted_focused_pane_even_when_initial_tab_in_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOCLENS_WORKSTATION_ID", "ws-focus-1")
+    monkeypatch.setenv("SOCLENS_PROFILE", "focus-profile")
+
+    app1 = create_app(
+        client=_make_rf_client(),
+        dry_run=True,
+        view_mode=UI_VIEW_ADMIN,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+    )
+
+    async def _run_first() -> None:
+        async with app1.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            host = app1.query_one(WorkspaceHost)
+            await pilot.press("alt+t")
+            await pilot.pause()
+            await pilot.press("alt+v")
+            await pilot.pause()
+            assert host.switch_to_pane("tab-watchlists") is True
+            await pilot.pause()
+            assert host.active_pane_id == "tab-watchlists"
+
+    asyncio.run(_run_first())
+
+    app2 = create_app(
+        client=_make_rf_client(),
+        dry_run=True,
+        view_mode=UI_VIEW_ADMIN,
+        initial_tab="tab-research",
+        workspace_dir=tmp_path,
+        no_secret_store=True,
+    )
+
+    async def _run_second() -> None:
+        async with app2.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            host2 = app2.query_one(WorkspaceHost)
+            assert host2.mode == "tiling"
+            assert host2.active_pane_id == "tab-watchlists"
+
+    asyncio.run(_run_second())

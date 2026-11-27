@@ -419,16 +419,31 @@ class BrandLogosPane(BaseSocPane):
         self._update_responsive_layout()
         self._maybe_auto_load()
 
-    def _update_responsive_layout(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        _ = height
+        self._update_responsive_layout(width=width, schedule_refresh=False)
+
+    def _update_responsive_layout(
+        self,
+        width: int | None = None,
+        *,
+        schedule_refresh: bool = True,
+    ) -> None:
         try:
+            w = int(self.size.width if width is None else width)
             workspace = self.query_one("#brand-workspace", Container)
-            if self.size.width >= 130:
+            if w >= 130:
                 workspace.add_class("split-horizontal")
             else:
                 workspace.remove_class("split-horizontal")
         except Exception:
             pass
-        self.call_after_refresh(self._fit_tables)
+        if schedule_refresh:
+            self.call_after_refresh(self._fit_tables)
 
     def _fit_tables(self) -> None:
         if self.is_app_shutting_down() or not self._tables_ready:

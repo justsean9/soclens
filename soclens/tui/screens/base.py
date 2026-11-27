@@ -1013,6 +1013,14 @@ class BaseSocPane(VerticalScroll):
         """Hook invoked when the active TUI display timezone changes."""
         _ = tz_name
 
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        """Synchronously apply responsive layout classes for an expected ``(width, height)``."""
+        _ = (width, height)
+
     def switch_to_pane(
         self,
         tab_id: str,

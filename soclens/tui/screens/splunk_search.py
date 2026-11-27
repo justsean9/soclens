@@ -229,18 +229,31 @@ class SplunkSearchPane(BaseSocPane):
     def on_tab_activated(self) -> None:
         self._update_split_layout()
 
-    def _update_split_layout(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self._update_split_layout(width=width, height=height)
+
+    def _update_split_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         if self.is_app_shutting_down():
             return
         try:
-            compact = self.size.width < 110 or self.size.height <= 26
+            w = int(self.size.width if width is None else width)
+            h = int(self.size.height if height is None else height)
+            compact = w < 110 or h <= 26
             self.set_class(compact, "search-compact")
             self.set_class(
-                compact or self.size.width < 130,
+                compact or w < 130,
                 "search-toolbar-compact",
             )
             ws = self.query_one("#splunk-search-workspace", Container)
-            if self.size.width >= 110:
+            if w >= 110:
                 ws.add_class("split-horizontal")
             else:
                 ws.remove_class("split-horizontal")

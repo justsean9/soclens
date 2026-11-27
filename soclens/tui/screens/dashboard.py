@@ -209,11 +209,23 @@ class DashboardPane(BaseSocPane):
             btn.label = "Insecure SSL: OFF"
             btn.variant = "default"
 
-    def _update_split_layout(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        _ = height
+        self._update_split_layout(width=width)
+
+    def _update_split_layout(self, width: int | None = None) -> None:
         try:
             workspace = self.query_one("#dash-workspace", Container)
-            width = int(self.size.width or getattr(self.app.size, "width", 120) or 120)
-            workspace.set_class(width >= _SPLIT_HORIZONTAL_MIN_WIDTH, "split-horizontal")
+            eff_width = int(
+                (self.size.width if width is None else width)
+                or getattr(self.app.size, "width", 120)
+                or 120
+            )
+            workspace.set_class(eff_width >= _SPLIT_HORIZONTAL_MIN_WIDTH, "split-horizontal")
         except Exception:
             pass
 

@@ -638,8 +638,21 @@ class SentinelOnePane(BaseSocPane):
             self.hydrate_from_alert_cache(force=False)
             self.call_after_refresh(self._fit_table)
 
-    def _update_split_layout(self) -> None:
-        split_horizontal = self.size.width >= _SPLIT_HORIZONTAL_MIN_WIDTH
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self._update_split_layout(width=width, height=height)
+
+    def _update_split_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        w = int(self.size.width if width is None else width)
+        h = int(self.size.height if height is None else height)
+        split_horizontal = w >= _SPLIT_HORIZONTAL_MIN_WIDTH
         try:
             ws = self.query_one("#s1-workspace", Container)
             if split_horizontal:
@@ -650,9 +663,9 @@ class SentinelOnePane(BaseSocPane):
             pass
         with contextlib.suppress(Exception):
             ai_panel = self.query_one("#s1-ai-panel", EventAIPanelWidget)
-            ai_panel.display = self.size.height > 26
+            ai_panel.display = h > 26
             ai_panel.set_class(
-                not split_horizontal and self.size.height < 40,
+                not split_horizontal and h < 40,
                 "ai-panel-compact",
             )
 

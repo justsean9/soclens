@@ -878,17 +878,55 @@ class TileSplit(Container):
             self.second_widget.styles.width = "1fr"
             self.second_widget.styles.height = f"{r2}fr"
 
+    def _presync_children_for_size(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        w = int(self.size.width if width is None else width)
+        h = int(self.size.height if height is None else height)
+        if w <= 0 or h <= 0:
+            return
+        r = clamp_ratio(self.ratio)
+        if self.direction == "horizontal":
+            avail = max(2, w - 1)
+            w1 = max(1, round(avail * r))
+            w2 = max(1, avail - w1)
+            first_size = (w1, h)
+            second_size = (w2, h)
+        else:
+            avail = max(2, h - 1)
+            h1 = max(1, round(avail * r))
+            h2 = max(1, avail - h1)
+            first_size = (w, h1)
+            second_size = (w, h2)
+        for child, (cw, ch) in (
+            (self.first_widget, first_size),
+            (self.second_widget, second_size),
+        ):
+            if isinstance(child, TileLeaf):
+                child.sync_compact_classes(cw, ch)
+            elif isinstance(child, TileSplit):
+                child._presync_children_for_size(cw, ch)
+
     def set_ratio(self, ratio: float, *, persist: bool = True) -> float:
         self.ratio = clamp_ratio(ratio)
         if self.split_node is not None:
             self.split_node.ratio = self.ratio
         self._apply_fr_weights()
+        presynced = False
+        host: WorkspaceHost | None = None
+        for anc in self.ancestors:
+            if isinstance(anc, WorkspaceHost):
+                host = anc
+                anc._presync_tile_layouts()
+                presynced = True
+                break
+        if not presynced:
+            self._presync_children_for_size()
         self.refresh(layout=True)
-        if persist:
-            for anc in self.ancestors:
-                if isinstance(anc, WorkspaceHost):
-                    anc.save_persisted_state()
-                    break
+        if persist and host is not None:
+            host.save_persisted_state()
         return self.ratio
 
 
@@ -1075,6 +1113,92 @@ class WorkspaceHost(Container):
         tabs = self.query_one("#main-tabs", TabbedContent)
         tabs.display = self._mode == "tabbed"
 
+    def on_resize(self, event: events.Resize) -> None:
+        if self._mode == "tiling":
+            self._presync_tile_layouts(event.size.width, event.size.height)
+
+    def _effective_tiling_root_size(
+        self,
+        root_width: int | None = None,
+        root_height: int | None = None,
+    ) -> tuple[int, int]:
+        if root_width is not None and root_height is not None and root_width > 0 and root_height > 0:
+            return int(root_width), int(root_height)
+        with contextlib.suppress(Exception):
+            tiling_root = self.query_one("#tiling-root", Container)
+            if tiling_root.size.width > 0 and tiling_root.size.height > 0:
+                return int(tiling_root.size.width), int(tiling_root.size.height)
+        if self.size.width > 0 and self.size.height > 0:
+            return int(self.size.width), int(self.size.height)
+        if self.app is not None and self.app.size.width > 0 and self.app.size.height > 0:
+            return int(self.app.size.width), max(1, int(self.app.size.height) - 3)
+        return 0, 0
+
+    @staticmethod
+    def _compute_leaf_pixel_sizes(
+        node: BSPNode,
+        width: int,
+        height: int,
+        *,
+        zoomed_pane_id: str | None = None,
+    ) -> dict[str, tuple[int, int]]:
+        w = max(1, int(width))
+        h = max(1, int(height))
+        if zoomed_pane_id:
+            return {leaf.pane_id: (w, h) for leaf in iter_leaves(node)}
+        sizes: dict[str, tuple[int, int]] = {}
+
+        def _walk(cur: BSPNode, cw: int, ch: int) -> None:
+            if isinstance(cur, LeafNode):
+                sizes[cur.pane_id] = (max(1, cw), max(1, ch))
+                return
+            r = clamp_ratio(cur.ratio)
+            if cur.direction == "horizontal":
+                avail = max(2, cw - 1)
+                w1 = max(1, round(avail * r))
+                w2 = max(1, avail - w1)
+                _walk(cur.first, w1, ch)
+                _walk(cur.second, w2, ch)
+            else:
+                avail = max(2, ch - 1)
+                h1 = max(1, round(avail * r))
+                h2 = max(1, avail - h1)
+                _walk(cur.first, cw, h1)
+                _walk(cur.second, cw, h2)
+
+        _walk(node, w, h)
+        return sizes
+
+    def _presync_tile_layouts(
+        self,
+        root_width: int | None = None,
+        root_height: int | None = None,
+    ) -> None:
+        if self._mode != "tiling":
+            return
+        slot_state = self._slots.get(self._active_workspace)
+        if slot_state is None:
+            return
+        rw, rh = self._effective_tiling_root_size(root_width, root_height)
+        if rw <= 0 or rh <= 0:
+            return
+        leaf_sizes = self._compute_leaf_pixel_sizes(
+            slot_state.tree,
+            rw,
+            rh,
+            zoomed_pane_id=slot_state.zoomed_pane_id,
+        )
+        for pane_id, (tile_w, tile_h) in leaf_sizes.items():
+            leaf_w = self._leaf_widgets.get(pane_id)
+            if leaf_w is not None:
+                leaf_w.sync_compact_classes(tile_w, tile_h)
+            pane = self._get_mounted_pane(pane_id)
+            if pane is not None and (leaf_w is None or pane.parent is leaf_w):
+                pane_w = max(36, tile_w - 2)
+                pane_h = max(1, tile_h - 2)
+                with contextlib.suppress(Exception):
+                    pane.sync_responsive_layout(pane_w, pane_h)
+
     def _visible_tab_ids(self) -> tuple[str, ...]:
         visible = getattr(self.app, "visible_tab_ids", None)
         if isinstance(visible, (tuple, list)):
@@ -1183,19 +1307,25 @@ class WorkspaceHost(Container):
         raw_state = data.get("state")
         state_map = raw_state if isinstance(raw_state, Mapping) else {}
 
+        initial_fb = (
+            self._initial_tab
+            if self._is_tab_visible(self._initial_tab)
+            else self._fallback_pane_id()
+        )
         parsed = WorkspaceLayoutState.from_dict(
             state_map,
             valid_pane_ids=self._visible_tab_ids(),
-            fallback_pane_id=self._fallback_pane_id(),
+            fallback_pane_id=initial_fb,
             mode_override=raw_mode,
         )
         self._slots = dict(parsed.workspaces)
         self._active_workspace = parsed.active_workspace
         self._active_pane_id = parsed.active_pane_id
+        self._rendered_tree_dict = None
 
         self._suppress_persisting = True
         try:
-            self.set_mode(parsed.mode, persist=False)
+            self.set_mode(parsed.mode, persist=False, preserve_focus=True)
         finally:
             self._suppress_persisting = False
 
@@ -1355,6 +1485,7 @@ class WorkspaceHost(Container):
                     slot_state.zoomed_pane_id,
                 )
                 await tiling_root.mount(root_widget)
+                self._presync_tile_layouts()
 
                 ensure_fn = getattr(self.app, "ensure_tab_mounted", None)
                 for leaf_node in iter_leaves(slot_state.tree):
@@ -1366,10 +1497,12 @@ class WorkspaceHost(Container):
                         self._reparent_widget(pane, leaf_w)
                         with contextlib.suppress(Exception):
                             pane.on_tab_activated()
+                        self._presync_tile_layouts()
                 self._rendered_tree_dict = target_tree_dict
 
             self._apply_zoom_visuals(slot_state)
             self._apply_focus_visuals(slot_state.focused_pane_id, move_focus=event.focus_pane)
+            self._presync_tile_layouts()
             tiling_root.refresh(layout=True)
 
             for target_id, cb in event.callbacks:
@@ -1393,21 +1526,31 @@ class WorkspaceHost(Container):
         finally:
             self._rebuilding = False
 
-    def set_mode(self, mode: str, *, persist: bool = True) -> WorkspaceMode:
+    def set_mode(
+        self,
+        mode: str,
+        *,
+        persist: bool = True,
+        preserve_focus: bool = False,
+    ) -> WorkspaceMode:
         """Switch workspace mode between ``'tabbed'`` and ``'tiling'``."""
         target_mode: WorkspaceMode = "tiling" if str(mode).strip().lower() == "tiling" else "tabbed"
         tabs = self.query_one("#main-tabs", TabbedContent)
         tiling_root = self.query_one("#tiling-root", Container)
 
         if target_mode == "tiling":
-            current_active = str(tabs.active or self._active_pane_id or self._fallback_pane_id())
+            current_active = (
+                str(self._active_pane_id or self._fallback_pane_id())
+                if preserve_focus
+                else str(tabs.active or self._active_pane_id or self._fallback_pane_id())
+            )
             if not self._is_tab_visible(current_active):
                 current_active = self._fallback_pane_id()
             if self._active_workspace not in self._slots:
                 self._ensure_slot(self._active_workspace, seed_pane_id=current_active)
             else:
                 slot_state = self._ensure_active_slot()
-                if contains_pane(slot_state.tree, current_active):
+                if not preserve_focus and contains_pane(slot_state.tree, current_active):
                     slot_state.focused_pane_id = current_active
             self._mode = "tiling"
             self._active_pane_id = self._slots[self._active_workspace].focused_pane_id
@@ -1415,7 +1558,7 @@ class WorkspaceHost(Container):
             tiling_root.display = True
             self._schedule_sync(focus_pane=True)
         else:
-            prev_active = self.active_pane_id
+            prev_active = self._active_pane_id if preserve_focus else self.active_pane_id
             if not self._is_tab_visible(prev_active):
                 prev_active = self._fallback_pane_id()
             self._park_all_panes()
@@ -1626,7 +1769,11 @@ class WorkspaceHost(Container):
             return
         for split_w, s_node in zip(self._split_widgets, split_nodes, strict=False):
             split_w.split_node = s_node
-            split_w.set_ratio(s_node.ratio, persist=False)
+            split_w.ratio = clamp_ratio(s_node.ratio)
+            split_w._apply_fr_weights()
+        self._presync_tile_layouts()
+        for split_w in self._split_widgets:
+            split_w.refresh(layout=True)
         self._rendered_tree_dict = node.to_dict()
 
     def toggle_zoom(self) -> bool:
@@ -1640,6 +1787,9 @@ class WorkspaceHost(Container):
             slot_state.zoomed_pane_id = None
         self._apply_zoom_visuals(slot_state)
         self._apply_focus_visuals(slot_state.focused_pane_id, move_focus=True)
+        self._presync_tile_layouts()
+        with contextlib.suppress(Exception):
+            self.query_one("#tiling-root", Container).refresh(layout=True)
         self.save_persisted_state()
         return True
 

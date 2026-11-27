@@ -557,10 +557,23 @@ class LocalLLMPane(BaseSocPane):
     def on_resize(self) -> None:
         self._sync_compact_class()
 
-    def _sync_compact_class(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self._sync_compact_class(width=width, height=height)
+
+    def _sync_compact_class(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         try:
-            self.set_class(self.size.width < 96, "llm-compact")
-            self.set_class(self.size.height <= 26, "llm-short")
+            w = int(self.size.width if width is None else width)
+            h = int(self.size.height if height is None else height)
+            self.set_class(w < 96, "llm-compact")
+            self.set_class(h <= 26, "llm-short")
         except Exception:
             pass
 

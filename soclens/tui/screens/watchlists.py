@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, ClassVar, Literal
 
 from rich.text import Text
@@ -337,10 +338,20 @@ class WatchlistsPane(BaseSocPane):
         self._update_responsive_layout()
         self._maybe_auto_load()
 
-    def _update_responsive_layout(self) -> None:
-        workspace = self.query_one("#wl-workspace", Container)
-        workspace.remove_class("split-horizontal")
-        self.call_after_refresh(self._fit_tables)
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        _ = (width, height)
+        self._update_responsive_layout(schedule_refresh=False)
+
+    def _update_responsive_layout(self, *, schedule_refresh: bool = True) -> None:
+        with contextlib.suppress(Exception):
+            workspace = self.query_one("#wl-workspace", Container)
+            workspace.remove_class("split-horizontal")
+        if schedule_refresh:
+            self.call_after_refresh(self._fit_tables)
 
     def _set_view_stage(
         self, stage: Literal["lists", "entities"], *, focus_table: bool = True

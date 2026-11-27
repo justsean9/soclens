@@ -486,9 +486,9 @@ class SplunkESPane(BaseSocPane):
     SplunkESPane.es-compact #es-inspector-tabs Button,
     SplunkESPane.es-compact #es-inspector-actions Button {
         width: 1fr !important;
-        min-width: 2 !important;
+        min-width: 4 !important;
         margin-right: 0 !important;
-        padding: 0 1 !important;
+        padding: 0 !important;
     }
     SplunkESPane.es-compact #es-rf-controls-row Checkbox {
         padding: 0 !important;
@@ -973,7 +973,13 @@ class SplunkESPane(BaseSocPane):
             except Exception:
                 pass
 
-    def _apply_compact_inline_styles(self, compact: bool) -> None:
+    def _apply_compact_inline_styles(
+        self,
+        compact: bool,
+        *,
+        split_horizontal: bool = False,
+        narrow: bool = False,
+    ) -> None:
         bar_ids = (
             "#es-status",
             "#es-summary-bar",
@@ -982,16 +988,18 @@ class SplunkESPane(BaseSocPane):
             "#es-detail-header",
         )
         if compact:
+            for row_id in ("#es-toolbar-row1", "#es-filter-bar"):
+                rw = self.query_one(row_id)
+                rw.styles.height = 1
+                rw.styles.padding = (0, 0)
             for row_id in (
-                "#es-toolbar-row1",
-                "#es-filter-bar",
                 "#es-mc-toolbar",
                 "#es-mc-actions-row",
                 "#es-rf-controls-row",
                 "#es-bulk-bar",
             ):
                 rw = self.query_one(row_id)
-                rw.styles.height = 1
+                rw.styles.height = "auto" if narrow else 1
                 rw.styles.padding = (0, 0)
             for bar_id in bar_ids:
                 bar = self.query_one(bar_id)
@@ -1021,10 +1029,10 @@ class SplunkESPane(BaseSocPane):
             search_inp.styles.min_width = 8
             search_inp.styles.margin = (0, 1, 0, 0)
             master = self.query_one("#es-master-pane")
-            master.styles.width = "42%"
+            master.styles.width = "42%" if split_horizontal else "1fr"
             master.styles.min_height = 4
             detail_pane = self.query_one("#es-detail-pane")
-            detail_pane.styles.width = "58%"
+            detail_pane.styles.width = "58%" if split_horizontal else "1fr"
             detail_pane.styles.min_height = 4
             table = self.query_one("#es-table")
             table.styles.min_height = 3
@@ -1071,27 +1079,45 @@ class SplunkESPane(BaseSocPane):
                 w.styles.min_height = None
                 w.styles.border = None
 
-    def _update_split_layout(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self._update_split_layout(width=width, height=height)
+
+    def _update_split_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         if self.is_app_shutting_down():
             return
         try:
-            compact_small = self.size.width < 100 or self.size.height <= 26
+            w = int(self.size.width if width is None else width)
+            h = int(self.size.height if height is None else height)
+            compact_small = w < 100 or h <= 26
+            narrow = w < 96
+            split_horizontal = w >= 110 or (
+                compact_small and w >= 76
+            )
             self.set_class(compact_small, "es-compact")
             self._sync_compact_labels(compact_small)
-            self._apply_compact_inline_styles(compact_small)
-            ws = self.query_one("#es-workspace", Container)
-            split_horizontal = self.size.width >= 110 or (
-                compact_small and self.size.width >= 76
+            self._apply_compact_inline_styles(
+                compact_small,
+                split_horizontal=split_horizontal,
+                narrow=narrow,
             )
+            ws = self.query_one("#es-workspace", Container)
             if split_horizontal:
                 ws.add_class("split-horizontal")
             else:
                 ws.remove_class("split-horizontal")
             with contextlib.suppress(Exception):
                 ai_panel = self.query_one("#es-ai-panel", EventAIPanelWidget)
-                ai_panel.display = self.size.height > 26
+                ai_panel.display = h > 26
                 ai_panel.set_class(
-                    not split_horizontal and self.size.height < 40,
+                    not split_horizontal and h < 40,
                     "ai-panel-compact",
                 )
             if compact_small:

@@ -181,9 +181,18 @@ class LogsPane(BaseSocPane):
     def on_resize(self) -> None:
         self._update_responsive_layout()
 
-    def _update_responsive_layout(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        _ = height
+        self._update_responsive_layout(width=width)
+
+    def _update_responsive_layout(self, width: int | None = None) -> None:
         try:
-            self.set_class(self.size.width < 100, "logs-compact")
+            w = int(self.size.width if width is None else width)
+            self.set_class(w < 100, "logs-compact")
         except Exception:
             pass
 

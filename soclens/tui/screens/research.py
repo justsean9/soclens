@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -359,13 +360,29 @@ class ResearchPane(BaseSocPane):
         if self._tables_ready and self._current_dossier is None:
             self._render_detail_panel()
 
-    def _update_responsive_layout(self) -> None:
-        workspace = self.query_one("#res-workspace", Container)
-        if self.size.width >= 120:
-            workspace.add_class("split-horizontal")
-        else:
-            workspace.remove_class("split-horizontal")
-        self.call_after_refresh(self._refresh_after_layout)
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        _ = height
+        self._update_responsive_layout(width=width, schedule_refresh=False)
+
+    def _update_responsive_layout(
+        self,
+        width: int | None = None,
+        *,
+        schedule_refresh: bool = True,
+    ) -> None:
+        with contextlib.suppress(Exception):
+            w = int(self.size.width if width is None else width)
+            workspace = self.query_one("#res-workspace", Container)
+            if w >= 120:
+                workspace.add_class("split-horizontal")
+            else:
+                workspace.remove_class("split-horizontal")
+        if schedule_refresh:
+            self.call_after_refresh(self._refresh_after_layout)
 
     def _refresh_after_layout(self) -> None:
         self._fit_table()

@@ -2271,10 +2271,23 @@ class SettingsPane(BaseSocPane):
             return
         self._load_form_from_store()
 
-    def _update_responsive_layout(self) -> None:
+    def sync_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self._update_responsive_layout(width=width, height=height)
+
+    def _update_responsive_layout(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         try:
-            is_horizontal = self.size.width >= _SPLIT_HORIZONTAL_MIN_WIDTH
-            is_compact = (not is_horizontal) or self.size.height <= 26
+            w = int(self.size.width if width is None else width)
+            h = int(self.size.height if height is None else height)
+            is_horizontal = w >= _SPLIT_HORIZONTAL_MIN_WIDTH
+            is_compact = (not is_horizontal) or h <= 26
             self.set_class(is_compact, "settings-compact")
 
             ws = self.query_one("#settings-workspace", Container)
